@@ -283,16 +283,21 @@ def _parse_characteristics(card: dict) -> list[tuple[str, str]]:
 
 
 async def _fetch_card_details(
-    client: httpx.AsyncClient, root: int
+    client: httpx.AsyncClient, nm_id: int
 ) -> tuple[str | None, list[tuple[str, str]]]:
-    """Забирает описание и характеристики с CDN basket-XX. Best-effort."""
-    vol = root // 100000
-    part = root // 1000
+    """Забирает описание и характеристики с CDN basket-XX. Best-effort.
+
+    Путь на CDN строится по nmId (артикулу), а не по root: описание и
+    характеристики лежат именно под nmId. root тут не подходит — по нему
+    подтягивается карточка чужого товара.
+    """
+    vol = nm_id // 100000
+    part = nm_id // 1000
 
     for host_num in _basket_host_candidates(vol):
         url = (
             f"https://basket-{host_num:02d}.wbbasket.ru"
-            f"/vol{vol}/part{part}/{root}/info/ru/card.json"
+            f"/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
         )
         try:
             response = await client.get(url, headers=BASE_HEADERS)
@@ -344,7 +349,7 @@ async def fetch_product(article: int) -> Product:
         (fb_rating, fb_count, reviews), (description, characteristics) = (
             await asyncio.gather(
                 _fetch_feedbacks(client, root),
-                _fetch_card_details(client, root),
+                _fetch_card_details(client, article),
             )
         )
 
