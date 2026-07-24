@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(py *)",
+      "WebSearch",
+      "WebFetch(domain:dev.wildberries.ru)",
+      "PowerShell(cd C:\\\\Projects\\\\wb-bot; $env:TELEGRAM_BOT_TOKEN=\"dummy\"; python _smoke.py)",
+      "PowerShell(cd C:\\\\Projects\\\\wb-bot; $env:TELEGRAM_BOT_TOKEN=\"dummy\"; $env:PYTHONIOENCODING=\"utf-8\"; python _smoke.py)",
+      "PowerShell(cd C:\\\\Projects\\\\wb-bot; $env:PYTHONIOENCODING=\"utf-8\"; python bot.py)",
+      "PowerShell(python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\461fb13d-8105-44b0-a00c-45a22c1fd37d\\\\scratchpad\\\\probe2.py\")",
+      "PowerShell(python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\461fb13d-8105-44b0-a00c-45a22c1fd37d\\\\scratchpad\\\\probe3.py\")",
+      "PowerShell(python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\461fb13d-8105-44b0-a00c-45a22c1fd37d\\\\scratchpad\\\\probe4.py\")",
+      "PowerShell(python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\461fb13d-8105-44b0-a00c-45a22c1fd37d\\\\scratchpad\\\\probe5.py\")",
+      "WebFetch(domain:card.wb.ru)",
+      "WebFetch(domain:github.com)",
+      "PowerShell(python -c \"import py_compile; py_compile.compile\\(r'C:\\\\Projects\\\\wb-bot\\\\wb_api.py', doraise=True\\); py_compile.compile\\(r'C:\\\\Projects\\\\wb-bot\\\\bot.py', doraise=True\\); print\\('compile OK'\\)\"; python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\461fb13d-8105-44b0-a00c-45a22c1fd37d\\\\scratchpad\\\\check.py\")",
+      "PowerShell(python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\461fb13d-8105-44b0-a00c-45a22c1fd37d\\\\scratchpad\\\\check2.py\")",
+      "PowerShell(Get-ChildItem Env: | Where-Object { $_.Name -match 'PROXY|proxy' } | Format-Table -AutoSize)",
+      "PowerShell(python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\461fb13d-8105-44b0-a00c-45a22c1fd37d\\\\scratchpad\\\\check3.py\")",
+      "PowerShell(python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\461fb13d-8105-44b0-a00c-45a22c1fd37d\\\\scratchpad\\\\unit.py\")",
+      "PowerShell(python -c \"import py_compile; py_compile.compile\\(r'C:\\\\Projects\\\\wb-bot\\\\wb_api.py', doraise=True\\); py_compile.compile\\(r'C:\\\\Projects\\\\wb-bot\\\\bot.py', doraise=True\\); print\\('compile OK'\\)\"; python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\461fb13d-8105-44b0-a00c-45a22c1fd37d\\\\scratchpad\\\\check_env.py\")",
+      "PowerShell(python -c \"import telegram, httpx, dotenv; print\\('telegram', telegram.__version__\\); print\\('httpx', httpx.__version__\\); print\\('dotenv OK'\\)\")",
+      "PowerShell(Get-ChildItem -Force | Select-Object Name, Length; Write-Output \"---GIT CHECK---\"; git rev-parse --is-inside-work-tree 2>$null; Write-Output \"exit=$LASTEXITCODE\")",
+      "PowerShell(Get-Command *)",
+      "PowerShell(winget list *)",
+      "PowerShell(winget install *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(git *)"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+# Секреты — НИКОГДА не коммитим (кроме шаблона .env.example)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Архивы
+wb-bot.zip
