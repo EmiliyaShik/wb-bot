@@ -12,6 +12,7 @@ bot/handlers с функцией register(app), реестр найдёт его
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from telegram import Update
@@ -20,9 +21,108 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 from bot import texts
 from bot.handlers import register_all
-from core import audit, config, crypto, db
+from core import audit, config, crypto, db, queue, scheduler
 
 logger = logging.getLogger(__name__)
+
+# Как часто воркер заглядывает в пустую очередь.
+WORKER_POLL_SEC = 5.0
+# Сколько ждём, пока воркер доработает текущую задачу при выключении.
+WORKER_STOP_TIMEOUT_SEC = 10.0
+
+
+def make_notifier(app):
+    """Чем очередь пишет клиенту: перевод внутреннего id в чат Telegram.
+
+    Задача без клиента это служебная работа, и о ней должен узнать владелец,
+    поэтому такое сообщение уходит в ADMIN_TELEGRAM_IDS. Ошибка отправки
+    гасится: очередь не должна падать из-за молчащего Telegram.
+    """
+
+    async def notify(client_id: int | None, text: str) -> None:
+        if client_id is None:
+            chat_ids = list(config.admin_ids())
+        else:
+            row = db.admin_repo().client(client_id)
+            chat_ids = [int(row["telegram_id"])] if row else []
+            if not row:
+                logger.warning("некому написать: клиента %s нет в базе", client_id)
+        for chat_id in chat_ids:
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text)
+            except Exception:  # noqa: BLE001 - молчание Telegram не наша авария
+                logger.exception("не удалось отправить сообщение в чат %s", chat_id)
+
+    return notify
+
+
+async def start_background(app) -> None:
+    """Поднимает фон: сначала подбираем брошенное, потом расписание, потом воркер."""
+    queue.set_notifier(make_notifier(app))
+
+    recovered = queue.recover()
+    if recovered:
+        audit.log("queue", None, f"После перезапуска вернул в очередь задач: {recovered}.")
+
+    job_queue = getattr(app, "job_queue", None)
+    if job_queue is None:
+        app.bot_data["scheduled_jobs"] = []
+        audit.log(
+            "schedule",
+            None,
+            "JobQueue недоступен, расписание выключено. Бот работает, но сам "
+            "ничего не пришлёт. Установите зависимость python-telegram-bot[job-queue].",
+            level="warning",
+        )
+    else:
+        names = scheduler.install(job_queue)
+        app.bot_data["scheduled_jobs"] = names
+        audit.log(
+            "schedule",
+            None,
+            "Расписание: " + (", ".join(names) if names else "работ пока нет"),
+        )
+
+    stop = asyncio.Event()
+    app.bot_data["queue_stop"] = stop
+    app.bot_data["queue_worker"] = asyncio.create_task(
+        queue.run_worker(poll_sec=WORKER_POLL_SEC, stop=stop)
+    )
+    logger.info("Воркер очереди запущен")
+
+
+async def stop_background(app) -> None:
+    """Останавливает воркер без обрыва текущей задачи."""
+    stop = app.bot_data.pop("queue_stop", None)
+    worker = app.bot_data.pop("queue_worker", None)
+    if stop is not None:
+        stop.set()
+    if worker is None:
+        return
+    try:
+        await asyncio.wait_for(worker, timeout=WORKER_STOP_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning("воркер не успел остановиться, снимаю принудительно")
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+    except asyncio.CancelledError:
+        pass
+
+    # Общая HTTP-сессия к Wildberries живёт на весь процесс, закрыть её должен
+    # тот, кто гасит фон. Импорт ленивый: выключение бота не обязано зависеть
+    # от того, загружен ли модуль WB, и сломанное закрытие не мешает остальному.
+    try:
+        from core import wbapi
+
+        await wbapi.close_session()
+    except Exception:  # noqa: BLE001 - на выключении мы уже ничего не спасаем
+        logger.exception("не удалось закрыть сессию к Wildberries")
+
+    db.close_all()
+    logger.info("Воркер очереди остановлен")
 
 
 def startup() -> dict:
@@ -87,8 +187,18 @@ def register_base(app: Application) -> None:
 
 
 def build_app(token: str) -> Application:
-    """Собирает приложение со всеми хендлерами в правильном порядке."""
-    app = Application.builder().token(token).build()
+    """Собирает приложение со всеми хендлерами в правильном порядке.
+
+    Фон (очередь и расписание) поднимается в post_init и гасится в
+    post_shutdown: так он живёт ровно столько, сколько живёт бот.
+    """
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(start_background)
+        .post_shutdown(stop_background)
+        .build()
+    )
 
     names = register_all(app)
     logger.info("Хендлеры модулей: %s", ", ".join(names) if names else "пока нет")

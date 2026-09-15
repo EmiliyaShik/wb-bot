@@ -131,3 +131,70 @@ def test_token_categories_follow_the_spec():
     assert categories["content"]["breaks"] == []
     assert "реклам" in categories["promotion"]["note"].lower()
     assert "себестоимост" in categories["content"]["note"].lower()
+
+
+def test_every_module_explains_itself():
+    """У каждого модуля есть строка «что даёт», её показывают /tariffs и отказ
+    по платной команде. У видимых модулей есть и строка для диагностики."""
+    raw = config.settings()["modules"]
+    assert set(raw) == {"finance", "rnp", "ads", "funnel", "all"}
+    for name, section in raw.items():
+        gives = section.get("gives", "")
+        assert gives.strip(), f"у модуля {name} нет строки gives"
+        assert "руб" not in gives and "990" not in gives, f"цена в gives модуля {name}"
+
+        line = section.get("diagnostic_line")
+        assert line is not None, f"у модуля {name} нет ключа diagnostic_line"
+        if section.get("visible"):
+            assert line.strip(), f"видимый модуль {name} без строки для диагностики"
+        else:
+            assert line == "", f"скрытый модуль {name} не показывается в диагностике"
+
+
+def test_diagnostic_line_is_shown_only_for_visible_modules():
+    """Проверяется свойство строки, а не редактура: править формулировки можно
+    без правки теста."""
+    for info in config.modules().values():
+        if info.visible:
+            assert len(info.diagnostic_line.strip()) > 20, info.name
+            assert str(info.price_month) not in info.diagnostic_line
+        else:
+            assert info.diagnostic_line == "", info.name
+
+
+def test_module_info_carries_the_shop_window_texts():
+    finance = config.modules()["finance"]
+    assert finance.gives == config.settings()["modules"]["finance"]["gives"]
+    assert finance.diagnostic_line
+    assert all(info.gives.strip() for info in config.modules().values())
+
+
+def test_missing_texts_do_not_break_the_config(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "settings",
+        lambda: {"modules": {"bare": {"price_month": 100, "visible": True}}},
+    )
+    bare = config.modules()["bare"]
+    assert bare.gives == ""
+    assert bare.diagnostic_line == ""
+    assert bare.price_month == 100
+
+
+def test_periods_are_parsed_from_config():
+    assert config.periods() == (1, 3, 12)
+    assert list(config.periods()) == sorted(config.periods())
+
+
+def test_periods_see_a_new_key(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "settings",
+        lambda: {"periods": {"months_1": 0, "months_6": 15, "months_12": 20, "note": 1}},
+    )
+    assert config.periods() == (1, 6, 12)  # посторонний ключ note не мешает
+
+
+def test_schedule_says_how_often_to_look_for_the_weekly_report():
+    schedule = config.settings()["schedule"]
+    assert schedule["weekly_check_hours"] == 6

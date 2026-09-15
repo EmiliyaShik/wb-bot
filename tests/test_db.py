@@ -206,6 +206,7 @@ def test_admin_repo_has_no_open_sql(db_path):
         "add_task",
         "task",
         "tasks",
+        "tasks_by_kind",
         "due_tasks",
         "update_task",
         "add_api_call",
@@ -353,3 +354,21 @@ def test_trial_and_diagnostic_are_tied_to_seller(db_path):
     assert admin.diagnostic("seller-1") is None
     admin.mark_diagnostic("seller-1", summary="три утечки")
     assert admin.diagnostic("seller-1")["summary"] == "три утечки"
+
+
+def test_tasks_by_kind_does_not_depend_on_table_size(db_path):
+    """Расписание отсекает повтор по виду задачи, поэтому выборка обязана
+    видеть всю таблицу, а не последние N строк."""
+    admin = db.admin_repo(db_path)
+    morning = admin.add_task("daily_report")
+    weekly = admin.add_task("weekly_check")
+    for _ in range(50):  # шум, за которым срез окна потерял бы утреннюю задачу
+        admin.add_task("housekeeping")
+
+    daily = admin.tasks_by_kind("daily_report")
+    assert [row["id"] for row in daily] == [morning]
+    assert {row["kind"] for row in daily} == {"daily_report"}
+    assert [row["id"] for row in admin.tasks_by_kind("weekly_check")] == [weekly]
+    assert admin.tasks_by_kind("нет-такого-вида") == []
+    assert len(admin.tasks_by_kind("housekeeping")) == 50
+    assert len(admin.tasks_by_kind("housekeeping", limit=5)) == 5

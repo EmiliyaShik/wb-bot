@@ -373,6 +373,20 @@ class AdminRepo:
             self._conn.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (int(limit),))
         )
 
+    def tasks_by_kind(self, kind: str, limit: int | None = None) -> list[sqlite3.Row]:
+        """Все задачи одного вида, без среза по последним N.
+
+        Нужно расписанию, чтобы не поставить вторую утреннюю задачу за тот же
+        день: срез окна пропускал бы повтор, как только очередь подрастёт.
+        Чтение, и только чтение: писать клиентскую строку общий слой не умеет.
+        """
+        sql = "SELECT * FROM tasks WHERE kind = ? ORDER BY id DESC"
+        params: list[Any] = [kind]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return list(self._conn.execute(sql, params))
+
     def due_tasks(self, now: str, limit: int = 10) -> list[sqlite3.Row]:
         """Задачи, которым пора выполняться."""
         return list(

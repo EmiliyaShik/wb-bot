@@ -27,7 +27,13 @@ LOCAL_DATA_DIR = ROOT / "data"
 
 @dataclass(frozen=True)
 class ModuleInfo:
-    """Один модуль из секции [modules.*] конфига."""
+    """Один модуль из секции [modules.*] конфига.
+
+    gives и diagnostic_line это готовые к показу строки: «что даёт модуль» для
+    витрины тарифов и «что он найдёт на цифрах этого кабинета» для бесплатной
+    диагностики. Ключа в конфиге нет - тут пустая строка, и витрина просто не
+    печатает блок, а не падает.
+    """
 
     name: str
     price_month: int
@@ -35,6 +41,8 @@ class ModuleInfo:
     title: str = ""
     agents: tuple[str, ...] = field(default_factory=tuple)
     includes: str | None = None
+    gives: str = ""
+    diagnostic_line: str = ""
 
 
 @lru_cache(maxsize=1)
@@ -44,9 +52,12 @@ def settings() -> dict[str, Any]:
         return tomllib.load(fh)
 
 
-@lru_cache(maxsize=1)
 def modules() -> dict[str, ModuleInfo]:
-    """Модули из конфига, включая скрытые (у них visible = false)."""
+    """Модули из конфига, включая скрытые (у них visible = false).
+
+    Разбор секции живёт здесь и только здесь: витрина тарифов и диагностика
+    берут готовый ModuleInfo, а не лезут в settings() каждая по-своему.
+    """
     result: dict[str, ModuleInfo] = {}
     for name, raw in settings()["modules"].items():
         result[name] = ModuleInfo(
@@ -56,6 +67,8 @@ def modules() -> dict[str, ModuleInfo]:
             title=str(raw.get("title", name)),
             agents=tuple(raw.get("agents", ())),
             includes=raw.get("includes"),
+            gives=str(raw.get("gives", "") or ""),
+            diagnostic_line=str(raw.get("diagnostic_line", "") or ""),
         )
     return result
 
@@ -63,6 +76,20 @@ def modules() -> dict[str, ModuleInfo]:
 def visible_modules() -> dict[str, ModuleInfo]:
     """Модули, которые показываем клиенту."""
     return {name: info for name, info in modules().items() if info.visible}
+
+
+def periods() -> tuple[int, ...]:
+    """Сроки подписки из секции [periods], по возрастанию.
+
+    Ключи там записаны как months_1, months_3, months_12. Разбирать их именами
+    в трёх местах сразу незачем: витрина получает готовый кортеж.
+    """
+    found: list[int] = []
+    for key in settings().get("periods", {}):
+        _, _, tail = str(key).partition("months_")
+        if tail.isdigit():
+            found.append(int(tail))
+    return tuple(sorted(found))
 
 
 def discount_percent(months: int) -> int:
