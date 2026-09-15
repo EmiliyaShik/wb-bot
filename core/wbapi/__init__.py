@@ -21,6 +21,7 @@ from core.wbapi.errors import (
 from core.wbapi.client import (
     ENDPOINTS,
     Endpoint,
+    ReportPages,
     RetryPolicy,
     close_session,
     load_token,
@@ -49,6 +50,7 @@ __all__ = [
     "Budget",
     "ENDPOINTS",
     "Endpoint",
+    "ReportPages",
     "RetryPolicy",
     "close_session",
     "load_token",

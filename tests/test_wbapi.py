@@ -730,3 +730,61 @@ async def test_probe_reports_the_code_the_host_answered(tmp_path):
     assert {probe.status for probe in probes} == {204}
     assert all(probe.ok for probe in probes)
     db.close_all()
+
+
+# --- обрезана выгрузка отчёта или нет: это должно быть фактом, а не догадкой ---
+
+
+@pytest.mark.asyncio
+async def test_full_last_page_with_spent_cursor_is_not_truncated(cabinet):
+    """Ровно полная последняя страница это не обрезка.
+
+    Арифметика по длинам тут ошибается: 4 строки при limit=2 выглядят как
+    «упёрлись», хотя выгрузка полная. Ложная тревога на честной неделе стоит
+    доверия ровно столько же, сколько пропущенная настоящая.
+    """
+    client = build(
+        cabinet,
+        [
+            ok({"data": [{"rrdId": 1}, {"rrdId": 2}]}),
+            ok({"data": [{"rrdId": 3}, {"rrdId": 4}]}),
+            ok({"data": []}),
+        ],
+    )
+
+    result = await client.sales_report_detailed_paged(
+        "2026-09-01", "2026-09-07", limit=2, max_pages=3
+    )
+
+    assert len(result.rows) == 4
+    assert result.truncated is False
+    assert result.pages == 3
+
+
+@pytest.mark.asyncio
+async def test_page_ceiling_with_live_cursor_is_truncated(cabinet):
+    """Страниц больше потолка: курсор живой, значит часть строк не прочитана."""
+    client = build(
+        cabinet,
+        [
+            ok({"data": [{"rrdId": 1}, {"rrdId": 2}]}),
+            ok({"data": [{"rrdId": 3}, {"rrdId": 4}]}),
+        ],
+    )
+
+    result = await client.sales_report_detailed_paged(
+        "2026-09-01", "2026-09-07", limit=2, max_pages=2
+    )
+
+    assert len(result.rows) == 4
+    assert result.truncated is True
+    assert result.last_rrd_id == 4
+
+
+@pytest.mark.asyncio
+async def test_old_call_still_returns_plain_rows(cabinet):
+    client = build(cabinet, [ok({"data": [{"rrdId": 1}]})])
+
+    rows = await client.sales_report_detailed("2026-09-01", "2026-09-07", limit=2)
+
+    assert rows == [{"rrdId": 1}]

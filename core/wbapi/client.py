@@ -86,6 +86,22 @@ USER_AGENT = "WBRentgen/1.0"
 
 
 @dataclass(frozen=True)
+class ReportPages:
+    """Страницы отчёта о реализации и факт, обрезана выгрузка или нет.
+
+    truncated поднимается только в одном случае: страницы кончились по потолку,
+    а курсор остался живым. «Возможно, неполные» из этого не получается, и
+    в этом весь смысл: цифры отчёта должны совпадать с кабинетом WB, а
+    пометка, которая срабатывает зря, перестаёт читаться через месяц.
+    """
+
+    rows: list[dict]
+    truncated: bool
+    pages: int = 0
+    last_rrd_id: int = 0
+
+
+@dataclass(frozen=True)
 class RetryPolicy:
     """Сколько попыток и какая пауза. Источник один: секция [queue] конфига."""
 
@@ -509,11 +525,44 @@ class WBClient:
     ) -> list[dict]:
         """Все строки отчёта за период. Пагинация по rrdId, как велит документация.
 
+        Отдаёт голый список: это привычная форма для тех, кому признак обрезки
+        не нужен. Кому нужен, тот зовёт sales_report_detailed_paged.
+        """
+        return (
+            await self.sales_report_detailed_paged(
+                date_from,
+                date_to,
+                period=period,
+                limit=limit,
+                fields=fields,
+                max_pages=max_pages,
+            )
+        ).rows
+
+    async def sales_report_detailed_paged(
+        self,
+        date_from: date | datetime | str,
+        date_to: date | datetime | str,
+        *,
+        period: str = "weekly",
+        limit: int = REPORT_PAGE,
+        fields: Sequence[str] | None = None,
+        max_pages: int = MAX_PAGES,
+    ) -> ReportPages:
+        """То же самое, но с честным ответом на вопрос «это всё?».
+
+        Обрезка это не арифметика по длинам: последняя страница вполне может
+        выйти ровно полной, и тогда счёт строк соврёт. Единственный надёжный
+        признак это ветка else у цикла: потолок страниц исчерпан, а курсор
+        остался живым, то есть строки за ним никто не прочитал.
+
         Дорожка медленная: 1 запрос в минуту. Страница за страницей это долго,
         и так и задумано: лучше медленнее, чем блокировка токена.
         """
         rows: list[dict] = []
         cursor = 0
+        pages = 0
+        truncated = False
         for _ in range(max_pages):
             body: dict[str, Any] = {
                 "dateFrom": moment(date_from),
@@ -526,13 +575,18 @@ class WBClient:
                 body["fields"] = list(fields)
             page = _listify(await self.request("sales_report_detailed", json=body), "rows", "items")
             rows.extend(page)
+            pages += 1
             if len(page) < int(limit):
                 break
             last = page[-1].get("rrdId")
             if last is None or int(last) == cursor:
                 break
             cursor = int(last)
-        return rows
+        else:
+            # Ни короткой страницы, ни исчерпанного курсора: мы просто упёрлись
+            # в потолок, и за ним остались непрочитанные строки.
+            truncated = max_pages > 0
+        return ReportPages(rows=rows, truncated=truncated, pages=pages, last_rrd_id=cursor)
 
     async def sales_reports_list(
         self,

@@ -50,6 +50,7 @@ __all__ = [
     "Month",
     "Article",
     "Check",
+    "Collected",
     "FinanceReport",
     "period_bounds",
     "collect",
@@ -613,14 +614,16 @@ async def collect(
     """
     client = wbapi.get_wb_client(client_id, http=http, path=path, clock=clock, sleep=sleep)
     page = int(limit) if limit is not None else PAGE_LIMIT
-    rows = await client.sales_report_detailed(
+    # Обрезку не вычисляем по длинам: клиент сам говорит, кончились ли
+    # страницы по потолку при живом курсоре. Ровно полная последняя страница
+    # это штатный конец выгрузки, а не повод пугать клиента.
+    downloaded = await client.sales_report_detailed_paged(
         date_from, date_to, period="weekly", limit=page, max_pages=max_pages
     )
+    rows = downloaded.rows
     saved = save_rows(client_id, rows, path=path)
-    pages = -(-len(rows) // page) if page else 0
-    # Клиент прекращает пагинацию либо на неполной странице, либо упёршись в
-    # потолок. Второе как раз и означает, что данные обрезаны.
-    truncated = pages >= max_pages and len(rows) >= page * max_pages
+    pages = downloaded.pages
+    truncated = downloaded.truncated
 
     control: dict[int, dict] = {}
     try:
@@ -728,22 +731,18 @@ def weeks_of(
 
 
 def _payload_of(raw: Any) -> tuple[dict | None, bool]:
-    """Разбирает `control_payload`: агрегат WB и признак полноты выгрузки."""
+    """Разбирает `control_payload`: агрегат WB и признак полноты выгрузки.
+
+    Колонку заполняет только `save_week` этого же модуля, поэтому форма ровно
+    одна и распознавать её не по чему. Пустая колонка значит, что неделю
+    записали без агрегата: сверка не выполнена, полнота под вопросом не
+    ставится.
+    """
     if not raw:
         return None, True
-    try:
-        stored = json.loads(raw)
-    except (TypeError, ValueError):
-        return None, True
-    if not isinstance(stored, dict):
-        return None, True
-    if "aggregate" in stored or "complete" in stored:
-        control = stored.get("aggregate")
-        return (control if isinstance(control, dict) else None), bool(
-            stored.get("complete", True)
-        )
-    # Старая форма: в колонке лежал сам агрегат.
-    return stored, True
+    stored = json.loads(raw)
+    control = stored.get("aggregate")
+    return control, bool(stored.get("complete", True))
 
 
 def _report_ids(weeks: Sequence[Week]) -> set[int]:
