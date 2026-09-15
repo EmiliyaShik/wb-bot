@@ -1,9 +1,9 @@
 """Клиент для получения данных карточки товара с Wildberries.
 
 Источники данных:
-  * card.wb.ru/cards/v4/detail — базовая карточка (название, цена, рейтинг, root);
-  * feedbacks{1,2}.wb.ru/feedbacks/v2/{root} — отзывы (ответ приходит в gzip);
-  * basket-XX.wbbasket.ru/.../card.json — описание и характеристики товара.
+  * card.wb.ru/cards/v4/detail - базовая карточка (название, цена, рейтинг, root);
+  * feedbacks{1,2}.wb.ru/feedbacks/v2/{root} - отзывы (ответ приходит в gzip);
+  * basket-XX.wbbasket.ru/.../card.json - описание и характеристики товара.
 """
 
 import asyncio
@@ -16,8 +16,8 @@ import httpx
 
 # Прокси только для запросов к Wildberries (напр. чтобы обойти гео-блок).
 # Управляется двумя переменными окружения:
-#   WB_PROXY_ENABLED — включает прокси (1/true/yes/on; по умолчанию выключен);
-#   WB_PROXY         — адрес, напр. http://user:pass@host:port или socks5://host:port.
+#   WB_PROXY_ENABLED - включает прокси (1/true/yes/on; по умолчанию выключен);
+#   WB_PROXY         - адрес, напр. http://user:pass@host:port или socks5://host:port.
 # Пока WB_PROXY_ENABLED выключен, запросы идут напрямую (см. trust_env ниже).
 # Конфиг читается лениво (в момент запроса), чтобы не зависеть от порядка
 # импорта и вызова load_dotenv().
@@ -34,7 +34,7 @@ def _env_flag(name: str, default: bool = False) -> bool:
 def _proxy_config() -> tuple[str | None, bool]:
     """Возвращает (proxy, trust_env) для httpx-клиента исходя из окружения.
 
-    Когда прокси выключен, trust_env=False — иначе httpx подхватил бы системные
+    Когда прокси выключен, trust_env=False - иначе httpx подхватил бы системные
     HTTP_PROXY/HTTPS_PROXY, и запросы шли бы не «напрямую», как задумано.
     """
     if _env_flag("WB_PROXY_ENABLED"):
@@ -42,7 +42,7 @@ def _proxy_config() -> tuple[str | None, bool]:
     return None, False
 
 # Актуальный публичный эндпоинт карточки товара (v1/v2 больше не работают).
-# dest=-1257786 — регион Москвы (нужен, чтобы вернулась цена).
+# dest=-1257786 - регион Москвы (нужен, чтобы вернулась цена).
 # Пробуем несколько зеркал: если одно недоступно, идём к следующему.
 CARD_API_HOSTS = [
     "https://card.wb.ru/cards/v4/detail",
@@ -56,7 +56,7 @@ DEFAULT_PARAMS = {
     "spp": "30",
 }
 
-# Зеркала сервиса отзывов. root может «жить» на любом из них — пробуем по очереди.
+# Зеркала сервиса отзывов. root может «жить» на любом из них - пробуем по очереди.
 FEEDBACKS_HOSTS = [
     "https://feedbacks1.wb.ru",
     "https://feedbacks2.wb.ru",
@@ -66,7 +66,7 @@ FEEDBACKS_HOSTS = [
 MAX_REVIEWS = 3
 
 # Диапазоны vol -> номер basket-хоста (по возрастанию верхней границы диапазона).
-# Таблица со временем «дрейфует», поэтому это лишь подсказка для первого запроса —
+# Таблица со временем «дрейфует», поэтому это лишь подсказка для первого запроса -
 # если она не сработает, мы всё равно переберём остальные корзины.
 BASKET_VOL_RANGES = [
     (143, 1), (287, 2), (431, 3), (719, 4), (1007, 5), (1061, 6),
@@ -97,7 +97,7 @@ class WBApiError(Exception):
 
 
 class WBBlockedError(WBApiError):
-    """Wildberries заблокировал запрос (403) — обычно из-за не-российского IP."""
+    """Wildberries заблокировал запрос (403) - обычно из-за не-российского IP."""
 
 
 @dataclass
@@ -105,7 +105,7 @@ class Review:
     """Один отзыв о товаре."""
 
     text: str
-    rating: int | None   # оценка автора отзыва, 1–5
+    rating: int | None   # оценка автора отзыва, 1-5
     date: str | None     # дата создания (как пришла от API)
 
 
@@ -121,7 +121,7 @@ class Product:
     rating: float | None         # рейтинг товара
     feedbacks: int               # количество отзывов
     supplier: str | None         # продавец
-    root: int | None = None      # id карточки (imtId) — ключ для отзывов и CDN
+    root: int | None = None      # id карточки (imtId) - ключ для отзывов и CDN
     description: str | None = None                 # описание с CDN
     characteristics: list[tuple[str, str]] = field(default_factory=list)  # (название, значение)
     reviews: list[Review] = field(default_factory=list)                   # последние отзывы
@@ -132,7 +132,7 @@ class Product:
 
 
 def _kopecks_to_rub(value: int | None) -> float | None:
-    """Цены в API приходят в копейках — переводим в рубли."""
+    """Цены в API приходят в копейках - переводим в рубли."""
     if value is None:
         return None
     return round(value / 100, 2)
@@ -159,7 +159,7 @@ def _extract_price(product: dict) -> tuple[float | None, float | None]:
             actual = _kopecks_to_rub(price.get("product") or price.get("total"))
             old = _kopecks_to_rub(price.get("basic"))
             return actual, old
-    # Запасной вариант — старый формат с salePriceU/priceU.
+    # Запасной вариант - старый формат с salePriceU/priceU.
     actual = _kopecks_to_rub(product.get("salePriceU") or product.get("priceU"))
     old = _kopecks_to_rub(product.get("priceU"))
     return actual, old
@@ -188,7 +188,7 @@ async def _request_card(client: httpx.AsyncClient, article: int) -> dict:
     if blocked:
         raise WBBlockedError(
             "Wildberries заблокировал запрос (403). Обычно так бывает при "
-            "обращении с не-российского IP — запустите бот с сервера в РФ/СНГ "
+            "обращении с не-российского IP - запустите бот с сервера в РФ/СНГ "
             "или включите прокси (WB_PROXY_ENABLED)."
         )
     raise WBApiError(f"Не удалось получить данные с Wildberries: {last_error}")
@@ -198,7 +198,7 @@ def _loads_maybe_gzip(content: bytes) -> dict:
     """Парсит JSON, при необходимости распаковывая gzip вручную.
 
     httpx сам разжимает ответ, если сервер прислал Content-Encoding: gzip,
-    но feedbacks нередко отдаёт gzip без этого заголовка — тогда content
+    но feedbacks нередко отдаёт gzip без этого заголовка - тогда content
     остаётся сжатым, и обычный .json() падает.
     """
     try:
@@ -227,7 +227,7 @@ async def _fetch_feedbacks(
 
         feedbacks = data.get("feedbacks")
         count = data.get("feedbackCount")
-        # root, которого нет на этом зеркале, отдаёт пустой набор — идём дальше.
+        # root, которого нет на этом зеркале, отдаёт пустой набор - идём дальше.
         if not feedbacks and not count:
             continue
 
@@ -288,7 +288,7 @@ async def _fetch_card_details(
     """Забирает описание и характеристики с CDN basket-XX. Best-effort.
 
     Путь на CDN строится по nmId (артикулу), а не по root: описание и
-    характеристики лежат именно под nmId. root тут не подходит — по нему
+    характеристики лежат именно под nmId. root тут не подходит - по нему
     подтягивается карточка чужого товара.
     """
     vol = nm_id // 100000
@@ -345,7 +345,7 @@ async def fetch_product(article: int) -> Product:
         if not root:
             return product
 
-        # Отзывы и карточку с CDN тянем параллельно — оба источника опциональны.
+        # Отзывы и карточку с CDN тянем параллельно - оба источника опциональны.
         (fb_rating, fb_count, reviews), (description, characteristics) = (
             await asyncio.gather(
                 _fetch_feedbacks(client, root),

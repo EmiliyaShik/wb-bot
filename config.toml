@@ -1,0 +1,106 @@
+# Цены, периоды, пороги и расписание. Секретов и реквизитов здесь нет:
+# они живут только в переменных окружения (см. .env.example).
+
+[modules.finance]
+price_month = 990
+agents = ["finance", "watchdog", "profit"]
+visible = true
+title = "Финансы"
+
+[modules.rnp]
+price_month = 590
+agents = ["rnp"]
+visible = true
+title = "План-факт"
+
+[modules.ads]
+price_month = 1290
+agents = ["ads_report", "minus_clusters"]
+visible = false          # откроется на этапе 3
+title = "Реклама"
+
+[modules.funnel]
+price_month = 490
+agents = ["funnel"]
+visible = false          # откроется на этапе 3
+title = "Воронка"
+
+[modules.all]
+price_month = 2290
+agents = []
+includes = "*"           # все видимые модули
+visible = true
+title = "Всё сразу"
+
+[periods]                # скидка в процентах
+months_1 = 0
+months_3 = 10
+months_12 = 20
+
+[trial]
+days = 7
+modules = 1              # один модуль на выбор
+
+[access]
+grace_days = 3
+renewal_notice_days = 5
+retention_days = 30
+retention_notice_days = 3
+
+[alerts]                 # пороги сторожа скрытых расходов, в п.п.
+acquiring = 0.5
+commission = 2.0
+spp = -5.0
+logistics_share = 2.0
+storage_share = 2.0
+baseline_weeks = 4
+
+[schedule]
+timezone = "Europe/Moscow"
+daily_at = "09:00"
+
+[invoice]
+valid_bank_days = 5
+vat_note = ""            # заполнить: налоговый режим ИП
+holidays = []            # нерабочие дни сверх выходных, ГГГГ-ММ-ДД
+service_name = "Предоставление доступа к онлайн-сервису WBРентген, модуль {module}, период {period}"
+
+[limits]
+client_messages_per_minute = 20   # вежливый отказ при превышении
+wb_requests_per_domain = 3        # лимит WB: 3 запроса
+wb_requests_window_sec = 30       # за 30 секунд на домен
+
+# Категория токена WB -> что перестанет работать, если её не выдали.
+# Читает хендлер подключения кабинета, когда разбирает маску токена.
+# breaks - модули, которые без этой категории не заработают совсем;
+# note - что сказать селлеру своими словами.
+
+[token_categories.statistics]
+title = "Статистика"
+breaks = []
+breaks_diagnostic = false
+note = "Сейчас эта категория ни для чего не используется, она запрошена на будущее."
+
+[token_categories.finance]
+title = "Финансы"
+breaks = ["finance"]
+breaks_diagnostic = true
+note = "Не заработает модуль finance и бесплатная диагностика."
+
+[token_categories.promotion]
+title = "Продвижение"
+breaks = []
+breaks_diagnostic = false
+note = "Не будет расхода рекламы в /profit и ДРР в плане-факте. Остальное работает."
+
+[token_categories.analytics]
+title = "Аналитика"
+breaks = ["rnp"]
+breaks_diagnostic = false
+note = "Не заработает модуль rnp, это план-факт по дням."
+
+[token_categories.content]
+title = "Контент"
+breaks = []
+breaks_diagnostic = false
+note = "Не собрать шаблон себестоимости по вашим артикулам."

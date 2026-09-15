@@ -1,4 +1,4 @@
-# Секреты — НИКОГДА не коммитим (кроме шаблона .env.example)
+# Секреты - НИКОГДА не коммитим (кроме шаблона .env.example)
 .env
 .env.*
 !.env.example
@@ -11,3 +11,18 @@ venv/
 
 # Архивы
 wb-bot.zip
+
+# Autopilot: pid/лог локального сервера дашборда
+.autopilot/serve.*
+
+# Данные, база, счета и выгрузки - никогда не коммитим
+data/
+*.db
+*.sqlite3
+invoices/
+exports/
+*.xlsx
+!**/templates/*.xlsx
+
+# Служебные файлы Word и Excel
+~$*
