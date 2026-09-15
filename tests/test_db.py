@@ -201,6 +201,7 @@ def test_admin_repo_has_no_open_sql(db_path):
         "set_client_fields",
         "delete_client",
         "next_invoice_number",
+        "tokens_with_exp",
         "add_event",
         "events",
         "add_task",
@@ -223,28 +224,39 @@ def test_admin_repo_has_no_open_sql(db_path):
 
 
 def test_business_rows_of_a_client_are_returned_by_nobody_else(db_path):
-    """Недоступность доказана данными: строку клиента не отдаёт ни общий слой,
-    ни репозиторий другого клиента."""
+    """Недоступность доказана данными: деловую строку клиента не отдаёт ни
+    общий слой, ни репозиторий другого клиента.
+
+    Обход разбирает и строки базы, и кортежи: метод, который отдаёт пару вместо
+    строки, обязан попадать под ту же проверку, иначе она не поймает как раз то,
+    что добавят позже.
+    """
     admin = db.admin_repo(db_path)
     mine = admin.ensure_client(telegram_id=4004)
     other = admin.ensure_client(telegram_id=4005)
-    marker = 424242
+
+    # приметные значения: если хоть одно всплывёт в общем слое, это утечка
+    secret = b"shifrotekst-4004"
+    forbidden = {secret, 424242, 99000, "WBR-2026-9999", "srid-4004", 777000}
+    exp = "2026-11-30"  # срок токена отдавать разрешено, это исключение
 
     repo = db.repo(mine, db_path)
-    repo.insert("costs", nm_id=marker, cost_per_unit_kop=100)
-    repo.insert("wb_tokens", ciphertext=b"secret", scopes="finance")
-    repo.insert("nm_daily", date="2026-09-01", nm_id=marker, orders=1)
-    repo.insert("fin_rows", report_id=1, rrd_id=marker, nm_id=marker)
+    repo.insert("costs", nm_id=424242, cost_per_unit_kop=100)
+    repo.insert("wb_tokens", ciphertext=secret, scopes="finance", exp=exp)
+    repo.insert("nm_daily", date="2026-09-01", nm_id=424242, orders=1)
+    repo.insert("fin_rows", report_id=1, rrd_id=424242, srid="srid-4004")
+    repo.insert("fin_weeks", report_id=1, date_from="2026-09-01", date_to="2026-09-07")
+    repo.insert("plans", year_month="2026-09", revenue_target_kop=777000)
     repo.insert("invoices", number="WBR-2026-9999", module="finance",
                 period_months=1, amount_kop=99000)
     repo.insert("module_access", module="finance", state="active")
+    repo.insert("access_log", module="finance", action="grant")
+    repo.insert("consents", offer_url="https://example.test/offer")
 
     for table in CLIENT_DATA_TABLES:
         assert db.repo(other, db_path).rows(table) == [], f"чужой клиент видит {table}"
 
-    # общий слой не умеет отдать ни одну из этих строк: методов под них нет,
-    # а произвольного SQL не существует
-    reachable = []
+    seen: dict[str, set] = {}
     writers = ("add_", "set_", "delete_", "update_", "mark_", "start_", "ensure_", "next_")
     for name in dir(admin):
         if name.startswith("_") or name.startswith(writers):
@@ -252,22 +264,43 @@ def test_business_rows_of_a_client_are_returned_by_nobody_else(db_path):
         method = getattr(admin, name)
         if not callable(method):
             continue
-        for args in ((), (mine,), ("seller-1",)):
+        for args in ((), (mine,), ("seller-1",), ("weekly_check",)):
             try:
                 result = method(*args)
-            except TypeError:
+            except Exception:  # noqa: BLE001 - метод просто не про эти аргументы
                 continue
-            except Exception:
-                continue
-            rows = result if isinstance(result, list) else [result]
-            for row in rows:
-                try:
-                    keys = set(row.keys())
-                except AttributeError:
-                    continue
-                if {"ciphertext", "cost_per_unit_kop", "amount_kop", "rrd_id"} & keys:
-                    reachable.append(name)
-    assert not reachable, f"общий слой отдал деловые данные клиента: {reachable}"
+            seen.setdefault(name, set()).update(_values(result))
+
+    leaks = {name: values & forbidden for name, values in seen.items() if values & forbidden}
+    assert not leaks, f"общий слой отдал деловые данные клиента: {leaks}"
+
+    # исключение из правила изоляции, названное в докстринге AdminRepo:
+    # срок токена отдаётся по всем клиентам, сам токен нет
+    assert exp in seen["tokens_with_exp"], "обход не заглянул внутрь кортежей"
+    assert mine in seen["tokens_with_exp"]
+    assert secret not in seen["tokens_with_exp"]
+
+
+def _values(result) -> set:
+    """Все скалярные значения результата: и строки базы, и кортежи, и списки."""
+    found: set = set()
+    stack = [result]
+    while stack:
+        item = stack.pop()
+        if item is None:
+            continue
+        keys = getattr(item, "keys", None)
+        if callable(keys):  # строка базы
+            stack.extend(item[key] for key in item.keys())
+            continue
+        if isinstance(item, (list, tuple, set)):
+            stack.extend(item)
+            continue
+        try:
+            found.add(item)
+        except TypeError:  # что-то нехешируемое, для проверки бесполезно
+            found.add(str(item))
+    return found
 
 
 def test_deleting_client_removes_all_his_rows(db_path):
@@ -407,3 +440,28 @@ def test_parallel_calls_for_different_years_do_not_mix(db_path):
             if value.startswith(f"WBR-{year}-")
         )
         assert own == [1, 2, 3, 4], f"{year}: {own}"
+
+
+def test_token_expiry_is_read_for_everyone_at_once(db_path):
+    """Напоминаниям о сроке токена нужен один проход по всем клиентам,
+    и сам токен наружу при этом не выходит."""
+    admin = db.admin_repo(db_path)
+    secret = b"shifrotekst-kotoryy-nelzya-otdavat"
+    expected = []
+    for telegram_id, exp in ((6001, "2026-10-01"), (6002, "2026-12-31"), (6003, None)):
+        client_id = admin.ensure_client(telegram_id=telegram_id)
+        db.repo(client_id, db_path).insert("wb_tokens", ciphertext=secret, exp=exp)
+        expected.append((client_id, exp))
+    admin.ensure_client(telegram_id=6004)  # клиент без токена
+
+    result = admin.tokens_with_exp()
+    assert result == expected, result
+    assert all(len(pair) == 2 for pair in result)
+    assert not any(secret in str(pair).encode() for pair in result)
+    assert not any("shifrotekst" in str(pair) for pair in result)
+
+
+def test_token_expiry_is_empty_without_tokens(db_path):
+    admin = db.admin_repo(db_path)
+    admin.ensure_client(telegram_id=6100)
+    assert admin.tokens_with_exp() == []
