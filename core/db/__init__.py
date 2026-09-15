@@ -52,10 +52,14 @@ def from_kop(kopecks: int | None) -> Decimal:
     """Копейки из базы обратно в рубли как Decimal, без потери точности."""
     return Decimal(int(kopecks or 0)) / Decimal(100)
 
+
 _IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
 _connections: dict[str, sqlite3.Connection] = {}
 _lock = threading.Lock()
+# Выдача номера счёта сериализуется здесь, а не у вызывающего: номер обязан
+# быть сквозным и без дыр, кто бы его ни попросил.
+_number_lock = threading.Lock()
 
 
 def _resolve(path: str | Path | None) -> Path:
@@ -286,25 +290,26 @@ class AdminRepo:
         self._conn.execute("DELETE FROM clients WHERE id = ?", (int(client_id),))
 
     def next_invoice_number(self, year: int) -> str:
-        """Следующий номер счёта, сквозной в пределах года и без повторов."""
+        """Следующий номер счёта, сквозной в пределах года и без повторов.
+
+        Соединение одно на файл и общее для потоков (sqlite3 собран с
+        threadsafety=3, так что сам по себе это разрешённый режим). Ручной
+        BEGIN IMMEDIATE на таком соединении ронял вторую параллельную выдачу
+        с «cannot start a transaction within a transaction»: транзакция
+        принадлежит соединению, а не вызывающему.
+
+        Поэтому номер выдаётся одним оператором, который увеличивает счётчик
+        и сразу возвращает результат, а вызовы сериализуются замком здесь же,
+        в слое данных. Вызывающему заводить свой замок не нужно.
+        """
         year = int(year)
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO invoice_seq (year, last_number) VALUES (?, 0)",
-                (year,),
-            )
-            self._conn.execute(
-                "UPDATE invoice_seq SET last_number = last_number + 1 WHERE year = ?",
-                (year,),
-            )
+        with _number_lock:
             row = self._conn.execute(
-                "SELECT last_number FROM invoice_seq WHERE year = ?", (year,)
+                "INSERT INTO invoice_seq (year, last_number) VALUES (?, 1)"
+                " ON CONFLICT(year) DO UPDATE SET last_number = last_number + 1"
+                " RETURNING last_number",
+                (year,),
             ).fetchone()
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
         return f"WBR-{year}-{int(row[0]):04d}"
 
     # --- журнал ---

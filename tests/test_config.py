@@ -198,3 +198,9 @@ def test_periods_see_a_new_key(monkeypatch):
 def test_schedule_says_how_often_to_look_for_the_weekly_report():
     schedule = config.settings()["schedule"]
     assert schedule["weekly_check_hours"] == 6
+
+
+def test_upload_limit_is_owner_setting_not_a_number_in_code():
+    limits = config.settings()["limits"]
+    assert limits["upload_max_mb"] == 5
+    assert limits["client_messages_per_minute"] == 20

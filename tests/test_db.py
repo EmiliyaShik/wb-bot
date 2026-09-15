@@ -372,3 +372,38 @@ def test_tasks_by_kind_does_not_depend_on_table_size(db_path):
     assert admin.tasks_by_kind("нет-такого-вида") == []
     assert len(admin.tasks_by_kind("housekeeping")) == 50
     assert len(admin.tasks_by_kind("housekeeping", limit=5)) == 5
+
+
+def test_invoice_numbers_survive_parallel_calls(db_path):
+    """Соединение одно на весь процесс и общее для потоков, поэтому ручной
+    BEGIN на нём ронял вторую параллельную выдачу. Сериализация выдачи живёт
+    в слое данных, а не у вызывающего."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    admin = db.admin_repo(db_path)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: admin.next_invoice_number(2026), range(8)))
+
+    assert len(set(results)) == 8, f"номера повторились: {results}"
+    numbers = sorted(int(value.rsplit("-", 1)[1]) for value in results)
+    assert numbers == list(range(1, 9)), f"в номерах дыра: {numbers}"
+    assert all(value.startswith("WBR-2026-") for value in results)
+    # счётчик после гонки в согласованном состоянии
+    assert admin.next_invoice_number(2026) == "WBR-2026-0009"
+
+
+def test_parallel_calls_for_different_years_do_not_mix(db_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    admin = db.admin_repo(db_path)
+    years = [2026, 2027] * 4
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(admin.next_invoice_number, years))
+
+    for year in (2026, 2027):
+        own = sorted(
+            int(value.rsplit("-", 1)[1])
+            for value in results
+            if value.startswith(f"WBR-{year}-")
+        )
+        assert own == [1, 2, 3, 4], f"{year}: {own}"

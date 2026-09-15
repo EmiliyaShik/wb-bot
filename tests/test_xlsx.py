@@ -1,0 +1,178 @@
+"""Общий помощник по xlsx: книги, листы, заголовки.
+
+Про себестоимость тут нет ни слова, и это условие: тем же помощником
+пользуются финансовые отчёты, прибыльность артикулов и реестр актов.
+"""
+
+import pytest
+
+from core import xlsx
+
+
+def test_write_book_returns_real_xlsx_bytes():
+    data = xlsx.write_book(xlsx.Sheet("Лист", ["Имя", "Число"], [["Аня", 7]]))
+
+    assert isinstance(data, bytes)
+    assert data[:2] == b"PK"
+    assert xlsx.looks_like_xlsx(data)
+
+
+def test_read_book_returns_headers_and_rows_by_header_name():
+    data = xlsx.write_book(
+        xlsx.Sheet("Лист", ["Имя", "Число"], [["Аня", 7], ["Боря", 8]])
+    )
+
+    sheet = xlsx.read_sheet(data)
+
+    assert sheet.title == "Лист"
+    assert sheet.headers == ("Имя", "Число")
+    assert [row.cells["Имя"] for row in sheet.rows] == ["Аня", "Боря"]
+    assert [row.number for row in sheet.rows] == [2, 3]
+
+
+def test_book_keeps_several_sheets():
+    data = xlsx.write_book(
+        [
+            xlsx.Sheet("Первый", ["A"], [[1]]),
+            xlsx.Sheet("Второй", ["B"], [[2], [3]]),
+        ]
+    )
+
+    book = xlsx.read_book(data)
+
+    assert book.titles == ("Первый", "Второй")
+    assert len(book["Второй"].rows) == 2
+    assert book.first.title == "Первый"
+
+
+def test_read_sheet_by_title_and_unknown_title_is_an_error():
+    data = xlsx.write_book(
+        [xlsx.Sheet("Первый", ["A"], [[1]]), xlsx.Sheet("Второй", ["B"], [[2]])]
+    )
+
+    assert xlsx.read_sheet(data, title="Второй").headers == ("B",)
+    with pytest.raises(xlsx.SheetNotFoundError):
+        xlsx.read_sheet(data, title="Третий")
+
+
+def test_column_is_found_by_synonyms_regardless_of_case_and_spaces():
+    data = xlsx.write_book(xlsx.Sheet("Лист", ["  nmID ", "Цена, руб"], [[1, 2]]))
+
+    sheet = xlsx.read_sheet(data)
+
+    assert sheet.column("nmid", "код") == "nmID"
+    assert sheet.column("название") is None
+    assert sheet.missing({"nmid": ("nmid",), "имя": ("имя",)}) == ("имя",)
+
+
+def test_alien_format_renamed_to_xlsx_is_rejected_not_crashed():
+    with pytest.raises(xlsx.NotXlsxError):
+        xlsx.read_book(b"%PDF-1.4 and then some bytes")
+    assert not xlsx.looks_like_xlsx(b"%PDF-1.4")
+
+
+def test_zip_without_workbook_inside_is_not_xlsx():
+    import io
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("readme.txt", "ничего общего с книгой")
+
+    with pytest.raises(xlsx.NotXlsxError):
+        xlsx.read_book(buffer.getvalue())
+
+
+def test_file_above_the_limit_is_rejected_before_parsing():
+    data = xlsx.write_book(xlsx.Sheet("Лист", ["A"], [[1]]))
+
+    with pytest.raises(xlsx.TooLargeError):
+        xlsx.read_book(data, max_bytes=10)
+
+
+def test_empty_rows_are_skipped_but_row_numbers_stay_real():
+    data = xlsx.write_book(
+        xlsx.Sheet("Лист", ["A", "B"], [[1, "x"], [None, None], [3, "z"]])
+    )
+
+    sheet = xlsx.read_sheet(data)
+
+    assert [row.number for row in sheet.rows] == [2, 4]
+
+
+def test_write_book_can_save_to_path_and_read_it_back(tmp_path):
+    target = tmp_path / "книга.xlsx"
+
+    xlsx.write_book(xlsx.Sheet("Лист", ["A"], [[42]]), path=target)
+
+    assert target.exists()
+    assert xlsx.read_sheet(target).rows[0].cells["A"] == 42
+
+
+def test_reading_stops_at_the_row_limit_instead_of_swallowing_the_book():
+    """Книга на порядок больше предела: важно, что обход оборвался на нём."""
+    data = xlsx.write_book(xlsx.Sheet("Лист", ["A"], [[i] for i in range(500)]))
+
+    with pytest.raises(xlsx.TooManyRowsError) as exc:
+        xlsx.read_book(data, max_rows=20)
+
+    # Дошли ровно до двадцать первой строки и там остановились, а не собрали
+    # все пятьсот, чтобы потом сверить итог.
+    assert exc.value.rows == 21
+    assert exc.value.limit == 20
+    # Предел по умолчанию есть и он конечный: разжатый лист на миллионы
+    # строк не должен собираться в память целиком.
+    assert 0 < xlsx.MAX_ROWS < 10_000_000
+
+
+def test_a_sheet_of_empty_rows_spends_the_limit_too():
+    """Пустые строки сжимаются лучше всего, и бомбу делают именно из них."""
+    data = xlsx.write_book(
+        xlsx.Sheet("Лист", ["A"], [[None] for _ in range(500)] + [[1]])
+    )
+
+    with pytest.raises(xlsx.TooManyRowsError) as exc:
+        xlsx.read_book(data, max_rows=20)
+
+    assert exc.value.rows == 21
+
+
+def test_reading_stops_at_the_cell_limit_too():
+    data = xlsx.write_book(
+        xlsx.Sheet("Лист", ["A", "B", "C"], [[1, 2, 3] for _ in range(500)])
+    )
+
+    with pytest.raises(xlsx.TooManyCellsError) as exc:
+        xlsx.read_book(data, max_cells=30)
+
+    # Одиннадцатая строка перешагнула тридцать ячеек, на ней и встали.
+    assert exc.value.cells == 33
+    assert 0 < xlsx.MAX_CELLS < 100_000_000
+
+
+def test_row_limit_counts_the_whole_book_not_one_sheet():
+    data = xlsx.write_book(
+        [xlsx.Sheet("Первый", ["A"], [[1], [2]]), xlsx.Sheet("Второй", ["A"], [[3]])]
+    )
+
+    with pytest.raises(xlsx.TooManyRowsError):
+        xlsx.read_book(data, max_rows=2)
+
+
+def test_unreadable_workbook_tells_the_owner_the_real_reason(monkeypatch):
+    """Селлер видит «это не xlsx», владелец в журнале - настоящую причину."""
+    written = []
+    monkeypatch.setattr(
+        xlsx.audit, "log", lambda kind, client_id, message, **kw: written.append(message)
+    )
+
+    def explode(*args, **kwargs):
+        raise ValueError("внутренняя беда разбора")
+
+    monkeypatch.setattr(xlsx, "load_workbook", explode)
+    data = xlsx.write_book(xlsx.Sheet("Лист", ["A"], [[1]]))
+
+    with pytest.raises(xlsx.NotXlsxError):
+        xlsx.read_book(data)
+
+    assert any("внутренняя беда разбора" in message for message in written)
