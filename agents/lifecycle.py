@@ -98,6 +98,7 @@ COLLECT_JOB = "lifecycle_finance_collect"  # суточный сбор фина�
 WEEKLY_JOB = "lifecycle_weekly"    # новый финотчёт WB появился
 
 _TIME_FORMAT = "%H:%M"
+_MARK_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 # --- сроки из конфига ---------------------------------------------------------
@@ -343,27 +344,25 @@ def fan_out_daily(task: Any, *, path: str | Path | None = None) -> list[int]:
 
 
 def new_report_of(client_id: int, *, path: str | Path | None = None) -> int | None:
-    """Появился ли у клиента финотчёт WB, о котором мы ещё не говорили.
+    """Появился ли у клиента новый финотчёт WB. Проба расписания, одна на всех.
 
-    Смотрим в базу, а не в календарь: недельная раскладка уходит тогда,
-    когда данные появились, а не в назначенный день недели. Строки в
-    fin_weeks кладёт сбор финансиста (см. scan_client ниже).
+    Смотрим в базу, а не в календарь: недельные работы уходят тогда, когда
+    данные появились, а не в назначенный день недели.
+
+    **Владелец пробы один, и это жизненный цикл.** Проба у планировщика одна,
+    и если её ставят двое, побеждает тот, кто зарегистрировался позже, то есть
+    порядок имён файлов в реестре хендлеров. Ломается это молча.
+
+    Само знание остаётся у сторожа: номер последнего отчёта считается в
+    `watchdog.latest_report` и здесь не пересчитывается. Повтор по тому же
+    отчёту гасит планировщик: он не ставит задачу того же вида с тем же
+    `report_id` дважды, и делает это отдельно для каждой недельной работы.
     """
     try:
-        rows = db.repo(client_id, path).rows("fin_weeks")
+        return watchdog.latest_report(client_id, path=path)
     except Exception:  # noqa: BLE001 - один клиент не ломает обход
         logger.exception("не удалось проверить финотчёты клиента %s", client_id)
         return None
-    if not rows:
-        return None
-    latest = max(int(row["report_id"]) for row in rows)
-    seen = _marks(client_id, path).get("weekly_report")
-    try:
-        if seen is not None and int(latest) <= int(seen):
-            return None
-    except (TypeError, ValueError):
-        pass
-    return latest
 
 
 async def weekly_job(
@@ -375,19 +374,11 @@ async def weekly_job(
     моменту в базе, их положил суточный сбор, и повторная выгрузка из WB тут
     не нужна - она самая дорогая работа в проекте.
 
-    Отметка о том, что отчёт учтён, ставится в любом случае: выключенная
-    рассылка не должна превращать один финотчёт в вечную очередь задач.
+    Повтор по тому же отчёту гасит планировщик, своей отметки тут нет:
+    вторая такая же привязка к одному и тому же факту разошлась бы с первой
+    при первом же расхождении.
     """
     client_id = int(client_id if client_id is not None else task.client_id)
-    report_id = _payload(task).get("report_id")
-
-    data = _settings(client_id, path)
-    marks = data.get(MARKS_KEY)
-    marks = dict(marks) if isinstance(marks, dict) else {}
-    if report_id is not None:
-        marks["weekly_report"] = int(report_id)
-    data[MARKS_KEY] = marks
-    _save(client_id, data, path)
 
     if not access.has_access(client_id, finance.MODULE, path=path):
         return None
@@ -591,19 +582,17 @@ def check(
     moment = _utc(now)
 
     gone = off_since(client_id, now=moment, path=path)
-    if gone is not None:
-        left = retention_days() - (moment - gone).days
-        if left <= 0:
-            # Удаление старше любых предупреждений: говорить про продление
-            # тому, чьи данные уже пора стирать, поздно и незачем.
-            return [
-                Event(
-                    kind=DELETED,
-                    client_id=int(client_id),
-                    days_left=0,
-                    until=gone + timedelta(days=retention_days()),
-                )
-            ]
+    if gone is not None and _deletion_due(client_id, gone, moment, path):
+        # Удаление старше любых предупреждений: говорить про продление
+        # тому, чьи данные уже пора стирать, поздно и незачем.
+        return [
+            Event(
+                kind=DELETED,
+                client_id=int(client_id),
+                days_left=0,
+                until=moment,
+            )
+        ]
 
     events: list[Event] = []
     for module in _modules_of(client_id, path):
@@ -622,30 +611,85 @@ def check(
         ):
             events.append(event)
 
-    if gone is not None:
+    if gone is not None and _warned_at(client_id, path) is None:
         left = retention_days() - (moment - gone).days
         if left <= retention_notice_days():
-            warning = Event(
-                kind=RETENTION,
-                client_id=int(client_id),
-                days_left=max(0, left),
-                until=gone + timedelta(days=retention_days()),
+            # Удаление не раньше, чем через retention_notice_days после самого
+            # предупреждения. Если бот молчал и срок уже вышел, дата удаления
+            # отодвигается: иначе человек узнал бы об удалении из сообщения
+            # о том, что оно уже случилось.
+            when = max(
+                gone + timedelta(days=retention_days()),
+                moment + timedelta(days=retention_notice_days()),
             )
-            if not _marked(client_id, RETENTION, "*", warning.stamp or "1", path):
-                events.append(warning)
+            events.append(
+                Event(
+                    kind=RETENTION,
+                    client_id=int(client_id),
+                    days_left=max(0, (when - moment).days),
+                    until=when,
+                )
+            )
     return events
 
 
-def remember(client_id: int, event: Event, *, path: str | Path | None = None) -> None:
+def _warned_at(client_id: int, path: str | Path | None) -> datetime | None:
+    """Когда клиенту ушло предупреждение об удалении. None - не уходило.
+
+    Отметка хранит момент отправки, а не дату удаления: от неё считается
+    само удаление, и она же говорит, было ли предупреждение вообще.
+    """
+    section = _marks(client_id, path).get(RETENTION)
+    section = section if isinstance(section, dict) else {}
+    raw = section.get("*")
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(str(raw), _MARK_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _deletion_due(
+    client_id: int, gone: datetime, moment: datetime, path: str | Path | None
+) -> bool:
+    """Пора ли стирать: срок хранения вышел И предупреждение уже отправлено.
+
+    Требование R71 говорит «удаляются с предупреждением за 3 дня», и это
+    условие удаления, а не украшение перед ним. Пока предупреждение не ушло,
+    данные живут: единственное необратимое действие в сборке не должно
+    зависеть от того, работал ли бот в нужный день.
+    """
+    if (moment - gone).days < retention_days():
+        return False
+    warned = _warned_at(client_id, path)
+    if warned is None or warned < gone:
+        # Предупреждения не было вовсе, либо оно из прошлого круга: клиент
+        # успел снова включить модуль, а потом снова выключиться.
+        return False
+    return moment >= warned + timedelta(days=retention_notice_days())
+
+
+def remember(
+    client_id: int,
+    event: Event,
+    *,
+    now: datetime | None = None,
+    path: str | Path | None = None,
+) -> None:
     """Отмечает, что предупреждение отправлено.
 
     Отметка привязана к сроку: продлил доступ - срок другой, и предупреждение
-    о новом конце придёт снова, само собой, без чистки отметок.
+    о новом конце придёт снова, само собой, без чистки отметок. У отметки об
+    удалении смысл другой: она хранит момент отправки, потому что от него
+    считается само удаление.
     """
     if event.kind == DELETED:
         return
-    stamp = event.stamp or "1"
-    _mark(client_id, event.kind, event.key, stamp, path)
+    if event.kind == RETENTION:
+        _mark(client_id, RETENTION, "*", _utc(now).strftime(_MARK_FORMAT), path)
+        return
+    _mark(client_id, event.kind, event.key, event.stamp or "1", path)
 
 
 def erase(client_id: int, *, path: str | Path | None = None) -> dict[str, int]:
@@ -690,7 +734,7 @@ async def daily_job(
                 if event.kind == DELETED:
                     erase(client_id, path=path)
                 else:
-                    remember(client_id, event, path=path)
+                    remember(client_id, event, now=moment, path=path)
             except Exception:  # noqa: BLE001 - один клиент не ломает обход
                 logger.exception("не удалось закрыть событие клиента %s", client_id)
                 continue

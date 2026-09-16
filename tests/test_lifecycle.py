@@ -333,8 +333,16 @@ def test_retention_warning_comes_three_days_before_deletion(db_path):
 
     assert lifecycle.check(client_id, now=utc("2026-10-30 09:00"), path=db_path) == []
 
-    events = lifecycle.check(client_id, now=utc("2026-11-01 09:00"), path=db_path)
+    warned = utc("2026-11-01 09:00")
+    events = lifecycle.check(client_id, now=warned, path=db_path)
     assert kinds(events) == [lifecycle.RETENTION]
+
+    # Предупредили в срок - удалили в срок, через retention_notice_days.
+    lifecycle.remember(client_id, events[0], now=warned, path=db_path)
+    assert lifecycle.check(client_id, now=utc("2026-11-03 09:00"), path=db_path) == []
+    assert kinds(lifecycle.check(client_id, now=utc("2026-11-04 09:00"), path=db_path)) == [
+        lifecycle.DELETED
+    ]
 
 
 def test_deletion_after_thirty_days_leaves_nothing_but_an_anonymous_log(db_path):
@@ -347,7 +355,18 @@ def test_deletion_after_thirty_days_leaves_nothing_but_an_anonymous_log(db_path)
     repo.insert("nm_daily", date="2026-09-10", nm_id=1)
     repo.insert("fin_weeks", report_id=1, date_from="2026-09-01", date_to="2026-09-07")
 
-    events = lifecycle.check(client_id, now=utc("2026-11-05 09:00"), path=db_path)
+    # Предупреждения не было: бот молчал, и на 35-й день данные не стираются,
+    # а уходит предупреждение. Удаление ждёт retention_notice_days после него.
+    late = utc("2026-11-05 09:00")
+    events = lifecycle.check(client_id, now=late, path=db_path)
+    # Про выключение модуля клиенту тоже ещё не говорили: бот молчал.
+    assert kinds(events) == [lifecycle.SHUTDOWN, lifecycle.RETENTION]
+    for event in events:
+        lifecycle.remember(client_id, event, now=late, path=db_path)
+
+    assert lifecycle.check(client_id, now=utc("2026-11-07 09:00"), path=db_path) == []
+
+    events = lifecycle.check(client_id, now=utc("2026-11-08 09:00"), path=db_path)
     assert kinds(events) == [lifecycle.DELETED]
 
     lifecycle.erase(client_id, path=db_path)
@@ -503,10 +522,14 @@ async def test_daily_job_sends_the_warning_once_and_deletes_when_the_time_comes(
     await lifecycle.daily_job(now=utc("2026-09-28 09:00"), path=db_path)
     assert len(bot.sent) == 1
 
-    # Через 30 дней после выключения данные уходят, но сообщение уже отправлено.
+    # Срок хранения вышел, но предупреждения не было: сначала предупреждаем.
     await lifecycle.daily_job(now=utc("2026-11-05 09:00"), path=db_path)
-    assert db.admin_repo(db_path).client(client_id) is None
+    assert db.admin_repo(db_path).client(client_id) is not None
     assert any("удал" in text.lower() for _, text, _ in bot.sent)
+
+    # И только потом, через retention_notice_days, стираем.
+    await lifecycle.daily_job(now=utc("2026-11-08 09:00"), path=db_path)
+    assert db.admin_repo(db_path).client(client_id) is None
 
 
 def test_all_deadlines_come_from_config_not_from_code(db_path, monkeypatch):
@@ -534,7 +557,13 @@ def test_all_deadlines_come_from_config_not_from_code(db_path, monkeypatch):
     assert kinds(lifecycle.check(client_id, now=utc("2026-09-21 09:00"), path=db_path)) == [
         lifecycle.RENEWAL
     ]
-    # Льготных дней нет, хранение 5 дней: 6 октября удалять.
+    # Льготных дней нет, хранение 5 дней: 6 октября предупреждать, и удалять
+    # через retention_notice_days после предупреждения, то есть 7 октября.
+    warned = utc("2026-10-06 09:00")
+    events = lifecycle.check(client_id, now=warned, path=db_path)
+    assert lifecycle.RETENTION in kinds(events)
+    for event in events:
+        lifecycle.remember(client_id, event, now=warned, path=db_path)
     assert kinds(lifecycle.check(client_id, now=utc("2026-10-07 09:00"), path=db_path)) == [
         lifecycle.DELETED
     ]
@@ -555,3 +584,36 @@ def test_only_one_morning_dispatch_is_registered_and_it_is_the_lifecycle_one(db_
     assert lifecycle.COLLECT_JOB in names
     assert rnp.COLLECT_ALL in names
     assert rnp.REPORT_ALL not in names
+
+
+def test_the_weekly_probe_is_registered_once_and_by_the_lifecycle(db_path, monkeypatch):
+    from agents import finance, rnp, watchdog
+    from core import scheduler
+
+    # Проба у планировщика одна на всех. Если её ставят двое, побеждает тот,
+    # кто зарегистрировался позже, а порядок зависит от имён файлов в реестре
+    # хендлеров: недельная рассылка сломается молча.
+    put = []
+    real = scheduler.set_report_probe
+
+    def spy(fn):
+        put.append(fn)
+        real(fn)
+
+    monkeypatch.setattr(scheduler, "set_report_probe", spy)
+
+    rnp.register_jobs()
+    finance.register_jobs()
+    watchdog.register_jobs(path=db_path)
+    lifecycle.register_jobs(path=db_path)
+
+    assert len(put) == 1
+    assert getattr(put[0], "func", put[0]) is lifecycle.new_report_of
+
+    # И она отвечает на вопрос, ради которого стоит: появился новый отчёт.
+    client_id = connect(db_path, 777080)
+    assert lifecycle.new_report_of(client_id, path=db_path) is None
+    db.repo(client_id, db_path).insert(
+        "fin_weeks", report_id=7, date_from="2026-09-07", date_to="2026-09-13"
+    )
+    assert lifecycle.new_report_of(client_id, path=db_path) == 7

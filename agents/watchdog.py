@@ -427,8 +427,8 @@ async def alerts_task(task: Any, *, path: str | Path | None = None) -> Watch | N
 def register_jobs(*, path: str | Path | None = None) -> None:
     """Связывает недельную работу с расписанием. Зовёт сборка бота, не импорт.
 
-    Заодно ставится проба нового отчёта: она читает базу, а не Wildberries,
-    и других недельных работ в проекте пока нет.
+    Пробу нового отчёта здесь больше не ставим: она одна на весь планировщик,
+    и её владелец один, agents.lifecycle. Знание о последнем отчёте остаётся
+    тут, в latest_report, и проба зовёт именно его.
     """
     scheduler.register_weekly(TASK_KIND, alerts_task)
-    scheduler.set_report_probe(lambda client_id: latest_report(client_id, path=path))

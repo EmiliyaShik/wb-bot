@@ -290,6 +290,10 @@ def test_weekly_job_waits_for_a_new_finance_report(db_path, five_weeks):
     scheduler.reset()
     queue.reset()
     watchdog.register_jobs(path=db_path)
+    # Пробу нового отчёта ставит владелец расписания (agents.lifecycle), одну
+    # на все недельные работы. Здесь проверяется сторож, поэтому пробу даём
+    # руками и оставляем в тесте только его работу.
+    scheduler.set_report_probe(lambda client_id: watchdog.latest_report(client_id, path=db_path))
 
     assert watchdog.TASK_KIND in scheduler.weekly_names()
     assert watchdog.latest_report(five_weeks, path=db_path) == 5
