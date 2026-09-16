@@ -67,13 +67,17 @@ def test_unknown_time_is_refused(db_path, client):
 def clean_registry():
     from core import queue, scheduler
 
+    from agents import finance
+
     queue.reset()
     scheduler.reset()
     lifecycle.set_notifier(None)
+    finance.set_sender(None)
     yield
     queue.reset()
     scheduler.reset()
     lifecycle.set_notifier(None)
+    finance.set_sender(None)
 
 
 def connect(db_path, telegram_id: int) -> int:
@@ -139,13 +143,16 @@ def test_daily_report_is_queued_for_the_hour_the_client_picked(db_path):
     assert str(row["next_run_at"]).startswith("2026-09-16 08:00")
 
 
-def test_weekly_report_waits_for_a_new_wb_report_not_for_a_weekday(db_path):
+@pytest.mark.asyncio
+async def test_weekly_report_waits_for_a_new_wb_report_not_for_a_weekday(db_path):
     from agents import finance
     from core import scheduler
 
     client_id = connect(db_path, 777030)
     access.grant_access(client_id, "finance", 30, "ref-week", path=db_path)
     lifecycle.register_jobs(path=db_path)
+    sent = []
+    finance.set_sender(lambda cid, report, xlsx: sent.append((cid, report)))
 
     # Нового финотчёта нет - и недельная задача не ставится.
     assert scheduler.check_weekly(db_path) == []
@@ -155,25 +162,45 @@ def test_weekly_report_waits_for_a_new_wb_report_not_for_a_weekday(db_path):
     )
     assert scheduler.check_weekly(db_path) != []
 
-    queued = tasks(db_path, client_id, lifecycle.WEEKLY_JOB)
-    assert len(queued) == 1
-    lifecycle.weekly_job(Task({"report_id": 4242}), client_id=client_id, path=db_path)
-    assert len(tasks(db_path, client_id, finance.TASK_KIND)) == 1
+    assert len(tasks(db_path, client_id, lifecycle.WEEKLY_JOB)) == 1
+    await lifecycle.weekly_job(Task({"report_id": 4242}), client_id=client_id, path=db_path)
+    # Отдаётся уже собранное: повторной выгрузки из WB недельная рассылка
+    # не заказывает, она самая дорогая в проекте.
+    assert [cid for cid, _ in sent] == [client_id]
+    assert tasks(db_path, client_id, finance.TASK_KIND) == []
 
     # Тот же отчёт второй раз не рассылается.
     assert scheduler.check_weekly(db_path) == []
 
 
-def test_weekly_toggle_stops_delivery_but_not_the_report_itself(db_path):
+@pytest.mark.asyncio
+async def test_weekly_toggle_stops_delivery_but_not_the_report_itself(db_path):
     from agents import finance
 
     client_id = connect(db_path, 777040)
     access.grant_access(client_id, "finance", 30, "ref-week-off", path=db_path)
     lifecycle.set_weekly(client_id, False, path=db_path)
+    sent = []
+    finance.set_sender(lambda cid, report, xlsx: sent.append(cid))
 
-    lifecycle.weekly_job(Task({"report_id": 77}), client_id=client_id, path=db_path)
+    await lifecycle.weekly_job(Task({"report_id": 77}), client_id=client_id, path=db_path)
 
-    assert tasks(db_path, client_id, finance.TASK_KIND) == []
+    assert sent == []
+
+
+def test_finance_data_is_collected_by_schedule_only_for_those_with_the_module(db_path):
+    from agents import finance
+
+    paying = connect(db_path, 777050)
+    silent = connect(db_path, 777051)
+    access.grant_access(paying, "finance", 30, "ref-collect", path=db_path)
+    # Тумблер гасит доставку, а не сбор: у платящего он выключен нарочно.
+    lifecycle.set_weekly(paying, False, path=db_path)
+
+    lifecycle.fan_out_collect(Task({"date": "2026-09-16"}), path=db_path)
+
+    assert len(tasks(db_path, paying, finance.COLLECT_KIND)) == 1
+    assert tasks(db_path, silent, finance.COLLECT_KIND) == []
 
 
 # --- продление, льготный период, выключение ------------------------------------
@@ -467,5 +494,6 @@ def test_only_one_morning_dispatch_is_registered_and_it_is_the_lifecycle_one(db_
     names = set(scheduler.daily_names())
     assert lifecycle.REPORTS_JOB in names
     assert lifecycle.DAILY_JOB in names
+    assert lifecycle.COLLECT_JOB in names
     assert rnp.COLLECT_ALL in names
     assert rnp.REPORT_ALL not in names

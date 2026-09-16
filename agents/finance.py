@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MODULE",
     "TASK_KIND",
+    "COLLECT_KIND",
     "PERIODS",
     "PERIOD_TITLES",
     "Amounts",
@@ -62,7 +63,10 @@ __all__ = [
     "articles_of",
     "months_of",
     "request_report",
+    "request_collect",
     "report_task",
+    "collect_task",
+    "deliver",
     "set_sender",
     "register_jobs",
     "excel_bytes",
@@ -71,9 +75,16 @@ __all__ = [
 
 MODULE = "finance"
 
-# Вид фоновой задачи. Регистрируется в одном явном месте, при сборке бота:
+# Виды фоновых задач. Регистрируются в одном явном месте, при сборке бота:
 # `bot.handlers.finance.register(app)`.
+#
+# Их два, и это не украшение. `finance_report` это просьба клиента: собрать и
+# сразу отдать. `finance_collect` это то же самое наполнение `fin_weeks` и
+# `fin_rows`, но молча: его ставит расписание (`agents/lifecycle.py`), чтобы
+# новые недели появлялись у всех, а не только у тех, кто позвал `/finance`.
+# На появление нового report_id срабатывает сторож скрытых расходов.
 TASK_KIND = "finance_report"
+COLLECT_KIND = "finance_collect"
 
 # Сколько дней назад смотрим для каждой кнопки. Год выгружается страницами и
 # идёт долго: лимит отчёта о реализации 1 запрос в минуту, самый жёсткий в
@@ -906,6 +917,10 @@ def set_sender(fn: Callable[[int, FinanceReport, bytes], Any] | None) -> None:
     _sender = fn
 
 
+def _period_of(task: Any) -> str:
+    return str((task.payload or {}).get("period") or "week")
+
+
 def request_report(
     client_id: int, period: str = "week", *, path: str | Path | None = None
 ) -> int:
@@ -915,12 +930,43 @@ def request_report(
     return queue.enqueue(client_id, TASK_KIND, {"period": period}, path=path)
 
 
-async def report_task(task: Any, *, path: str | Path | None = None) -> FinanceReport:
-    """Обработчик задачи: выгрузить период, сложить в базу, отдать клиенту."""
-    client_id = int(task.client_id)
-    period = str((task.payload or {}).get("period") or "week")
+def request_collect(
+    client_id: int, period: str = "week", *, path: str | Path | None = None
+) -> int:
+    """Ставит в очередь сбор без отправки: расписание, а не просьба клиента.
+
+    `notify=False` здесь не мелочь: клиент этой задачи не просил, и «принято,
+    пришлю» на неё было бы сообщением ни о чём.
+    """
+    if period not in PERIODS:
+        raise ValueError(f"неизвестный период: {period}")
+    return queue.enqueue(
+        client_id, COLLECT_KIND, {"period": period}, notify=False, path=path
+    )
+
+
+async def collect_task(task: Any, *, path: str | Path | None = None) -> Collected:
+    """Собрать период в базу и замолчать. Ни сообщения, ни Excel.
+
+    Ради этого вида задача и разведена надвое. Пока `fin_weeks` наполняла
+    только команда `/finance`, новых недель у молчащего клиента не появлялось,
+    а сторож скрытых расходов (агент 2) срабатывает ровно на появление нового
+    `report_id`. Требование R43 говорит «еженедельные после появления нового
+    финотчёта WB», и без сбора по расписанию оно не выполнялось вовсе.
+    """
+    period = _period_of(task)
     date_from, date_to = period_bounds(period)
-    await collect(client_id, date_from, date_to, path=path)
+    return await collect(int(task.client_id), date_from, date_to, path=path)
+
+
+async def deliver(
+    client_id: int, period: str = "week", *, path: str | Path | None = None
+) -> FinanceReport:
+    """Отдать отчёт по тому, что уже собрано. В WB отсюда не ходят ни разу.
+
+    Вторая половина пары. Повторная отправка не должна тянуть повторную
+    выгрузку: она самая дорогая в проекте, один запрос в минуту.
+    """
     report = build(client_id, period, path=path)
     if _sender is None:
         raise RuntimeError("некому отправить финансовый отчёт: доставка не подключена")
@@ -930,6 +976,15 @@ async def report_task(task: Any, *, path: str | Path | None = None) -> FinanceRe
     return report
 
 
+async def report_task(task: Any, *, path: str | Path | None = None) -> FinanceReport:
+    """Обработчик задачи клиента: собрать период и сразу отдать собранное."""
+    client_id = int(task.client_id)
+    period = _period_of(task)
+    await collect_task(task, path=path)
+    return await deliver(client_id, period, path=path)
+
+
 def register_jobs() -> None:
-    """Связывает вид задачи с обработчиком. Зовёт сборка бота, не импорт."""
+    """Связывает виды задач с обработчиками. Зовёт сборка бота, не импорт."""
     queue.register(TASK_KIND, report_task)
+    queue.register(COLLECT_KIND, collect_task)

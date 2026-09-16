@@ -772,3 +772,107 @@ async def test_commission_by_article_adds_up_to_the_commission_of_the_week(
     line = method["Комиссия WB, ₽ по артикулу"]
     assert line.get("Поле ответа WB") == "vw"
     assert "/profit" in str(line.get("Пояснение"))
+
+
+# --- сбор и отправка это две разные задачи -----------------------------------
+
+
+class Task(SimpleNamespace):
+    """Задача очереди в том виде, в каком её видит обработчик."""
+
+
+@pytest.mark.asyncio
+async def test_collect_task_fills_the_weeks_and_says_nothing(
+    cabinet, db_path, monkeypatch
+):
+    """R43: недели появляются сами, без просьбы клиента и без сообщений.
+
+    Пока `fin_weeks` наполняла только команда `/finance`, у молчащего клиента
+    новых недель не появлялось, и сторож скрытых расходов молчал вместе с ним.
+    """
+    sent = []
+    finance.set_sender(lambda *args: sent.append(args))
+
+    time = FakeTime()
+    http = wb_http()
+    real_collect = finance.collect
+
+    async def with_recorded_wb(client_id, date_from, date_to, **kw):
+        kw.setdefault("http", http)
+        kw.setdefault("clock", time.clock)
+        kw.setdefault("sleep", time.sleep)
+        return await real_collect(client_id, date_from, date_to, **kw)
+
+    monkeypatch.setattr(finance, "collect", with_recorded_wb)
+
+    result = await finance.collect_task(
+        Task(client_id=cabinet, payload={"period": "week"}), path=db_path
+    )
+
+    # данные легли в базу: сторожу и прибыльности этого достаточно
+    assert result.rows == 3
+    assert db.repo(cabinet, db_path).count("fin_weeks") == 1
+    assert db.repo(cabinet, db_path).count("fin_rows") == 3
+    # и клиенту не сказано ни слова
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_report_over_collected_data_sends_without_touching_wb(
+    cabinet, db_path, monkeypatch
+):
+    """Повторная отправка не тянет повторную выгрузку: она дороже всего."""
+    await collect(cabinet, db_path)
+
+    def no_wb(*args, **kwargs):
+        raise AssertionError("отправка отчёта полезла в Wildberries")
+
+    monkeypatch.setattr(finance, "collect", no_wb)
+    monkeypatch.setattr(wbapi, "get_wb_client", no_wb)
+    # период фиксируем, чтобы тест не зависел от сегодняшней даты
+    monkeypatch.setattr(
+        finance,
+        "period_bounds",
+        lambda period, today=None: (date(2026, 9, 1), date(2026, 9, 30)),
+    )
+
+    sent = []
+    finance.set_sender(lambda client_id, report, data: sent.append((client_id, report, data)))
+
+    report = await finance.deliver(cabinet, "week", path=db_path)
+
+    assert len(sent) == 1
+    client_id, delivered, data = sent[0]
+    assert client_id == cabinet
+    assert delivered is report
+    assert delivered.weeks[0].for_pay == Decimal("840.25")
+    assert data[:2] == b"PK"  # книга Excel, собранная целиком из базы
+
+
+def test_the_two_task_kinds_are_registered_under_their_own_names():
+    """Имена видов задач это интерфейс: по ним расписание ставит сбор."""
+    queue.reset()
+    finance.register_jobs()
+    handlers = queue.handlers()
+
+    assert finance.TASK_KIND == "finance_report"
+    assert finance.COLLECT_KIND == "finance_collect"
+    assert handlers[finance.TASK_KIND] is finance.report_task
+    assert handlers[finance.COLLECT_KIND] is finance.collect_task
+
+
+def test_scheduled_collect_does_not_promise_anything_to_the_client(cabinet, db_path):
+    """Клиент этой задачи не просил, значит «принято, пришлю» ему не нужно."""
+    said = []
+    queue.set_notifier(lambda client_id, text: said.append(text))
+    try:
+        finance.request_collect(cabinet, "week", path=db_path)
+        assert said == []
+
+        finance.request_report(cabinet, "week", path=db_path)
+        assert said == [queue.ACCEPTED]
+    finally:
+        queue.set_notifier(None)
+
+    rows = db.admin_repo(db_path).tasks_by_kind(finance.COLLECT_KIND)
+    assert [row["kind"] for row in rows] == [finance.COLLECT_KIND]

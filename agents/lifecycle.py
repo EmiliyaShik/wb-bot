@@ -11,8 +11,9 @@
 же агенту, которому понадобятся тумблеры или сроки хранения, достался бы
 круговой импорт. Здесь же это обычный сосед по слою.
 
-В WB отсюда никто не ходит и отчётов никто не строит: жизненный цикл
-только ставит задачи по их виду, а выгрузку запускает владелец задачи.
+В WB отсюда никто не ходит и отчётов никто не строит: выгрузку жизненный
+цикл заказывает задачей по её виду (finance.request_collect), а готовое
+отдаёт сам агент (finance.deliver строит по базе и в WB не ходит).
 
 Два правила, которые держат всё остальное:
 
@@ -64,6 +65,8 @@ __all__ = [
     "DAILY_JOB",
     "WEEKLY_JOB",
     "REPORTS_JOB",
+    "COLLECT_JOB",
+    "fan_out_collect",
     "RENEWAL",
     "GRACE",
     "SHUTDOWN",
@@ -87,6 +90,7 @@ DELETED = "deleted"      # данные удалены
 # Имена работ в расписании.
 DAILY_JOB = "lifecycle_daily"      # обход сроков: продление, льгота, удаление
 REPORTS_JOB = "lifecycle_reports"  # утренняя рассылка: тумблеры и время клиента
+COLLECT_JOB = "lifecycle_finance_collect"  # суточный сбор финансовых данных
 WEEKLY_JOB = "lifecycle_weekly"    # новый финотчёт WB появился
 
 _TIME_FORMAT = "%H:%M"
@@ -358,14 +362,17 @@ def new_report_of(client_id: int, *, path: str | Path | None = None) -> int | No
     return latest
 
 
-def weekly_job(
+async def weekly_job(
     task: Any, *, client_id: int | None = None, path: str | Path | None = None
-) -> int | None:
+) -> Any:
     """Новый финотчёт появился: отдать недельную раскладку тем, кто её ждёт.
 
-    Сам отчёт собирает финансист, здесь только ворота: доступ и тумблер.
-    Отметка о том, что отчёт учтён, ставится в любом случае - выключенная
-    рассылка не превращает один отчёт в вечную очередь задач.
+    Отчёт строит и отправляет финансист по уже собранному: данные к этому
+    моменту в базе, их положил суточный сбор, и повторная выгрузка из WB тут
+    не нужна - она самая дорогая работа в проекте.
+
+    Отметка о том, что отчёт учтён, ставится в любом случае: выключенная
+    рассылка не должна превращать один финотчёт в вечную очередь задач.
     """
     client_id = int(client_id if client_id is not None else task.client_id)
     report_id = _payload(task).get("report_id")
@@ -373,9 +380,8 @@ def weekly_job(
     data = _settings(client_id, path)
     marks = data.get(MARKS_KEY)
     marks = dict(marks) if isinstance(marks, dict) else {}
-    marks["weekly_report"] = int(report_id) if report_id is not None else marks.get(
-        "weekly_report"
-    )
+    if report_id is not None:
+        marks["weekly_report"] = int(report_id)
     data[MARKS_KEY] = marks
     _save(client_id, data, path)
 
@@ -383,13 +389,33 @@ def weekly_job(
         return None
     if not weekly_enabled(client_id, path=path):
         return None
-    return queue.enqueue(
-        client_id,
-        finance.TASK_KIND,
-        {"period": "week"},
-        notify=False,
-        path=path,
-    )
+    return await finance.deliver(client_id, "week", path=path)
+
+
+# --- суточный сбор финансовых данных ------------------------------------------
+
+
+def fan_out_collect(task: Any, *, path: str | Path | None = None) -> list[int]:
+    """Раз в сутки поставить финансисту сбор недели. Задача по виду, не вызов.
+
+    **Собираем только тем, у кого модуль finance работает, и это решение, а
+    не экономия на спичках.** Отчёт о реализации WB отдаёт с 29 января 2024
+    года, то есть задним числом его можно забрать всегда: не собранное
+    сегодня не теряется, в отличие от суточной воронки РНП, где сбор идёт у
+    всех подключённых. А лимит у этого отчёта самый жёсткий в проекте, один
+    запрос в минуту на кабинет, и потраченный на неплательщика он забран у
+    того, кто платит. Оплатив, клиент получает историю сразу: команда
+    /finance за месяц или квартал поднимет её задним числом, а недельная
+    рассылка пойдёт с ближайшего нового финотчёта.
+
+    Тумблер рассылки здесь не спрашивается: он про «не присылай мне отчёт»,
+    а не про «не собирай данные».
+    """
+    return [
+        finance.request_collect(client_id, "week", path=path)
+        for client_id in connected_clients(path)
+        if access.has_access(client_id, finance.MODULE, path=path)
+    ]
 
 
 # --- доставка -----------------------------------------------------------------
@@ -613,8 +639,12 @@ def register_jobs(*, path: str | Path | None = None) -> None:
     Утренняя рассылка РНП стоит под своим именем и принадлежит жизненному
     циклу: только он знает про тумблеры и про выбранное клиентом время.
     Агент её больше не регистрирует, поэтому рассылка в расписании одна.
+
+    Суточный сбор финансиста стоит здесь же: без него новых недель в базе
+    не появлялось бы, а недельная рассылка ждёт именно появления новой.
     """
     scheduler.register_daily(REPORTS_JOB, functools.partial(fan_out_daily, path=path))
     scheduler.register_daily(DAILY_JOB, functools.partial(daily_job, path=path))
+    scheduler.register_daily(COLLECT_JOB, functools.partial(fan_out_collect, path=path))
     scheduler.set_report_probe(functools.partial(new_report_of, path=path))
     scheduler.register_weekly(WEEKLY_JOB, functools.partial(weekly_job, path=path))
