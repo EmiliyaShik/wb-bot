@@ -187,6 +187,24 @@ def _day(value: Any) -> str:
     return text[:10]
 
 
+def vw_of(row: Any) -> Decimal:
+    """Комиссия одной строки `fin_rows`: поле `vw` из сохранённого `raw`.
+
+    Отдельной колонки под `vw` в схеме нет, а менять схему нельзя, поэтому
+    значение берётся из `raw` - той самой строки WB, которую мы сохранили
+    целиком. Основание одно и то же и здесь, и у агента 3 (прибыльность
+    артикулов): иначе один артикул за одну неделю покажет в `/finance` одну
+    комиссию, а в `/profit` другую, и селлер решит, что один из отчётов врёт.
+    """
+    raw = row["raw"] if "raw" in row.keys() else None
+    if not raw:
+        return ZERO
+    try:
+        return money(json.loads(raw).get("vw"))
+    except (TypeError, ValueError):
+        return ZERO
+
+
 def is_return(row: dict) -> bool:
     """Возврат отличается от продажи типом документа, это поле `docTypeName`."""
     name = str(row.get("docTypeName") or row.get("sellerOperName") or "").lower()
@@ -778,7 +796,7 @@ def articles_of(
                 revenue=ZERO if returned else amount,
                 returns_amount=amount if returned else ZERO,
                 for_pay=db.from_kop(row["ppvz_for_pay_kop"]),
-                commission=db.from_kop(row["ppvz_sales_commission_kop"]),
+                commission=vw_of(row),
                 acquiring=db.from_kop(row["acquiring_fee_kop"]),
                 logistics=db.from_kop(row["delivery_kop"]),
                 storage=db.from_kop(row["storage_fee_kop"]),

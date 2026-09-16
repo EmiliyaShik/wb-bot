@@ -713,3 +713,62 @@ async def test_last_page_exactly_full_is_not_a_false_alarm(cabinet, db_path):
     assert report.incomplete == ()
     assert "неполные" not in handlers_finance.summary_text(report)
 
+
+# Строка без nmId: общее удержание недели, которое Wildberries не привязал
+# ни к одному товару. Комиссия по ней тоже есть.
+FACELESS = {
+    **WEEK,
+    "rrdId": 4,
+    "rrDate": "2026-09-11",
+    "docTypeName": "Удержание",
+    "sellerOperName": "Удержание",
+    "quantity": 0,
+    "retailAmount": "0",
+    "retailPriceWithDisc": "0",
+    "vw": "10",
+    "forPay": "0",
+    "acquiringFee": "0",
+    "deliveryService": "0",
+    "paidStorage": "0",
+    "paidAcceptance": "0",
+    "penalty": "0",
+    "additionalPayment": "0",
+    "deduction": "15",
+}
+
+
+@pytest.mark.asyncio
+async def test_commission_by_article_adds_up_to_the_commission_of_the_week(
+    cabinet, db_path
+):
+    """Комиссия артикулов и комиссия недели это одна и та же величина.
+
+    Основание одно: поле vw. Им же считает комиссию отчёт о прибыльности
+    артикулов, поэтому /finance и /profit не могут показать за одну неделю
+    две разные комиссии. Строка без nmId не выброшена и не разнесена по
+    выручке: она отдельной строкой «без артикула», и итог сходится без
+    остатка.
+    """
+    await collect(cabinet, db_path, http=wb_http(rows=ROWS + [FACELESS]))
+    report = finance.build(cabinet, "week", today=date(2026, 9, 15), path=db_path)
+
+    # vw по строкам: 150 + 75 + 0 у продаж и возврата, плюс 10 обезлички
+    week = report.weeks[0]
+    assert week.commission == Decimal("235")
+
+    by_article = {article.nm_id: article.commission for article in report.articles}
+    assert by_article == {111: Decimal("150"), 222: Decimal("75"), None: Decimal("10")}
+    assert sum(by_article.values()) == week.commission
+
+    # и то же самое в самой книге, колонка в колонку
+    book = xlsx.read_book(finance.excel_bytes(report))
+    articles = book["По артикулам"].rows
+    assert "без артикула" in [row.get("Артикул WB") for row in articles]
+    total = sum(Decimal(str(row.get("Комиссия WB, ₽"))) for row in articles)
+    assert total == Decimal(str(book["Недели"].rows[0].get("Комиссия WB, ₽")))
+
+    # на «Методологии» названо поле и сказано, почему именно оно
+    method = {row.get("Показатель"): row for row in book["Методология"].rows}
+    line = method["Комиссия WB, ₽ по артикулу"]
+    assert line.get("Поле ответа WB") == "vw"
+    assert "/profit" in str(line.get("Пояснение"))
