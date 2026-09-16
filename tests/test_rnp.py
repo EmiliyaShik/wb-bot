@@ -489,7 +489,7 @@ def test_register_puts_commands_and_both_daily_jobs_in_place(db_path, cabinet):
     assert len(app.added) == 2
     # Сбор и рассылка это две разные утренние работы: одна идёт всем,
     # вторая только подписчикам.
-    assert set(scheduler.daily_names()) == {rnp.COLLECT_ALL, rnp.REPORT_ALL}
+    assert set(scheduler.daily_names()) == {rnp.COLLECT_ALL}
     assert rnp.COLLECT_ONE in queue.handlers()
     assert rnp.REPORT_ONE in queue.handlers()
 

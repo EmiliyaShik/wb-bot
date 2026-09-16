@@ -578,8 +578,13 @@ async def report_client(task: Any, *, path: str | Path | None = None) -> RnpRepo
 
 
 def register_jobs() -> None:
-    """Ставит сбор и рассылку в расписание, а их разбор по клиентам в очередь."""
+    """Ставит сбор в расписание, а разбор по клиентам в очередь.
+
+    Утреннюю рассылку отсюда не регистрируем: её ставит agents.lifecycle
+    под своим именем, потому что кому и в котором часу слать, решают
+    тумблеры и время клиента из /settings, а не агент. Сбор наоборот
+    остаётся здесь и идёт у всех подключённых кабинетов.
+    """
     scheduler.register_daily(COLLECT_ALL, fan_out_collect)
-    scheduler.register_daily(REPORT_ALL, fan_out_report)
     queue.register(COLLECT_ONE, collect_client)
     queue.register(REPORT_ONE, report_client)
