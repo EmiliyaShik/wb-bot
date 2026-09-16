@@ -244,10 +244,12 @@ async def test_owner_is_told_about_every_new_invoice(wired, client_id):
     made = billing.invoices_of(client_id, path=wired)[0]
 
     to_owner = " ".join(context.bot.to(OWNER_ID))
-    assert made.number in to_owner        # номер
-    assert "Финансы" in to_owner          # что
-    assert "990" in to_owner              # сколько
-    assert str(CLIENT_TG) in to_owner     # кто
+    assert made.number in to_owner                 # номер
+    assert "Финансы" in to_owner                   # что
+    assert "990" in to_owner                       # сколько
+    assert f"клиент #{client_id}" in to_owner      # кто, внутренним id
+    # R159: Telegram-аккаунт клиента в админку не уезжает даже сюда.
+    assert str(CLIENT_TG) not in to_owner
 
 
 @pytest.mark.asyncio
@@ -293,6 +295,9 @@ async def test_without_seller_details_client_waits_and_owner_gets_the_list(
     assert "SELLER_ACCOUNT" in to_owner
     # Заполненную переменную владельцу не называют.
     assert "SELLER_NAME" not in to_owner
+    # И здесь клиент назван внутренним id, а не Telegram-аккаунтом.
+    assert f"клиент #{client_id}" in to_owner
+    assert str(CLIENT_TG) not in to_owner
 
 
 # --- кнопка владельца «Оплачен» ---

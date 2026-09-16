@@ -237,11 +237,17 @@ def paid_keyboard(number: str) -> InlineKeyboardMarkup:
     )
 
 
-def owner_new_text(item: billing.Invoice, telegram_id: int | None) -> str:
-    """Уведомление владельцу: кто, что, сколько, номер."""
+def owner_new_text(item: billing.Invoice) -> str:
+    """Уведомление владельцу: кто, что, сколько, номер.
+
+    «Кто» это внутренний id, как везде в админке, а не Telegram ID. Наружу не
+    идут ни имена, ни аккаунты (R159), и одно исключение ради удобства
+    сделало бы правило необязательным. Выдать доступ по этому числу владелец
+    может: команды понимают внутренний id.
+    """
     return OWNER_NEW.format(
         number=item.number,
-        client=telegram_id if telegram_id else f"клиент {item.client_id}",
+        client=f"клиент #{item.client_id}",
         title=module_title(item.module),
         period=billing.months_words(item.period_months),
         amount=tariffs.rubles(item.amount),
@@ -251,11 +257,15 @@ def owner_new_text(item: billing.Invoice, telegram_id: int | None) -> str:
 
 
 def owner_no_details_text(
-    module: str, months: int, telegram_id: int | None, missing: tuple[str, ...]
+    module: str, months: int, client_id: int, missing: tuple[str, ...]
 ) -> str:
-    """Список ровно тех переменных, которых не хватает."""
+    """Список ровно тех переменных, которых не хватает.
+
+    Клиент назван внутренним id по той же причине, что и в уведомлении о
+    счёте: в админке Telegram-аккаунтов не показывают.
+    """
     return OWNER_NO_DETAILS.format(
-        client=telegram_id if telegram_id else "неизвестен",
+        client=f"клиент #{client_id}",
         title=module_title(module),
         period=billing.months_words(months),
         amount=tariffs.rubles(config.price_decimal(module, months)),
@@ -292,11 +302,6 @@ async def tell_client(bot: Any, client_id: int, text: str, **kwargs: Any) -> Non
         )
     except Exception:  # noqa: BLE001
         logger.exception("не удалось написать клиенту %s", client_id)
-
-
-def _telegram_id(client_id: int) -> int | None:
-    row = db.admin_repo().client(client_id)
-    return int(row["telegram_id"]) if row else None
 
 
 # --- диалог ---
@@ -445,7 +450,7 @@ async def _issue(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict
         await message.reply_text(WAIT_FOR_DETAILS, parse_mode=ParseMode.HTML)
         await tell_owner(
             bot,
-            owner_no_details_text(module, months, _telegram_id(client_id), gap.missing),
+            owner_no_details_text(module, months, client_id, gap.missing),
         )
         audit.log(
             "invoice.blocked",
@@ -482,13 +487,13 @@ async def _issue(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict
     except billing.DetailsMissing as gap:
         await tell_owner(
             bot,
-            owner_no_details_text(module, months, _telegram_id(client_id), gap.missing),
+            owner_no_details_text(module, months, client_id, gap.missing),
         )
 
     # Уведомление и кнопка одним сообщением: владелец видит, за что жмёт.
     await tell_owner(
         bot,
-        owner_new_text(item, _telegram_id(client_id)),
+        owner_new_text(item),
         reply_markup=paid_keyboard(item.number),
     )
     if billing.vat_note_missing():
