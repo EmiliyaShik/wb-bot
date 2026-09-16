@@ -132,3 +132,30 @@ def test_days_left_is_counted_from_the_moment_the_status_was_built(db_path, clie
     )
     assert tenth_day.days_left == 20
     assert tenth_day.as_of == T0 + timedelta(days=10)
+
+
+def test_revoke_switches_off_logs_once_and_is_safe_to_repeat(db_path, client_id):
+    access.grant_access(
+        client_id, "finance", 30, "WBR-2026-0009", "invoice", "owner",
+        now=T0, path=db_path,
+    )
+    moment = T0 + timedelta(days=10)
+    revoked = access.revoke_access(
+        client_id, "finance", "возврат по заявлению", "owner",
+        payment_ref="WBR-2026-0009", now=moment, path=db_path,
+    )
+    assert revoked.state == "off"
+    assert access.has_access(client_id, "finance", now=moment, path=db_path) is False
+
+    again = access.revoke_access(
+        client_id, "finance", "ещё раз", "owner", now=moment, path=db_path
+    )
+    assert again.state == "off"
+
+    rows = db.repo(client_id, db_path).rows("access_log", module="finance")
+    assert [row["action"] for row in rows] == ["grant", "revoke"]
+    assert rows[-1]["actor"] == "owner"
+    assert rows[-1]["method"] == "возврат по заявлению"
+    assert rows[-1]["payment_ref"] == "WBR-2026-0009"
+    # На момент отмены оставалось 20 оплаченных суток из 30.
+    assert rows[-1]["days"] == 20

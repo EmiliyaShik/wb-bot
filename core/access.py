@@ -214,6 +214,69 @@ def grant_access(
     return _read(client_id, module, moment, path)
 
 
+def revoke_access(
+    client_id: int,
+    module: str,
+    reason: str = "",
+    actor: str = "owner",
+    *,
+    payment_ref: str | None = None,
+    now: datetime | None = None,
+    path: str | Path | None = None,
+) -> Access:
+    """Отмена доступа: обратная сторона grant_access и такая же единственная.
+
+    Гасит модуль и пишет в access_log строку revoke рядом с grant, чтобы
+    владелец видел обе стороны истории. Причина ложится в колонку method: у
+    выдачи там основание «как оплачено», у отмены основание «почему снято».
+
+    Идемпотентность здесь стоит не на номере платежа, а на состоянии: гасить
+    нечего - значит, и записи нет. Это строже, чем проверка по payment_ref:
+    два разных основания не погасят один доступ дважды, а возврат по тому же
+    платежу остаётся одним возвратом. payment_ref нужен, только чтобы связать
+    отмену с оплатой в журнале.
+
+    Отмена не открывает платёж заново: grant_access с тем же payment_ref
+    по-прежнему считается дублем. После возврата новая выдача идёт по новому
+    платежу, иначе возврат и повторная оплата стали бы неразличимы.
+    """
+    module = str(module)
+    moment = _now(now)
+    repo = db.repo(client_id, path)
+    current = _read(client_id, module, moment, path)
+
+    if current.until is None and current.paused_at is None:
+        return current
+
+    repo.upsert(
+        "module_access",
+        {"module": module},
+        until=None,
+        state=OFF,
+        paused_at=None,
+        updated_at=_stamp(moment),
+    )
+    repo.insert(
+        "access_log",
+        module=module,
+        action="revoke",
+        days=current.days_left,
+        payment_ref=payment_ref,
+        method=reason or "revoke",
+        actor=actor,
+        at=_stamp(moment),
+    )
+    audit.log(
+        "access.revoke",
+        client_id,
+        f"модуль {module} отключён ({reason or 'без причины'}), "
+        f"сгорело оплаченных дней: {current.days_left}",
+        level="warning",
+        path=path,
+    )
+    return _read(client_id, module, moment, path)
+
+
 def access_of(
     client_id: int,
     module: str,
