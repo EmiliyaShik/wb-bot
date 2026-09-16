@@ -28,6 +28,19 @@ from typing import Any, Iterable
 
 from core import access, audit, config, db
 from core.billing import bankdays
+from core.billing.acts import (
+    ACTS_HEADERS,
+    ACTS_SHEET,
+    BadPeriod,
+    acts_book,
+    acts_file_name,
+    acts_rows,
+    in_period,
+    month_bounds,
+    month_key,
+    month_title,
+    previous_month_bounds,
+)
 from core.billing.counterparty import Counterparty, inn_is_valid, lookup, normalize
 
 logger = logging.getLogger(__name__)
@@ -51,6 +64,19 @@ __all__ = [
     "cancel",
     "invoice",
     "invoices_of",
+    "paid_invoices",
+    "acts_xlsx",
+    "acts_book",
+    "acts_rows",
+    "acts_file_name",
+    "ACTS_HEADERS",
+    "ACTS_SHEET",
+    "BadPeriod",
+    "month_bounds",
+    "previous_month_bounds",
+    "month_title",
+    "month_key",
+    "in_period",
     "expire_overdue",
     "months_to_days",
     "months_words",
@@ -320,6 +346,41 @@ def invoices_of(
     where: dict[str, Any] = {"status": status} if status else {}
     rows = db.repo(client_id, path).rows("invoices", order_by="issued_at DESC", **where)
     return [_row_to_invoice(row) for row in rows]
+
+
+def paid_invoices(
+    start: datetime, end: datetime, *, path: str | Path | None = None
+) -> list[Invoice]:
+    """Оплаченные счета за период по всем клиентам, старые сверху.
+
+    Обходом клиентов, а не сквозным запросом по таблице: счета это данные
+    клиента, и правило изоляции у реестра владельца исключений не получает.
+    Тот же приём, что у поиска счёта по номеру.
+    """
+    found: list[Invoice] = []
+    for row in db.admin_repo(path).all_clients():
+        for item in invoices_of(int(row["id"]), status=PAID, path=path):
+            if in_period(item.paid_at, start, end):
+                found.append(item)
+    found.sort(key=lambda item: (item.paid_at or start, item.number))
+    return found
+
+
+def acts_xlsx(
+    period: Any = None,
+    *,
+    today: date | None = None,
+    path: str | Path | None = None,
+) -> bytes:
+    """Реестр оплаченных счетов за месяц одним вызовом: «ГГГГ-ММ» или текущий.
+
+    Состав колонок из ТЗ: номер, дата, ИНН, название клиента, модуль, период,
+    сумма. Реестр единственное место, где ИНН и название организации выходят
+    наружу: бухгалтерии они нужны по закону, всё остальное у владельца видит
+    клиента внутренним id.
+    """
+    start, end = month_bounds(period, today=today)
+    return acts_book(paid_invoices(start, end, path=path), path=path)
 
 
 # --- выставление ---
