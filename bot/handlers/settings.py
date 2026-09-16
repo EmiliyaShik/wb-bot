@@ -115,6 +115,31 @@ def _days_word(days: int) -> str:
     return f"{days} дней"
 
 
+def _weeks_word(weeks: int) -> str:
+    """«4 недели», «1 неделя», «5 недель». Счёт тот же, что и у дней."""
+    weeks = abs(int(weeks))
+    if 11 <= weeks % 100 <= 14:
+        return f"{weeks} недель"
+    last = weeks % 10
+    if last == 1:
+        return f"{weeks} неделя"
+    if last in (2, 3, 4):
+        return f"{weeks} недели"
+    return f"{weeks} недель"
+
+
+def backfill_text(event: lifecycle.Event) -> str:
+    return (
+        f"📥 Модуль «{_module_title(event.module)}» работает. Бот подтягивает вашу "
+        f"историю за {_weeks_word(event.days_left)}: без неё не с чем сравнивать, "
+        "и он не увидит, что расход вырос.\n\n"
+        "Wildberries отдаёт такие отчёты медленно, поэтому это займёт время, "
+        "иногда несколько часов. Ничего делать не нужно: первые отчёты и "
+        "предупреждения о выросших расходах придут сами, как только история "
+        "соберётся."
+    )
+
+
 def renewal_text(event: lifecycle.Event) -> str:
     return (
         f"⏳ Доступ к модулю «{_module_title(event.module)}» заканчивается через "
@@ -174,6 +199,8 @@ def notice(event: lifecycle.Event) -> tuple[str, InlineKeyboardMarkup | None]:
         return grace_text(event), _invoice_keyboard(event.module)
     if event.kind == lifecycle.SHUTDOWN:
         return shutdown_text(event), _invoice_keyboard(event.module)
+    if event.kind == lifecycle.BACKFILL:
+        return backfill_text(event), None
     if event.kind == lifecycle.RETENTION:
         return retention_text(event), _invoice_keyboard(tariffs.LIST_TOKEN)
     return deleted_text(event), None

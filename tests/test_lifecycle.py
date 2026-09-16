@@ -188,7 +188,8 @@ async def test_weekly_toggle_stops_delivery_but_not_the_report_itself(db_path):
     assert sent == []
 
 
-def test_finance_data_is_collected_by_schedule_only_for_those_with_the_module(db_path):
+@pytest.mark.asyncio
+async def test_finance_data_is_collected_by_schedule_only_for_those_with_the_module(db_path):
     from agents import finance
 
     paying = connect(db_path, 777050)
@@ -197,10 +198,67 @@ def test_finance_data_is_collected_by_schedule_only_for_those_with_the_module(db
     # Тумблер гасит доставку, а не сбор: у платящего он выключен нарочно.
     lifecycle.set_weekly(paying, False, path=db_path)
 
-    lifecycle.fan_out_collect(Task({"date": "2026-09-16"}), path=db_path)
+    await lifecycle.fan_out_collect(Task({"date": "2026-09-16"}), path=db_path)
 
-    assert len(tasks(db_path, paying, finance.COLLECT_KIND)) == 1
+    assert tasks(db_path, paying, finance.COLLECT_KIND) != []
     assert tasks(db_path, silent, finance.COLLECT_KIND) == []
+
+
+@pytest.mark.asyncio
+async def test_history_for_the_baseline_is_raised_once_by_itself(db_path):
+    import json as _json
+
+    from agents import finance, watchdog
+
+    bot = FakeBot()
+    lifecycle.set_notifier(settings_handler.make_notifier(SimpleNamespace(bot=bot), path=db_path))
+
+    client_id = connect(db_path, 777060)
+    access.grant_access(client_id, "finance", 30, "ref-baseline", path=db_path)
+
+    await lifecycle.fan_out_collect(Task({"date": "2026-09-16"}), path=db_path)
+
+    periods = [
+        _json.loads(row["payload"])["period"]
+        for row in tasks(db_path, client_id, finance.COLLECT_KIND)
+    ]
+    # Неделя за сегодня и один подъём истории под базу сравнения сторожа.
+    assert periods.count("week") == 1
+    raised = [value for value in periods if value != "week"]
+    assert len(raised) == 1
+    # Период покрывает окно сравнения сторожа, а не выбран числом в коде.
+    assert finance.PERIODS[raised[0]] >= watchdog.baseline_weeks() * 7
+    # Клиенту сказали, что история подтягивается: пустой отчёт без объяснения
+    # выглядит как сломанный сервис.
+    assert len(bot.sent) == 1
+    told = bot.sent[0][1].lower()
+    assert "истор" in told and "займёт время" in told
+    # Это сообщение про подъём истории, а не про удаление данных.
+    assert "удал" not in told
+
+    # Второй проход расписания истории не поднимает: лимит дорогой.
+    await lifecycle.fan_out_collect(Task({"date": "2026-09-17"}), path=db_path)
+
+    periods = [
+        _json.loads(row["payload"])["period"]
+        for row in tasks(db_path, client_id, finance.COLLECT_KIND)
+    ]
+    assert [value for value in periods if value != "week"] == raised
+    assert len(bot.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_trial_access_raises_the_history_too(db_path):
+    from agents import finance
+
+    client_id = connect(db_path, 777070)
+    db.admin_repo(db_path).set_client_fields(client_id, seller_id="seller-777070")
+    access.start_trial(client_id, "finance", path=db_path)
+
+    await lifecycle.fan_out_collect(Task({"date": "2026-09-16"}), path=db_path)
+
+    assert lifecycle.needs_baseline(client_id, path=db_path) is False
+    assert len(tasks(db_path, client_id, finance.COLLECT_KIND)) == 2
 
 
 # --- продление, льготный период, выключение ------------------------------------

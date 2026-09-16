@@ -37,7 +37,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from agents import finance, rnp
+from agents import finance, rnp, watchdog
 from core import access, audit, clients, config, db, queue, scheduler
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,10 @@ __all__ = [
     "GRACE",
     "SHUTDOWN",
     "RETENTION",
+    "BACKFILL",
     "DELETED",
+    "needs_baseline",
+    "baseline_period",
 ]
 
 # Ключ в clients.settings, где живут тумблеры и время рассылки. Рядом с ним
@@ -85,6 +88,7 @@ RENEWAL = "renewal"      # скоро конец доступа, пора пре
 GRACE = "grace"          # срок вышел, идут льготные дни
 SHUTDOWN = "shutdown"    # льготные дни кончились, модуль выключен
 RETENTION = "retention"  # скоро удаление данных
+BACKFILL = "backfill"    # поднимаем историю под базу сравнения сторожа
 DELETED = "deleted"      # данные удалены
 
 # Имена работ в расписании.
@@ -395,7 +399,47 @@ async def weekly_job(
 # --- суточный сбор финансовых данных ------------------------------------------
 
 
-def fan_out_collect(task: Any, *, path: str | Path | None = None) -> list[int]:
+def baseline_period() -> str:
+    """Какой период поднять, чтобы сторожу было с чем сравнивать.
+
+    Сколько недель нужно, знает сторож (`watchdog.baseline_weeks()`, настройка
+    из конфига), а какие периоды умеет выгружать финансист - знает финансист.
+    Берём самый короткий из его периодов, который окно сравнения покрывает:
+    лишние недели это лишние минуты самого жёсткого лимита в проекте.
+    """
+    needed = watchdog.baseline_weeks() * 7
+    for name, days in sorted(finance.PERIODS.items(), key=lambda item: item[1]):
+        if days >= needed:
+            return name
+    return max(finance.PERIODS, key=lambda name: finance.PERIODS[name])
+
+
+def needs_baseline(client_id: int, *, path: str | Path | None = None) -> bool:
+    """Нужно ли поднять историю: доступ есть, а сравнивать не с чем.
+
+    Отметка ставится один раз и навсегда: повторный подъём той же истории
+    сжёг бы лимит впустую.
+    """
+    if _marks(client_id, path).get("baseline"):
+        return False
+    try:
+        rows = db.repo(client_id, path).rows("fin_weeks")
+    except Exception:  # noqa: BLE001 - один клиент не ломает обход
+        logger.exception("не удалось прочитать недели клиента %s", client_id)
+        return False
+    return len(rows) < watchdog.baseline_weeks()
+
+
+def _mark_baseline(client_id: int, value: str, path: str | Path | None) -> None:
+    data = _settings(client_id, path)
+    marks = data.get(MARKS_KEY)
+    marks = dict(marks) if isinstance(marks, dict) else {}
+    marks["baseline"] = value
+    data[MARKS_KEY] = marks
+    _save(client_id, data, path)
+
+
+async def fan_out_collect(task: Any, *, path: str | Path | None = None) -> list[int]:
     """Раз в сутки поставить финансисту сбор недели. Задача по виду, не вызов.
 
     **Собираем только тем, у кого модуль finance работает, и это решение, а
@@ -404,18 +448,40 @@ def fan_out_collect(task: Any, *, path: str | Path | None = None) -> list[int]:
     сегодня не теряется, в отличие от суточной воронки РНП, где сбор идёт у
     всех подключённых. А лимит у этого отчёта самый жёсткий в проекте, один
     запрос в минуту на кабинет, и потраченный на неплательщика он забран у
-    того, кто платит. Оплатив, клиент получает историю сразу: команда
-    /finance за месяц или квартал поднимет её задним числом, а недельная
-    рассылка пойдёт с ближайшего нового финотчёта.
+    того, кто платит.
+
+    Оплатившему история поднимается сама и один раз: без базы сравнения
+    сторож молчит, и человек, заплативший именно за алерты о выросших
+    расходах, пять недель считал бы, что сервис не работает. Догадаться
+    позвать /finance за месяц он не может, ему об этом никто не говорил.
+    Пробный период это тоже рабочий доступ: взявший семь дней должен увидеть,
+    ради чего он их взял.
 
     Тумблер рассылки здесь не спрашивается: он про «не присылай мне отчёт»,
     а не про «не собирай данные».
     """
-    return [
-        finance.request_collect(client_id, "week", path=path)
-        for client_id in connected_clients(path)
-        if access.has_access(client_id, finance.MODULE, path=path)
-    ]
+    queued: list[int] = []
+    for client_id in connected_clients(path):
+        if not access.has_access(client_id, finance.MODULE, path=path):
+            continue
+        queued.append(finance.request_collect(client_id, "week", path=path))
+        if not needs_baseline(client_id, path=path):
+            continue
+        period = baseline_period()
+        queued.append(finance.request_collect(client_id, period, path=path))
+        # Отметка ставится сразу после постановки, а не после выгрузки:
+        # задача уже в очереди, и очередь сама её доведёт или повторит.
+        _mark_baseline(client_id, period, path)
+        await _tell(
+            client_id,
+            Event(
+                kind=BACKFILL,
+                client_id=int(client_id),
+                module=finance.MODULE,
+                days_left=watchdog.baseline_weeks(),
+            ),
+        )
+    return queued
 
 
 # --- доставка -----------------------------------------------------------------
@@ -431,6 +497,18 @@ def set_notifier(fn: Callable[[int, "Event"], Any] | None) -> None:
 
 def notifier() -> Callable[[int, "Event"], Any] | None:
     return _notifier
+
+
+async def _tell(client_id: int, event: "Event") -> None:
+    """Сказать клиенту про событие. Молчание Telegram не ломает работу."""
+    if _notifier is None:
+        return
+    try:
+        result = _notifier(client_id, event)
+        if hasattr(result, "__await__"):
+            await result
+    except Exception:  # noqa: BLE001 - молчание Telegram не наша авария
+        logger.exception("не удалось написать клиенту %s", client_id)
 
 
 # --- события жизненного цикла -------------------------------------------------
@@ -607,13 +685,7 @@ async def daily_job(
             logger.exception("не удалось проверить клиента %s", client_id)
             continue
         for event in events:
-            if _notifier is not None:
-                try:
-                    result = _notifier(client_id, event)
-                    if hasattr(result, "__await__"):
-                        await result
-                except Exception:  # noqa: BLE001 - молчание Telegram не авария
-                    logger.exception("не удалось предупредить клиента %s", client_id)
+            await _tell(client_id, event)
             try:
                 if event.kind == DELETED:
                     erase(client_id, path=path)
