@@ -77,6 +77,13 @@ TASKS_LIMIT = 10
 EVENTS_LIMIT = 5
 
 STATS_HEAD = "📊 <b>WBРентген за {title}</b>"
+# Слово «клиент» у владельца должно всюду значить одно число. Здесь и в /tasks
+# это внутренний id, и подпись говорит об этом прямо: в уведомлении о счёте
+# владелец видит Telegram-аккаунт, и два числа легко спутать.
+CLIENT_NOTE = (
+    "Клиент везде это внутренний id. /grant и /revoke понимают и его, "
+    "и Telegram ID из уведомления о счёте."
+)
 NO_CLIENTS = "Клиентов пока нет."
 NO_CALLS = "Вызовов к Wildberries за месяц не было."
 
@@ -88,7 +95,9 @@ GRANT_USAGE = (
     "Выдать доступ вручную:\n"
     "<code>/grant id модуль месяцев способ номер_платежа</code>\n\n"
     "Например: <code>/grant 12 finance 3 счёт WBR-2026-0007</code>\n"
-    "Способ: счёт, карта или другое. Клиент это внутренний id из /stats."
+    "Способ: счёт, карта или другое.\n"
+    "Клиент это внутренний id из /stats или Telegram ID из уведомления о счёте: "
+    "понимаю оба, переводить одно в другое не нужно."
 )
 GRANT_DONE = "Клиент {client_id}: модуль {module} включён до {until}. Платёж {ref}, способ {method}."
 GRANT_DUPLICATE = (
@@ -96,14 +105,25 @@ GRANT_DUPLICATE = (
     "Модуль {module} работает до {until}."
 )
 UNKNOWN_MODULE = "Нет такого модуля: {module}. Есть: {known}."
-UNKNOWN_CLIENT = "Клиента с id {client_id} в базе нет."
+UNKNOWN_CLIENT = (
+    "Клиента с номером {client_id} в базе нет: ни внутреннего id, ни Telegram-аккаунта."
+)
+# Одно число может означать двух разных клиентов. Угадывать в команде, которая
+# стоит денег, нельзя: бот называет обоих и просит повторить однозначно.
+CLIENT_AMBIGUOUS = (
+    "Число {value} означает сразу двоих: это внутренний id клиента {by_id} и "
+    "Telegram-аккаунт клиента {by_telegram}. Угадывать не буду. Повторите с "
+    "внутренним id, он показан в /stats."
+)
+FOUND_BY_TELEGRAM = "Узнал клиента по Telegram-аккаунту: внутренний id {client_id}."
 BAD_NUMBER = "Срок пишется числом месяцев, например 3."
 
 REVOKE_USAGE = (
     "Отменить доступ:\n"
     "<code>/revoke id модуль причина</code>\n\n"
     "Например: <code>/revoke 12 finance возврат по счёту WBR-2026-0007</code>\n"
-    "Вместо модуля можно написать <code>все</code>: тогда гаснет всё, что работает."
+    "Вместо модуля можно написать <code>все</code>: тогда гаснет всё, что работает.\n"
+    "Клиент, как и у /grant, это внутренний id или Telegram ID: понимаю оба."
 )
 
 # Слово вместо модуля: погасить у клиента всё сразу, обходом по модулям.
@@ -204,7 +224,7 @@ def stats_text(result: metering.Stats) -> str:
         for item in result.clients:
             modules = ", ".join(item.modules) if item.modules else "без доступа"
             lines.append(
-                f"  клиент {item.client_id} ({modules}): выручка {rubles(item.revenue)}, "
+                f"  клиент #{item.client_id} ({modules}): выручка {rubles(item.revenue)}, "
                 f"расход {rubles(item.cost)}, маржа {rubles(item.margin)}, вызовов {item.calls}"
             )
     return "\n".join(lines).strip()
@@ -299,8 +319,59 @@ def make_acts_job(app: Any, path: str | Path | None = None):
 # --- D10: /grant и /revoke ---
 
 
-def _client_exists(client_id: int, path) -> bool:
-    return db.admin_repo(path).client(client_id) is not None
+class AmbiguousClient(Exception):
+    """Одно число указывает на двух разных клиентов."""
+
+    def __init__(self, value: int, by_id: int, by_telegram: int) -> None:
+        self.value = value
+        self.by_id = by_id
+        self.by_telegram = by_telegram
+        super().__init__(f"{value}: клиенты {by_id} и {by_telegram}")
+
+
+def resolve_client(value: int, *, path: str | Path | None = None) -> tuple[int, str] | None:
+    """Кого имел в виду владелец: внутренний id или Telegram ID из уведомления.
+
+    Владелец видит клиента в двух видах: внутренним id в /stats и /tasks и
+    Telegram-аккаунтом в уведомлении о новом счёте. Переводить одно число в
+    другое руками он не должен, поэтому команды понимают оба.
+
+    Правило разбора предсказуемое, а не «как угадается». Внутренний id имеет
+    приоритет: это то, что означает слово «клиент» во всех ответах владельцу.
+    Telegram ID подхватывается, только когда внутреннего такого нет. А если
+    число значит и то и другое у разных клиентов, команда не выполняется
+    вовсе: выдача доступа стоит денег, и промах здесь дороже лишнего вопроса.
+
+    Отдаёт пару (внутренний id, как узнали) или None, если такого нет.
+    """
+    admin = db.admin_repo(path)
+    by_id = admin.client(value)
+    by_telegram = admin.client_by_telegram(value)
+    if by_id is not None and by_telegram is not None and int(by_telegram["id"]) != value:
+        raise AmbiguousClient(value, int(by_id["id"]), int(by_telegram["id"]))
+    if by_id is not None:
+        return int(by_id["id"]), "id"
+    if by_telegram is not None:
+        return int(by_telegram["id"]), "telegram"
+    return None
+
+
+async def _resolved(update, value: int, path) -> tuple[int, str] | None:
+    """Разбирает номер клиента и сам объясняет владельцу, если не вышло."""
+    try:
+        found = resolve_client(value, path=path)
+    except AmbiguousClient as clash:
+        await _reply(
+            update,
+            CLIENT_AMBIGUOUS.format(
+                value=clash.value, by_id=clash.by_id, by_telegram=clash.by_telegram
+            ),
+        )
+        return None
+    if found is None:
+        await _reply(update, UNKNOWN_CLIENT.format(client_id=value))
+        return None
+    return found
 
 
 async def grant_command(
@@ -320,7 +391,7 @@ async def grant_command(
         await _reply(update, GRANT_USAGE)
         return
     try:
-        client_id = int(raw_client)
+        asked = int(raw_client)
         months = int(raw_months)
     except ValueError:
         await _reply(update, BAD_NUMBER)
@@ -328,9 +399,11 @@ async def grant_command(
     if module not in config.modules():
         await _reply(update, UNKNOWN_MODULE.format(module=module, known=", ".join(config.modules())))
         return
-    if not _client_exists(client_id, path):
-        await _reply(update, UNKNOWN_CLIENT.format(client_id=client_id))
+    found = await _resolved(update, asked, path)
+    if found is None:
         return
+    client_id, how = found
+    note = ("\n" + FOUND_BY_TELEGRAM.format(client_id=client_id)) if how == "telegram" else ""
 
     days = billing.months_to_days(months)
     granted = access.grant_access(
@@ -339,7 +412,10 @@ async def grant_command(
     if granted.duplicate:
         await _reply(
             update,
-            GRANT_DUPLICATE.format(ref=payment_ref, module=granted.module, until=local_date(granted.until)),
+            GRANT_DUPLICATE.format(
+                ref=payment_ref, module=granted.module, until=local_date(granted.until)
+            )
+            + note,
         )
         return
     await _reply(
@@ -350,7 +426,8 @@ async def grant_command(
             until=local_date(granted.until),
             ref=payment_ref,
             method=raw_method,
-        ),
+        )
+        + note,
     )
 
 
@@ -377,7 +454,7 @@ async def revoke_command(
         await _reply(update, REVOKE_USAGE)
         return
     try:
-        client_id = int(args[0])
+        asked = int(args[0])
     except ValueError:
         await _reply(update, REVOKE_USAGE)
         return
@@ -387,9 +464,11 @@ async def revoke_command(
     if not everything and module not in config.modules():
         await _reply(update, UNKNOWN_MODULE.format(module=module, known=", ".join(config.modules())))
         return
-    if not _client_exists(client_id, path):
-        await _reply(update, UNKNOWN_CLIENT.format(client_id=client_id))
+    found = await _resolved(update, asked, path)
+    if found is None:
         return
+    client_id, how = found
+    note = ("\n" + FOUND_BY_TELEGRAM.format(client_id=client_id)) if how == "telegram" else ""
 
     if everything:
         names = [item.module for item in access.status(client_id, now=now, path=path) if item.works]
@@ -406,7 +485,7 @@ async def revoke_command(
         burned += before.days_left
     await _reply(
         update,
-        REVOKE_DONE.format(client_id=client_id, module=", ".join(names), days=burned),
+        REVOKE_DONE.format(client_id=client_id, module=", ".join(names), days=burned) + note,
     )
 
 
@@ -415,7 +494,7 @@ async def revoke_command(
 
 def _task_line(row) -> str:
     client = row["client_id"]
-    who = f"клиент {int(client)}" if client is not None else "общая"
+    who = f"клиент #{int(client)}" if client is not None else "общая"
     line = f"#{row['id']} {row['kind']} ({who}), попыток {int(row['attempts'] or 0)}"
     # last_error пишет очередь, и туда попадает сырой ответ WB. Показывать его
     # владельцу можно только через ту же чистку, что стоит у журнала: один раз
@@ -427,7 +506,7 @@ def _task_line(row) -> str:
 
 
 def tasks_text(running, failed, errors) -> str:
-    lines = [TASKS_HEAD, ""]
+    lines = [TASKS_HEAD, CLIENT_NOTE, ""]
     if not running and not failed:
         lines.append(TASKS_NONE)
     if running:
@@ -442,7 +521,7 @@ def tasks_text(running, failed, errors) -> str:
         lines.append(TASKS_EVENTS)
         for row in errors:
             client = row["client_id"]
-            who = f"клиент {int(client)}" if client is not None else "общая"
+            who = f"клиент #{int(client)}" if client is not None else "общая"
             lines.append(f"{row['at']} {row['kind']} ({who}): {row['message']}")
     return "\n".join(lines).strip()
 

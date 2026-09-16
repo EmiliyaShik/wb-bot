@@ -17,6 +17,7 @@ import logging
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import InvalidToken
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from bot import texts
@@ -24,6 +25,18 @@ from bot.handlers import register_all
 from core import audit, config, crypto, db, queue, scheduler
 
 logger = logging.getLogger(__name__)
+
+TOKEN_MISSING = (
+    "Не задан TELEGRAM_BOT_TOKEN. Создайте файл .env на основе .env.example "
+    "и положите туда токен бота, полученный у @BotFather в Telegram."
+)
+
+TOKEN_REJECTED = (
+    "Телеграм не принял TELEGRAM_BOT_TOKEN: токен неверный, отозван или "
+    "скопирован не целиком. Проверьте значение в .env или в настройках "
+    "хостинга, при необходимости выпустите новый у @BotFather. "
+    "Токен выглядит так: 123456789:ABCdef-ГдеТоДлиннаяСтрокаБукв."
+)
 
 # Как часто воркер заглядывает в пустую очередь.
 WORKER_POLL_SEC = 5.0
@@ -212,3 +225,29 @@ def build_app(token: str) -> Application:
     legacy_handlers.register(app)
 
     return app
+
+
+def run(token: str | None) -> None:
+    """Запускает бота. Проблема с токеном объясняется по-русски, без трассировки.
+
+    Пустой токен и токен, который не принял Telegram, это одна и та же ошибка
+    настройки, и человек должен получить на них одинаково понятный ответ.
+    """
+    if not (token or "").strip():
+        raise SystemExit(TOKEN_MISSING)
+
+    report = startup()
+    logger.info(
+        "База: %s, схема %s, админов %s, приём токенов %s",
+        report["db_path"],
+        report["schema_version"],
+        report["admins"],
+        "включён" if report["tokens_enabled"] else "выключен",
+    )
+
+    try:
+        app = build_app(token)
+        logger.info("Бот запущен")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except InvalidToken as exc:
+        raise SystemExit(TOKEN_REJECTED) from exc

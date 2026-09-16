@@ -61,9 +61,8 @@ HOW_TO_SET_PLAN = (
 )
 
 SHORT_BASE = (
-    "Сравнивать пока не с чем: я собираю данные с первого дня подключения, "
-    "и суток накопилось немного. Так и должно быть у нового кабинета, чем "
-    "дальше, тем точнее будет сравнение."
+    "Данных пока немного: я собираю их с первого дня подключения. Для нового "
+    "кабинета это нормально, чем дальше, тем точнее будет сравнение."
 )
 
 PLAN_SAVED = "План на {month} принят.\n{lines}\n\nБуду считать выполнение каждое утро."
@@ -136,7 +135,7 @@ def report_text(report: rnp.RnpReport) -> str:
 
     lines.append(f"Заказы: {report.orders}" + _against(report.avg_orders, _orders, report.avg_days))
     lines.append(
-        f"Выручка: {rubles(report.revenue)} ₽"
+        f"Выручка: {rubles(report.revenue)}"
         + _against(report.avg_revenue, _money, report.avg_days)
     )
     if 0 < report.avg_days < rnp.WINDOW_DAYS:
@@ -152,7 +151,7 @@ def report_text(report: rnp.RnpReport) -> str:
     if report.ad_spend > 0:
         share = _percent(report.drr)
         lines.append(
-            f"Расход: {rubles(report.ad_spend)} ₽"
+            f"Расход: {rubles(report.ad_spend)}"
             + (f", ДРР {share}" if share else ", выручки за день нет, ДРР не считается")
         )
     else:
@@ -160,31 +159,44 @@ def report_text(report: rnp.RnpReport) -> str:
 
     if report.risks:
         lines.extend(["", "<b>Скоро закончится</b>"])
-        for risk in report.risks:
-            lines.append(
-                f"Артикул {risk.nm_id}: осталось {_pieces(risk.stock)}, "
-                f"при нынешней скорости хватит на {_days(risk.days)}."
-            )
+        lines.extend(_risk_line(risk) for risk in report.risks)
     return "\n".join(lines)
 
 
+def _risk_line(risk: rnp.StockRisk) -> str:
+    """Строка про остаток. «Хватит на 0 дней» не пишем: это не срок, а конец."""
+    if risk.stock <= 0:
+        return f"Артикул {risk.nm_id}: на складе пусто, товар закончился."
+    if risk.days <= 0:
+        return (
+            f"Артикул {risk.nm_id}: осталось {_pieces(risk.stock)}, "
+            "при нынешней скорости это меньше дня."
+        )
+    return (
+        f"Артикул {risk.nm_id}: осталось {_pieces(risk.stock)}, "
+        f"при нынешней скорости хватит на {_days(risk.days)}."
+    )
+
+
 def _money(value: Decimal) -> str:
-    return f"{rubles(value)} ₽"
+    return rubles(value)
 
 
 def _against(average: Decimal | None, shape, avg_days: int) -> str:
     """Сравнение со средним. Средних нет, если суток ещё не набралось.
 
-    Если собранных суток меньше недели, в тексте стоит их настоящее число.
-    Назвать двое суток неделей значит подсунуть селлеру базу сравнения,
-    которой нет: он решит, что вчера хуже обычного, а «обычного» ещё не было.
+    Два слова тут неслучайны. «В день» - потому что «в среднем за неделю
+    10 заказов» читается и как недельный итог. Настоящее число собранных
+    суток - потому что назвать двое суток неделей значит подсунуть селлеру
+    базу сравнения, которой нет: он решит, что вчера хуже обычного, а
+    «обычного» ещё не было.
     """
     if average is None or avg_days <= 0:
         return ""
     value = shape(int(average)) if shape is _orders else shape(average)
     if avg_days >= rnp.WINDOW_DAYS:
-        return f", в среднем за неделю {value}"
-    return f", в среднем {value} за {_days(avg_days)} до этого"
+        return f", в среднем {value} в день за прошлую неделю"
+    return f", в среднем {value} в день, но собрано пока {_days(avg_days)}"
 
 
 def _plan_lines(report: rnp.RnpReport) -> list[str]:
@@ -193,11 +205,11 @@ def _plan_lines(report: rnp.RnpReport) -> list[str]:
     if plan.revenue is not None:
         share = _percent(report.revenue_percent)
         lines.append(
-            f"Выручка: {rubles(report.month_revenue)} из {rubles(plan.revenue)} ₽"
+            f"Выручка: {rubles(report.month_revenue)} из {rubles(plan.revenue)}"
             + (f", это {share}" if share else "")
         )
     else:
-        lines.append(f"Выручка с начала месяца: {rubles(report.month_revenue)} ₽")
+        lines.append(f"Выручка с начала месяца: {rubles(report.month_revenue)}")
     if plan.orders is not None:
         share = _percent(report.orders_percent)
         lines.append(
@@ -207,7 +219,7 @@ def _plan_lines(report: rnp.RnpReport) -> list[str]:
         lines.append(f"Заказов с начала месяца: {report.month_orders}")
     lines.append(
         "По нынешнему темпу к концу месяца выйдет "
-        f"{rubles(report.forecast_revenue)} ₽ и {_orders(report.forecast_orders)}."
+        f"{rubles(report.forecast_revenue)} и {_orders(report.forecast_orders)}."
     )
     return lines
 
@@ -262,7 +274,7 @@ async def plan_command(
     orders = int(numbers[1]) if len(numbers) > 1 else None
     rnp.set_plan(client_id, month, revenue=revenue, orders=orders, path=path)
 
-    lines = [f"Выручка: {rubles(revenue)} ₽"]
+    lines = [f"Выручка: {rubles(revenue)}"]
     if orders is not None:
         lines.append(f"Заказы: {orders}")
     await message.reply_text(
@@ -277,7 +289,7 @@ def _current_plan_text(client_id: int, month: str, moment: date, path) -> str:
         return HOW_TO_SET_PLAN
     lines = [f"План на {MONTHS[moment.month - 1]}:"]
     if plan.revenue is not None:
-        lines.append(f"Выручка: {rubles(plan.revenue)} ₽")
+        lines.append(f"Выручка: {rubles(plan.revenue)}")
     if plan.orders is not None:
         lines.append(f"Заказы: {plan.orders}")
     lines.append("")

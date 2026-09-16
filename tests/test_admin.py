@@ -340,6 +340,62 @@ async def test_grant_goes_through_the_only_door_and_lands_in_the_log(db_path, bu
 
 
 @pytest.mark.asyncio
+async def test_grant_understands_the_telegram_id_from_the_invoice_notice(db_path, business, owner):
+    """Владелец видит в уведомлении о счёте Telegram-аккаунт, и этого хватает."""
+    _, second = business  # у него внутренний id 2 и Telegram ID 5050
+    message = FakeMessage()
+
+    await admin.grant_command(
+        FakeUpdate(OWNER, message),
+        context("5050", "finance", "1", "счёт", "П-5050"),
+        path=db_path,
+    )
+
+    assert access.has_access(second, "finance", path=db_path)
+    assert f"{second}" in message.last  # в ответе назван внутренний id
+
+
+@pytest.mark.asyncio
+async def test_revoke_understands_the_telegram_id_too(db_path, business, owner):
+    first, _ = business  # внутренний id 1, Telegram ID 4040
+    now = datetime(2026, 9, 16, tzinfo=timezone.utc)
+    message = FakeMessage()
+
+    await admin.revoke_command(
+        FakeUpdate(OWNER, message), context("4040", "finance", "возврат"), path=db_path, now=now
+    )
+
+    assert access.has_access(first, "finance", now=now, path=db_path) is False
+
+
+@pytest.mark.asyncio
+async def test_a_number_meaning_two_clients_stops_the_command(db_path, business, owner):
+    """Внутренний id одного совпал с Telegram ID другого: угадывать нельзя."""
+    admin_repo = db.admin_repo(db_path)
+    twin = admin_repo.ensure_client(1)  # его Telegram ID равен внутреннему id первого
+    message = FakeMessage()
+
+    await admin.grant_command(
+        FakeUpdate(OWNER, message), context("1", "finance", "1", "счёт", "П-9"), path=db_path
+    )
+
+    assert access.has_access(twin, "finance", path=db_path) is False
+    assert db.repo(1, db_path).one("access_log", payment_ref="П-9") is None
+    assert f"{twin}" in message.last  # назвал обоих, чтобы владелец выбрал сам
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_number_is_not_taken_for_anybody(db_path, business, owner):
+    message = FakeMessage()
+
+    await admin.grant_command(
+        FakeUpdate(OWNER, message), context("777777", "finance", "1", "счёт", "П-8"), path=db_path
+    )
+
+    assert "нет" in message.last.lower()
+
+
+@pytest.mark.asyncio
 async def test_grant_with_the_same_payment_number_does_not_extend_anything(db_path, business, owner):
     first, _ = business
     message = FakeMessage()

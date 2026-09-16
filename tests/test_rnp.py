@@ -521,3 +521,120 @@ def test_report_text_does_not_pass_two_days_off_as_a_week(db_path, cabinet):
 
     assert "неделю" not in text
     assert "2 дня" in text
+
+
+# --- как отчёт выглядит для человека ---
+
+NB = "\u00a0"  # неразрывный пробел: им rubles() разделяет разряды и отбивает знак
+
+
+def test_report_text_reads_exactly_as_a_human_would_write_it(db_path, half_a_month):
+    """Целая строка, а не наличие чисел: склейки видно только так.
+
+    Знак рубля ставит сама rubles(), поэтому второго знака рядом быть не может.
+    """
+    rnp.set_plan(half_a_month, "2026-09", revenue=Decimal("60000"), orders=600, path=db_path)
+
+    text = handler.report_text(rnp.daily(half_a_month, today=TODAY, path=db_path))
+
+    assert text == "\n".join(
+        [
+            "📈 <b>Отчёт за 15 сентября</b>",
+            "",
+            "Заказы: 10, в среднем 10 заказов в день за прошлую неделю",
+            f"Выручка: 1{NB}000{NB}₽, в среднем 1{NB}000{NB}₽ в день за прошлую неделю",
+            "",
+            "<b>План на сентябрь</b>",
+            f"Выручка: 15{NB}000{NB}₽ из 60{NB}000{NB}₽, это 25%",
+            "Заказы: 150 из 600, это 25%",
+            f"По нынешнему темпу к концу месяца выйдет 30{NB}000{NB}₽ и 300 заказов.",
+            "",
+            "<b>Реклама за вчера</b>",
+            "Расхода не было.",
+            "",
+            "<b>Скоро закончится</b>",
+            "Артикул 111: осталось 90 штук, при нынешней скорости хватит на 9 дней.",
+        ]
+    )
+
+
+def test_ad_spend_line_shows_one_rouble_sign_and_the_drr(db_path, cabinet):
+    put_day(cabinet, db_path, "2026-09-15", orders=1, revenue="10000", ad="700", stock=1)
+
+    text = handler.report_text(rnp.daily(cabinet, today=TODAY, path=db_path))
+
+    # 700 рублей рекламы при выручке 10000 это ДРР 7 процентов.
+    assert f"Расход: 700{NB}₽, ДРР 7%" in text
+    # Один остаток при одном заказе в день это ровно один день, и он в отчёте.
+    assert "осталось 1 штука, при нынешней скорости хватит на 1 день." in text
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["с планом", "без плана", "без данных", "нулевая выручка"],
+)
+def test_no_report_ever_shows_a_doubled_rouble_sign(db_path, half_a_month, case):
+    if case == "с планом":
+        rnp.set_plan(half_a_month, "2026-09", revenue=Decimal("60000"), path=db_path)
+    if case == "нулевая выручка":
+        put_day(half_a_month, db_path, "2026-09-15", orders=0, revenue="0", ad="500")
+    today = date(2027, 1, 2) if case == "без данных" else TODAY
+
+    text = handler.report_text(rnp.daily(half_a_month, today=today, path=db_path))
+
+    assert f"₽{NB}₽" not in text
+    assert "₽ ₽" not in text
+    assert "  " not in text
+    assert "\n\n\n" not in text
+    for mark in (" ,", " .", " :"):
+        assert mark not in text
+
+
+@pytest.mark.asyncio
+async def test_plan_confirmation_shows_one_rouble_sign(db_path, cabinet):
+    message = FakeMessage()
+
+    await handler.plan_command(
+        FakeUpdate(4040, message),
+        SimpleNamespace(args=["500000", "300"]),
+        path=db_path,
+        today=TODAY,
+    )
+
+    assert message.last == "\n".join(
+        [
+            "План на сентябрь принят.",
+            f"Выручка: 500{NB}000{NB}₽",
+            "Заказы: 300",
+            "",
+            "Буду считать выполнение каждое утро.",
+        ]
+    )
+
+
+def test_stock_running_out_today_is_not_called_zero_days(db_path, cabinet):
+    """«Хватит на 0 дней» это не по-русски и не помогает: так не пишем."""
+    put_day(cabinet, db_path, "2026-09-14", orders=4, revenue="400")
+    put_day(cabinet, db_path, "2026-09-15", orders=4, revenue="400", stock=1)
+
+    text = handler.report_text(rnp.daily(cabinet, today=TODAY, path=db_path))
+
+    assert "0 дней" not in text
+    assert "меньше дня" in text
+
+
+def test_empty_stock_says_the_goods_ran_out(db_path, cabinet):
+    put_day(cabinet, db_path, "2026-09-14", orders=4, revenue="400")
+    put_day(cabinet, db_path, "2026-09-15", orders=4, revenue="400", stock=0)
+
+    text = handler.report_text(rnp.daily(cabinet, today=TODAY, path=db_path))
+
+    assert "0 штук" not in text
+    assert "закончился" in text
+
+
+def test_average_says_plainly_that_it_is_a_daily_average(db_path, half_a_month):
+    """«В среднем за неделю 10 заказов» читается и как недельный итог. Так нельзя."""
+    text = handler.report_text(rnp.daily(half_a_month, today=TODAY, path=db_path))
+
+    assert "в среднем 10 заказов в день за прошлую неделю" in text
