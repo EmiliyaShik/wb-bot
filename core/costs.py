@@ -99,6 +99,23 @@ _ZERO = Decimal("0")
 # округляются молча: селлер должен узнать, что его число изменили.
 KOPECK = Decimal("0.01")
 
+# Потолок себестоимости за штуку: миллиард рублей за единицу товара. Дороже
+# на Wildberries не продаётся ничего, так что всё, что выше, это опечатка
+# или чужая ячейка, попавшая под заголовок.
+#
+# Граница нужна не для красоты. Decimal не переполняется молча: на числе
+# вроде 1e30 `quantize` бросает InvalidOperation, и разбор всего файла падает
+# из-за одной ячейки вместо того, чтобы отметить одну строку. Миллиард при
+# этом на восемь порядков ниже, чем потолок восьмибайтового целого в базе,
+# так что копейки влезают с запасом.
+MAX_COST = Decimal("1000000000")
+
+# Потолок артикула WB. nmID это счётчик номенклатуры, сейчас он девятизначный;
+# тысяча триллионов оставляет запас на годы вперёд. Число из чужой ячейки
+# бывает и на тридцать знаков, а такое целое sqlite уже не принимает и роняет
+# запись всего файла.
+MAX_NM_ID = 10**15
+
 
 class BadFile(Exception):
     """Файл целиком не годится: размер, формат или отсутствующая колонка.
@@ -275,12 +292,20 @@ def parse_upload(
         if nm_id is None or nm_id <= 0:
             problems.append(Problem(row.number, f"{COL_NM} не число"))
             continue
+        if nm_id > MAX_NM_ID:
+            problems.append(Problem(row.number, f"{COL_NM} слишком большой"))
+            continue
         cost = _to_money(raw_cost)
         if cost is None:
             problems.append(Problem(row.number, "себестоимость не число"))
             continue
         if cost < _ZERO:
             problems.append(Problem(row.number, "себестоимость отрицательная"))
+            continue
+        # Порядок важен: проверка на долю копейки ниже зовёт quantize, а он
+        # на слишком большом числе бросит InvalidOperation вместо ответа.
+        if cost > MAX_COST:
+            problems.append(Problem(row.number, "себестоимость слишком большая"))
             continue
         if cost != cost.quantize(KOPECK):
             problems.append(
@@ -313,6 +338,7 @@ def save_upload(
         "costs",
         client_id,
         f"Себестоимость из файла: принято {saved}, пропущено {parsed.skipped}.",
+        path=path,
     )
     return Upload(
         values=parsed.values,
@@ -460,7 +486,23 @@ def _to_int(value: Any) -> int | None:
 
 
 def _to_money(value: Any) -> Decimal | None:
-    """Число из ячейки в рубли. Запятая, пробелы и знак рубля допустимы."""
+    """Число из ячейки в рубли. Запятая, пробелы и знак рубля допустимы.
+
+    Бесконечность и NaN отсекаются здесь же, вместе с «сто рублей»: деньгами
+    они не являются, а дальше по коду сравнение с NaN и quantize от
+    бесконечности бросают InvalidOperation и роняют разбор всего файла.
+    Числом из книги такое не приходит (формат xlsx хранит числа десятичным
+    текстом, и openpyxl отдаёт такую ячейку пустой), зато приходит текстом:
+    `Decimal("Infinity")` разбирается прекрасно.
+    """
+    number = _decimal_of(value)
+    if number is None or not number.is_finite():
+        return None
+    return number
+
+
+def _decimal_of(value: Any) -> Decimal | None:
+    """Ячейка в Decimal как есть, без суждения о разумности числа."""
     if isinstance(value, bool):
         return None
     if isinstance(value, Decimal):

@@ -25,7 +25,16 @@
       "PowerShell(winget list *)",
       "PowerShell(winget install *)",
       "PowerShell(Test-Path *)",
-      "PowerShell(git *)"
+      "PowerShell(git *)",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\Git\\\\cmd;\" + $env:Path; $n = git config user.name; $e = git config user.email; Write-Output \"name=$n email=$e\")",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\Git\\\\cmd;\" + $env:Path; Write-Output \"--- Tracked files ---\"; git ls-files; Write-Output \"--- Check for secrets/zip ---\"; git ls-files | Select-String -Pattern \"\\\\.env$|wb-bot\\\\.zip\"; Write-Output \"\\(empty above = good\\)\")",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\Git\\\\cmd;\" + $env:Path; git config --get credential.helper; Test-Path \"C:\\\\Program Files\\\\Git\\\\mingw64\\\\bin\\\\git-credential-manager.exe\"; Test-Path \"C:\\\\Program Files\\\\Git\\\\mingw64\\\\libexec\\\\git-core\\\\git-credential-manager.exe\")",
+      "PowerShell(python --version 2>&1; python -c \"import httpx; print\\('httpx', httpx.__version__\\)\" 2>&1)",
+      "PowerShell(python \"C:\\\\Users\\\\emili\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Projects-wb-bot\\\\474f4629-2337-4a32-9c96-065f283cc752\\\\scratchpad\\\\test_fix.py\" 2>&1 | Out-String)",
+      "PowerShell(git push *)",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\Git\\\\cmd;\" + $env:Path; & \"C:\\\\Program Files\\\\Git\\\\cmd\\\\git.exe\" -c http.sslBackend=openssl -c http.proxy=http://127.0.0.1:7897 ls-remote https://github.com/EmiliyaShik/wb-bot.git 2>&1 | Out-String)",
+      "PowerShell(git ls-remote *)",
+      "PowerShell($env:Path = \"C:\\\\Program Files\\\\Git\\\\cmd;\" + $env:Path; foreach\\($i in 1..4\\){ $out = git ls-remote origin main 2>&1 | Out-String; if\\($out -match '93dd17a|0cc921c'\\){ Write-Output \"OK: $out\"; break } else { Write-Output \"attempt $i failed, retrying\"; Start-Sleep -Seconds 2 } })"
     ]
   }
 }

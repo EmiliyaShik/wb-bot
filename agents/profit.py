@@ -794,7 +794,7 @@ def set_sender(fn: Callable[[int, ProfitReport, bytes], Any] | None) -> None:
 
 def request_report(
     client_id: int, period: str = "week", *, path: str | Path | None = None
-) -> int:
+) -> queue.TaskId:
     """Ставит отчёт в очередь. «Принято» клиенту говорит сама очередь.
 
     Из хендлера в WB не ходят: за рекламой идёт обработчик задачи, и повтор

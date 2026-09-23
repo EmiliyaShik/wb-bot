@@ -8,8 +8,9 @@
 Две стороны:
 
 * запись - `write_book(sheets, path=None)`. Заголовок жирный и закреплён,
-  ширина колонок считается по содержимому. Без `path` возвращает байты,
-  готовые к отправке в Telegram, с `path` ещё и кладёт файл на диск;
+  ширина колонок считается по содержимому, денежная колонка показывается с
+  копейками. Без `path` возвращает байты, готовые к отправке в Telegram, с
+  `path` ещё и кладёт файл на диск;
 * чтение - `read_book(source)` и `read_sheet(source)`. Приходит книга из
   листов, у листа заголовки и строки, у строки настоящий номер, как его
   видит человек в Excel. Номер нужен, чтобы сказать «строка 12: ...».
@@ -59,6 +60,9 @@ __all__ = [
     "MAX_WIDTH",
     "MAX_ROWS",
     "MAX_CELLS",
+    "MONEY_FORMAT",
+    "MONEY_SIGN",
+    "is_money_header",
 ]
 
 # Строка заголовков в листе одна и всегда первая: так книгу читает человек,
@@ -69,6 +73,20 @@ FIRST_DATA_ROW = HEADER_ROW + 1
 
 MIN_WIDTH = 9
 MAX_WIDTH = 60
+
+# Деньги показываются с копейками всегда. Без формата Excel рисует число так,
+# как оно записано, и 2290,10 показывается как 2290,1: по реестру владелец
+# сверяется с банковской выпиской, а там двух копеек не видно. Это факт про
+# Excel, а не настройка владельца, поэтому строка стоит здесь, а не в
+# config.toml. Разделитель тысяч и знак запятой Excel подставит по локали.
+MONEY_FORMAT = "#,##0.00"
+
+# Денежную колонку узнаём по её же заголовку: в книгах проекта деньги всегда
+# подписаны рублём («Сумма, ₽», «Комиссия WB, ₽», «Себестоимость за единицу,
+# ₽»). Правило стоит на самих данных, а не на списке номеров колонок рядом с
+# каждой книгой: такой список автор нового листа забудет дополнить, и колонка
+# молча потеряет копейки. Знак в заголовке забыть нельзя, его читает человек.
+MONEY_SIGN = "₽"
 
 # Потолок на разжатое содержимое. Размер архива тут не помощник: короткий
 # zip разворачивается в лист на миллионы строк, и книга целиком уезжает в
@@ -123,6 +141,9 @@ class Sheet:
     `widths` задаёт ширину колонок вручную, если считать по содержимому не
     хочется. Длина списка может быть короче, чем заголовков: остальные
     посчитаются сами.
+
+    Отдельного признака «здесь деньги» у листа нет: колонку с рублём в
+    заголовке книга покажет с копейками сама, см. `is_money_header`.
     """
 
     title: str
@@ -205,6 +226,11 @@ def normalize(text: Any) -> str:
     return " ".join(str(text or "").split()).casefold()
 
 
+def is_money_header(header: Any) -> bool:
+    """Подписана ли колонка рублём. По этому и ставится формат с копейками."""
+    return str(header or "").rstrip().endswith(MONEY_SIGN)
+
+
 def find_column(headers: Sequence[str], aliases: Sequence[str]) -> str | None:
     """Первый заголовок, совпавший с любым из синонимов.
 
@@ -262,6 +288,8 @@ def _fill(worksheet: Any, sheet: Sheet) -> None:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(vertical="center", wrap_text=True)
 
+    money = {index for index, header in enumerate(headers) if is_money_header(header)}
+
     lengths = [len(header) for header in headers]
     for row in sheet.rows:
         values = list(row)
@@ -270,7 +298,14 @@ def _fill(worksheet: Any, sheet: Sheet) -> None:
             if index >= len(lengths):
                 lengths.append(0)
             lengths[index] = max(lengths[index], len(str(value if value is not None else "")))
+            if index in money:
+                worksheet.cell(row=worksheet.max_row, column=index + 1).number_format = (
+                    MONEY_FORMAT
+                )
 
+    # Ширина меряется по str(value). У денег это «2290.10», а Excel покажет
+    # «2 290,10»: разделитель тысяч добавляет знак, и запас в два знака ниже
+    # уходит как раз на него.
     given = list(sheet.widths or ())
     for index in range(len(lengths)):
         if index < len(given) and given[index]:

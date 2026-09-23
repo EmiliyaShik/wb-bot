@@ -5,6 +5,7 @@ import sys
 import pytest
 
 import bot.handlers as handlers
+from core import audit, db
 
 
 @pytest.fixture
@@ -77,3 +78,18 @@ def test_sandbox_leaves_nothing_behind():
 def test_own_package_is_importable():
     # в пакете хендлеров пока может не быть ни одного модуля, и это нормально
     assert isinstance(handlers.register_all(FakeApp()), list)
+
+
+def test_broken_handler_is_visible_in_the_journal(monkeypatch, tmp_path, sandbox):
+    """Без admin.py бот поднимется без ограничителя частоты и админ-команд,
+    поэтому сбой импорта обязан попасть в журнал, а не только в stdout."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    db.migrate()
+    body = "raise ImportError('нет модуля telegram')" + chr(10)
+    package = sandbox("fake_handlers_journal", body)
+    handlers.register_all(FakeApp(), package=package)
+
+    errors = [row["message"] for row in audit.recent(level="error")]
+    db.close_all()
+    assert any("fake_handlers_journal.alpha" in message for message in errors), errors
+    assert any("ImportError" in message for message in errors)

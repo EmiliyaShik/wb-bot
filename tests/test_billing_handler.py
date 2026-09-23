@@ -272,6 +272,204 @@ async def test_text_outside_the_dialog_is_left_to_other_handlers(wired, client_i
     assert message.sent == []
 
 
+# --- чужой текст в разметке ---
+
+# Название организации клиент пишет руками, адрес приезжает из DaData.
+# Внутри и то и другое лежит как есть, а вот в сообщении разметки быть не
+# должно: она уходит владельцу в личку от имени его же бота.
+EVIL_NAME = '<a href="http://zlo.example/dai-token">ООО Ромашка</a>'
+EVIL_ADDRESS = "г <i>Пример</i>, ул Тестовая, д 2"
+
+# Теги, которых бот не пишет нигде: если такой встретился, его подставил не
+# бот. Свои <b> и <code> в списке отсутствуют намеренно, они тут законны.
+ALIEN_TAGS = ("<a ", "<a href", "</a>", "<i>", "</i>", "<script")
+
+
+def assert_no_markup(text, *needles):
+    """Ни одного чужого тега в сообщении, но сам текст на месте."""
+    for tag in ALIEN_TAGS:
+        assert tag not in text, f"чужая разметка уехала в сообщение: {tag}"
+    for needle in needles:
+        assert needle in text
+
+
+@pytest.mark.asyncio
+async def test_name_typed_by_the_client_is_escaped_everywhere(wired, client_id):
+    context = FakeContext()
+    message = FakeMessage()
+    update = FakeUpdate(CLIENT_TG, message)
+    await handler.start_dialog(update, context, "finance")
+    await handler.period_callback(
+        FakeUpdate(CLIENT_TG, message, FakeQuery("inv:p:finance:1", message)), context
+    )
+    for answer in ("1234567894", EVIL_NAME, EVIL_ADDRESS):
+        try:
+            await handler.text_step(FakeUpdate(CLIENT_TG, message, text=answer), context)
+        except handler.ApplicationHandlerStop:
+            pass
+
+    # Счёт выставлен, и в базе имя лежит как его написали: экранирование это
+    # про разметку сообщения, а не про данные.
+    made = billing.invoices_of(client_id, path=wired)[0]
+    assert made.org_name == EVIL_NAME
+
+    to_owner = " ".join(context.bot.to(OWNER_ID))
+    assert_no_markup(to_owner, "&lt;a href=", "ООО Ромашка")
+    assert "zlo.example" in to_owner  # текст не потерян, он просто не ссылка
+    # И ни в одном сообщении клиенту чужого тега тоже нет.
+    for text in message.texts:
+        assert_no_markup(text)
+
+
+@pytest.mark.asyncio
+async def test_answer_of_dadata_is_escaped_too(wired, client_id, monkeypatch):
+    from core.billing import counterparty
+
+    async def fake_lookup(inn, **kwargs):
+        return counterparty.Counterparty(
+            inn=str(inn), name=EVIL_NAME, address=EVIL_ADDRESS
+        )
+
+    monkeypatch.setattr(counterparty, "lookup", fake_lookup)
+
+    context = FakeContext()
+    message = FakeMessage()
+    await handler.start_dialog(FakeUpdate(CLIENT_TG, message), context, "finance")
+    await handler.period_callback(
+        FakeUpdate(CLIENT_TG, message, FakeQuery("inv:p:finance:1", message)), context
+    )
+    try:
+        await handler.text_step(FakeUpdate(CLIENT_TG, message, text="1234567894"), context)
+    except handler.ApplicationHandlerStop:
+        pass
+
+    assert_no_markup(message.last, "ООО Ромашка", "Пример")
+    # В состоянии диалога, а значит и в счёте, лежит исходная строка.
+    assert context.user_data[handler.STATE]["name"] == EVIL_NAME
+
+
+def test_owner_contact_is_data_not_markup(wired, monkeypatch):
+    monkeypatch.setenv("OWNER_CONTACT", '<a href="http://zlo.example">@kontakt</a>')
+    assert_no_markup(handler.card_text(), "@kontakt")
+    assert_no_markup(handler.paysupport_text(), "@kontakt")
+
+
+# --- callback_data это не доверенный канал ---
+
+
+@pytest.mark.asyncio
+async def test_forged_callback_cannot_buy_a_hidden_module(wired, client_id):
+    context = FakeContext()
+    message = FakeMessage()
+    # Модуль ads в конфиге скрыт, кнопки с ним бот не рисует.
+    await handler.start_dialog(FakeUpdate(CLIENT_TG, message), context, "ads")
+    assert handler.STATE not in context.user_data
+
+    await handler.period_callback(
+        FakeUpdate(CLIENT_TG, message, FakeQuery("inv:p:ads:1", message)), context
+    )
+    assert handler.STATE not in context.user_data
+    assert billing.invoices_of(client_id, path=wired) == []
+
+
+@pytest.mark.asyncio
+async def test_forged_callback_cannot_invent_a_period(wired, client_id):
+    context = FakeContext()
+    message = FakeMessage()
+    # Срока в 7 месяцев в тарифах нет, но цену за него config.price посчитает.
+    assert 7 not in config.periods()
+    for data in ("inv:p:finance:7", "inv:p:finance:0", "inv:p:finance:-3"):
+        await handler.period_callback(
+            FakeUpdate(CLIENT_TG, message, FakeQuery(data, message)), context
+        )
+        assert handler.STATE not in context.user_data
+    assert billing.invoices_of(client_id, path=wired) == []
+
+
+@pytest.mark.asyncio
+async def test_garbage_callback_does_not_break_the_bot(wired, client_id):
+    context = FakeContext()
+    message = FakeMessage()
+    for data in ("inv:p:", "inv:p:finance", "inv:p:finance:мес", "inv:p:a:b:c"):
+        await handler.period_callback(
+            FakeUpdate(CLIENT_TG, message, FakeQuery(data, message)), context
+        )
+    assert handler.STATE not in context.user_data
+    assert billing.invoices_of(client_id, path=wired) == []
+
+
+@pytest.mark.asyncio
+async def test_hidden_module_in_the_dialog_state_makes_no_invoice(wired, client_id):
+    """Последняя проверка перед деньгами: состояние тоже сверяется с витриной."""
+    context = FakeContext()
+    context.user_data[handler.STATE] = {"module": "ads", "months": 1, "step": "address"}
+    message = FakeMessage()
+    try:
+        await handler.text_step(
+            FakeUpdate(CLIENT_TG, message, text="г Пример, ул Тестовая, д 2"), context
+        )
+    except handler.ApplicationHandlerStop:
+        pass
+    assert billing.invoices_of(client_id, path=wired) == []
+
+
+# --- предел обращений к справочнику ---
+
+
+@pytest.mark.asyncio
+async def test_dadata_limit_leaves_the_manual_path_open(wired, client_id, monkeypatch):
+    """Выбранная квота меняет слова, а не дорогу: счёт всё равно выставляется."""
+    from core.billing import counterparty
+
+    counterparty.forget()
+    monkeypatch.setenv("DADATA_API_KEY", "ключ-для-теста")
+    monkeypatch.setattr(counterparty, "per_day", lambda: 1)
+
+    class Silent:
+        """Справочник молчит: обращение потрачено, ответ не запомнен."""
+
+        async def post(self, url, **kwargs):
+            raise OSError("справочник недоступен")
+
+    try:
+        # Единственное на сегодня обращение клиент потратил раньше. Дальше в
+        # сеть уже не ходят: своего http диалог не подставляет, и живой
+        # запрос из теста означал бы, что предел не сработал.
+        await counterparty.lookup("1000000002", client_id=client_id, http=Silent())
+        assert counterparty.throttled(client_id) is True
+
+        context = FakeContext()
+        message = FakeMessage()
+        await handler.start_dialog(FakeUpdate(CLIENT_TG, message), context, "finance")
+        await handler.period_callback(
+            FakeUpdate(CLIENT_TG, message, FakeQuery("inv:p:finance:1", message)),
+            context,
+        )
+        # Верный ИНН, но в сеть за ним уже не идут: квота выбрана.
+        try:
+            await handler.text_step(
+                FakeUpdate(CLIENT_TG, message, text="1234567894"), context
+            )
+        except handler.ApplicationHandlerStop:
+            pass
+
+        assert "исчерпан" in message.last
+        assert "руками" in message.last or "Пришлите наименование" in message.last
+        assert context.user_data[handler.STATE]["step"] == "name"
+
+        # И ручная дорога рабочая: счёт выставлен.
+        for answer in ("ООО Ромашка", "г Пример, ул Тестовая, д 2"):
+            try:
+                await handler.text_step(
+                    FakeUpdate(CLIENT_TG, message, text=answer), context
+                )
+            except handler.ApplicationHandlerStop:
+                pass
+        assert len(billing.invoices_of(client_id, path=wired)) == 1
+    finally:
+        counterparty.forget()
+
+
 # --- пустые реквизиты ---
 
 

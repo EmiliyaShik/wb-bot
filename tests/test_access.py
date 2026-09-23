@@ -1,5 +1,7 @@
 """Доступ к модулям. Шов один: путь к базе."""
 
+import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -159,3 +161,179 @@ def test_revoke_switches_off_logs_once_and_is_safe_to_repeat(db_path, client_id)
     assert rows[-1]["payment_ref"] == "WBR-2026-0009"
     # На момент отмены оставалось 20 оплаченных суток из 30.
     assert rows[-1]["days"] == 20
+
+
+@pytest.mark.parametrize(
+    "module, reason",
+    [("all", "package"), ("ads", "not_sold"), ("funnel", "not_sold")],
+)
+def test_trial_is_refused_for_packages_and_hidden_modules(db_path, module, reason):
+    """callback_data не доверенный канал: запрет живёт в функции, не в клавиатуре."""
+    admin = db.admin_repo(db_path)
+    client = admin.ensure_client(777777)
+    admin.set_client_fields(client, seller_id="WB-555")
+
+    with pytest.raises(access.TrialDenied) as denied:
+        access.start_trial(client, module, now=T0, path=db_path)
+    assert denied.value.reason == reason
+
+    # Отказ доказан состоянием: доступа нет и попытка не потрачена.
+    assert access.has_access(client, module, now=T0, path=db_path) is False
+    assert admin.trials("WB-555") == []
+    assert access.start_trial(client, "finance", now=T0, path=db_path).state == "active"
+
+
+def test_the_one_trial_taken_by_another_process_leaves_nothing_to_take(db_path):
+    """Квота «один модуль» живёт в базе, а не в порядке чтений.
+
+    Проверяем отдельным соединением с тем же файлом: это второй процесс бота,
+    и threading.RLock он ни с кем не разделяет. Значит, отказ может дать только
+    сама база - тем же оператором, которым и пишет.
+
+    Настоящие потоки здесь не запускаются намеренно: бот однопоточный, а общее
+    соединение sqlite одновременного обращения из двух потоков не переживает.
+    Тест, который падает раз через раз, хуже отсутствующего.
+    """
+    admin = db.admin_repo(db_path)
+    client = admin.ensure_client(888888)
+    admin.set_client_fields(client, seller_id="WB-RACE")
+
+    other_process = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        taken = other_process.execute(
+            "INSERT INTO trials (seller_id, module) SELECT 'WB-RACE', 'finance'"
+            " WHERE (SELECT COUNT(*) FROM trials WHERE seller_id = 'WB-RACE') < 1"
+        ).rowcount
+    finally:
+        other_process.close()
+    assert taken == 1, "первая проба не записалась, дальше проверять нечего"
+
+    with pytest.raises(access.TrialDenied) as denied:
+        access.start_trial(client, "rnp", now=T0, path=db_path)
+
+    assert denied.value.reason == "used"
+    assert len(admin.trials("WB-RACE")) == 1, "бесплатно ушло больше одного модуля"
+    assert access.has_access(client, "rnp", now=T0, path=db_path) is False
+
+
+def test_the_base_itself_refuses_the_second_trial(db_path):
+    """Тот же оператор, выполненный дважды, второй раз не пишет ничего."""
+    admin = db.admin_repo(db_path)
+    client = admin.ensure_client(888889)
+    admin.set_client_fields(client, seller_id="WB-QUOTA")
+
+    assert admin.start_trial("WB-QUOTA", "finance") is True
+    assert admin.start_trial("WB-QUOTA", "rnp") is False
+    assert admin.start_trial("WB-QUOTA", "finance") is False
+    assert len(admin.trials("WB-QUOTA")) == 1
+
+
+def _run_together(*calls) -> None:
+    """Запускает вызовы одновременно: барьер отпускает потоки в одной точке."""
+    ready = threading.Barrier(len(calls))
+
+    def wrapped(call):
+        def run():
+            ready.wait()
+            call()
+
+        return run
+
+    threads = [threading.Thread(target=wrapped(call)) for call in calls]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def test_one_payment_paid_twice_at_once_extends_once(db_path, client_id):
+    def pay():
+        access.grant_access(
+            client_id, "finance", 30, "WBR-2026-0010", "invoice", "system",
+            now=T0, path=db_path,
+        )
+
+    _run_together(pay, pay, pay, pay)
+
+    rows = db.repo(client_id, db_path).rows("access_log", module="finance")
+    assert [row["action"] for row in rows].count("grant") == 1
+    current = access.access_of(client_id, "finance", now=T0, path=db_path)
+    assert current.until == T0 + timedelta(days=30)
+
+
+def test_the_rule_against_a_twice_paid_invoice_lives_in_the_database(db_path, client_id):
+    """Замок в core.access это верхняя граница, база нижняя.
+
+    Второй процесс бота на той же базе замка не видит, поэтому вторая строка
+    выдачи по тому же платежу должна быть невозможна и без него.
+    """
+    access.grant_access(
+        client_id, "finance", 30, "WBR-2026-0012", "invoice", "system",
+        now=T0, path=db_path,
+    )
+    repo = db.repo(client_id, db_path)
+    row = dict(
+        module="finance", action="grant", days=30,
+        payment_ref="WBR-2026-0012", method="invoice", actor="system",
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.insert("access_log", **row)
+
+    # Правило в пределах клиента, как и проверка в grant_access: чужой клиент
+    # с тем же номером ни при чём.
+    other = db.admin_repo(db_path).ensure_client(100200)
+    db.repo(other, db_path).insert("access_log", **row)
+
+    # Запрещена только выдача. Дубли, паузы и возвраты по тому же платежу
+    # пишутся сколько угодно раз, иначе журнал перестал бы быть журналом.
+    for action in ("duplicate", "duplicate", "revoke"):
+        repo.insert("access_log", **{**row, "action": action})
+
+
+def test_payment_claimed_by_another_process_comes_back_as_a_duplicate(db_path, client_id):
+    """Выдачу занял кто-то мимо замка: наружу дубль, а не исключение базы.
+
+    Второй процесс бота это отдельное соединение с тем же файлом: своего
+    threading.RLock он не разделяет ни с кем. Здесь он успевает записать
+    выдачу первым.
+    """
+    other_process = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        other_process.execute(
+            "INSERT INTO access_log (client_id, module, action, days, payment_ref,"
+            " method, actor) VALUES (?, 'finance', 'grant', 30, 'WBR-2026-0013',"
+            " 'invoice', 'system')",
+            (client_id,),
+        )
+    finally:
+        other_process.close()
+
+    granted = access.grant_access(
+        client_id, "finance", 30, "WBR-2026-0013", "invoice", "system",
+        now=T0, path=db_path,
+    )
+
+    assert granted.duplicate is True
+    actions = [
+        row["action"]
+        for row in db.repo(client_id, db_path).rows("access_log", module="finance")
+    ]
+    assert sorted(actions) == ["duplicate", "grant"]
+    # Второй процесс выдал доступ по-своему, наша сторона его не продлевала.
+    assert access.access_of(client_id, "finance", now=T0, path=db_path).state == "off"
+
+
+def test_two_simultaneous_revokes_write_one_line(db_path, client_id):
+    access.grant_access(
+        client_id, "rnp", 30, "WBR-2026-0011", "invoice", "owner",
+        now=T0, path=db_path,
+    )
+
+    def cancel():
+        access.revoke_access(client_id, "rnp", "возврат", "owner", now=T0, path=db_path)
+
+    _run_together(cancel, cancel, cancel, cancel)
+
+    rows = db.repo(client_id, db_path).rows("access_log", module="rnp")
+    assert [row["action"] for row in rows].count("revoke") == 1
+    assert access.has_access(client_id, "rnp", now=T0, path=db_path) is False

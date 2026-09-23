@@ -228,3 +228,62 @@ async def test_broken_session_does_not_block_shutdown(monkeypatch, prepared):
     await bot_app.start_background(app)
     await bot_app.stop_background(app)
     assert app.bot_data.get("queue_worker") is None
+
+
+# --- сбой в хендлере: клиент получает ответ, владелец запись ---
+
+
+class FakeMessage:
+    def __init__(self):
+        self.replies = []
+
+    async def reply_text(self, text, **kwargs):
+        self.replies.append(text)
+
+
+class FakeUpdate:
+    def __init__(self, telegram_id=None, message=None):
+        self.effective_message = message
+        self.effective_user = type("U", (), {"id": telegram_id})() if telegram_id else None
+
+
+class FakeContext:
+    def __init__(self, error):
+        self.error = error
+
+
+@pytest.mark.asyncio
+async def test_handler_failure_answers_the_client_and_lands_in_the_journal(prepared):
+    from bot import texts
+
+    client_id = db.admin_repo().ensure_client(telegram_id=910001)
+    message = FakeMessage()
+    await bot_app.on_error(FakeUpdate(910001, message), FakeContext(ValueError("сломалось")))
+
+    assert message.replies == [texts.SOMETHING_WENT_WRONG]
+    row = audit.recent(level="error")[0]
+    assert row["client_id"] == client_id
+    assert "ValueError" in row["message"]
+
+
+@pytest.mark.asyncio
+async def test_failure_without_message_is_still_recorded(prepared):
+    await bot_app.on_error(FakeUpdate(), FakeContext(RuntimeError("фон упал")))
+    row = audit.recent(level="error")[0]
+    assert "RuntimeError" in row["message"]
+    assert row["client_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_silent_telegram_does_not_add_a_second_failure(prepared):
+    class Mute(FakeMessage):
+        async def reply_text(self, text, **kwargs):
+            raise RuntimeError("телеграм молчит")
+
+    await bot_app.on_error(FakeUpdate(910002, Mute()), FakeContext(ValueError("сломалось")))
+    assert audit.recent(level="error")  # запись всё равно есть
+
+
+def test_bot_does_not_serve_clients_one_by_one():
+    # одно сообщение за раз означало бы, что медленный хендлер держит всех
+    assert bot_app.CONCURRENT_UPDATES > 1

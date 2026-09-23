@@ -13,6 +13,12 @@ core.clients, разбор токена в core.wbapi, доступ к моду�
 Путь к базе приходит параметром path, как и у остальных хендлеров проекта.
 Транспорт WB хендлер не знает вовсе: он зовёт core.clients, а тот берёт
 общее соединение через core.wbapi.
+
+Разметку в сообщениях ставит только бот. В подтверждение подключения едут
+ID продавца и тип токена из самого токена, ссылка на оферту из окружения и
+названия категорий из конфига, а уходит оно с `ParseMode.HTML`. Поэтому
+подстановка идёт через общий `bot.texts.fill`, а `_reply` принимает либо
+готовый `Safe`, либо шаблон: другой дороги к разметке из этого файла нет.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from telegram.ext import (
 
 from bot import texts
 from bot.handlers import tariffs
+from bot.texts import Safe, fill
 from core import access, audit, clients, config, crypto, db, queue, scheduler, wbapi
 
 logger = logging.getLogger(__name__)
@@ -54,6 +61,10 @@ TOKEN_PATTERN = r"eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*"
 
 # Имя ежедневной работы в расписании. Оно же имя вида задачи в очереди.
 REMINDER_JOB = "token_expiry_reminder"
+
+# Вид задачи: доделать в фоне пробный запрос, на который не хватило бюджета
+# при подключении. Обещание «проверю связь позже» держится этой задачей.
+TOKEN_CHECK = "token_check"
 
 INSTRUCTION = (
     "🔑 <b>Подключение кабинета Wildberries</b>\n\n"
@@ -161,12 +172,36 @@ NOT_CONNECTED = (
     "Команда <code>/connect</code> расскажет, как подключить."
 )
 
+CHECK_LATER = (
+    "🕓 Связь с Wildberries по этому токену я ещё не проверял: проверок подряд "
+    "набралось много, и я не стал занимать ими очередь. Сам токен принят и "
+    "разобран, срок и категории выше взяты из него.\n"
+    "Связь проверю в фоне, в ближайшие минуты. Делать ничего не нужно: "
+    "напишу, только если Wildberries токен не примет."
+)
+
 TOKEN_TROUBLE = (
     "⛔️ Wildberries перестал принимать ваш токен.\n\n"
     "Обычно это значит, что токен отозвали в кабинете или у него кончился срок. "
     "Пока он не работает, я поставил ваши модули на паузу: оплаченные дни "
     "не тратятся и дождутся нового токена.\n\n"
     "Выпустите новый токен и пришлите его командой <code>/connect</code>."
+)
+
+OFFER_LINE = "Оферта, с которой вы соглашаетесь: {link}"
+
+CABINET = (
+    "ID продавца: <code>{sid}</code>\n"
+    "Тип токена: {acc}.\n"
+    "Токен действует до {until}, это ещё {days} дн."
+)
+
+REMINDER = (
+    "⏳ Токену Wildberries осталось {days} дн.\n\n"
+    "Когда он кончится, я перестану собирать отчёты, а оплаченные дни встанут "
+    "на паузу и не сгорят. Чтобы этого не было, выпустите новый токен заранее: "
+    "команда <code>/connect</code> напомнит, где в кабинете нажимать.\n"
+    "Новый токен заменит старый, ничего перенастраивать не придётся."
 )
 
 
@@ -183,17 +218,22 @@ def _client_id(update: Update, path) -> int | None:
     return db.admin_repo(path).ensure_client(user.id)
 
 
-def offer_line() -> str:
+def offer_line() -> Safe:
     """Строка про оферту. Пустая переменная это не повод молчать или выдумывать."""
     link = clients.offer_url()
     if not link:
-        return OFFER_PENDING
-    return f"Оферта, с которой вы соглашаетесь: {link}"
+        return Safe(OFFER_PENDING)
+    return fill(OFFER_LINE, link=link)
 
 
-def instruction_text() -> str:
+def instruction_text() -> Safe:
     """Пошаговая инструкция плюс строка про оферту."""
-    return f"{INSTRUCTION}\n\n{offer_line()}"
+    return Safe(INSTRUCTION + "\n\n" + offer_line())
+
+
+def token_prompt() -> Safe:
+    """Та же инструкция и просьба прислать токен одним сообщением."""
+    return Safe(instruction_text() + "\n\n" + SEND_TOKEN)
 
 
 def consent_keyboard() -> InlineKeyboardMarkup:
@@ -220,28 +260,30 @@ def wipe_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def category_line(name: str) -> str:
+def category_line(name: str) -> Safe:
     """Название категории и что без неё не заработает. Карта живёт в конфиге."""
     section = config.settings().get("token_categories", {}).get(name, {})
     title = section.get("title") or wbapi.category_title(name)
     note = str(section.get("note") or "").strip()
-    return f"• <b>{title}</b>: {note}" if note else f"• <b>{title}</b>"
+    if note:
+        return fill("• <b>{title}</b>: {note}", title=title, note=note)
+    return fill("• <b>{title}</b>", title=title)
 
 
-def missing_text(missing: tuple[str, ...]) -> str:
+def missing_text(missing: tuple[str, ...]) -> Safe:
     """Чего у токена нет и что из-за этого не работает. Пусто - пустая строка."""
     if not missing:
-        return ""
+        return Safe("")
     lines = ["⚠️ У токена не хватает категорий:"]
     lines += [category_line(name) for name in missing]
     lines.append(
         "Это поправимо: отметьте их в том же токене или выпустите новый "
         "и пришлите его сюда ещё раз."
     )
-    return "\n".join(lines)
+    return Safe("\n".join(lines))
 
 
-def forbidden_text(category: str) -> str:
+def forbidden_text(category: str) -> Safe:
     """403 это не пауза: сказать, какой категории нет, и работать дальше."""
     lines = [
         "⚠️ Wildberries не дал доступ к части данных: у токена нет нужной категории.",
@@ -253,56 +295,69 @@ def forbidden_text(category: str) -> str:
         "Чтобы заработало и это, выпустите токен с недостающей категорией "
         "и пришлите его командой <code>/connect</code>."
     )
-    return "\n\n".join(lines)
+    return Safe("\n\n".join(lines))
 
 
-def modules_text(client_id: int, *, path=None, now: datetime | None = None) -> str:
+def modules_text(client_id: int, *, path=None, now: datetime | None = None) -> Safe:
     """Таблица модулей со статусами. Состояния считает core.access."""
     lines = ["<b>Ваши модули:</b>"]
     for item in access.status(client_id, now=now, path=path):
-        lines.append(f"• {texts.module_title(item.module)}: {tariffs.state_words(item)}")
-    return "\n".join(lines)
+        lines.append(
+            fill(
+                "• {title}: {state}",
+                title=texts.module_title(item.module),
+                state=tariffs.state_words(item),
+            )
+        )
+    return Safe("\n".join(lines))
 
 
 def confirm_text(
     result: clients.Connected, *, path=None, now: datetime | None = None
-) -> str:
+) -> Safe:
     """Подтверждение: кабинет, срок, тип токена, предупреждения, модули."""
     info = result.info
     blocks = [
         "✅ <b>Кабинет подключён.</b>",
-        f"ID продавца: <code>{info.sid}</code>\n"
-        f"Тип токена: {info.acc_title}.\n"
-        f"Токен действует до {tariffs.local_date(info.expires_at)}, "
-        f"это ещё {info.days_left(now)} дн.",
+        fill(
+            CABINET,
+            sid=info.sid,
+            acc=info.acc_title,
+            until=tariffs.local_date(info.expires_at),
+            days=info.days_left(now),
+        ),
     ]
     if info.is_test:
         blocks.append(ACC_TEST)
     if int(info.acc) != clients.PERSONAL_ACC:
-        blocks.append(ACC_WRONG.format(title=info.acc_title))
+        blocks.append(fill(ACC_WRONG, title=info.acc_title))
     if not info.read_only:
         blocks.append(READ_ONLY_WARNING)
+    if not result.probed:
+        # Пробного запроса не было, значит и «проверил» говорить нельзя:
+        # разобрать токен и проверить его у Wildberries это разные вещи.
+        blocks.append(CHECK_LATER)
     problem = missing_text(result.missing)
     if problem:
         blocks.append(problem)
     blocks.append(modules_text(result.client_id, path=path, now=now))
-    return "\n\n".join(blocks)
+    return Safe("\n\n".join(blocks))
 
 
-def reminder_text(days: int) -> str:
+def reminder_text(days: int) -> Safe:
     """Напоминание о сроке токена. Два раза за срок, а не каждый день."""
-    return (
-        f"⏳ Токену Wildberries осталось {days} дн.\n\n"
-        "Когда он кончится, я перестану собирать отчёты, а оплаченные дни встанут "
-        "на паузу и не сгорят. Чтобы этого не было, выпустите новый токен заранее: "
-        "команда <code>/connect</code> напомнит, где в кабинете нажимать.\n"
-        "Новый токен заменит старый, ничего перенастраивать не придётся."
-    )
+    return fill(REMINDER, days=days)
 
 
 async def _reply(message, text: str, keyboard=None) -> None:
+    """Единственная отправка с разметкой в этом файле, она же и граница.
+
+    Либо готовый текст с пометкой `Safe`, либо шаблон, и тогда он проходит
+    через `fill` здесь. Незаполненный шаблон идёт той же дорогой, а не мимо
+    неё: иначе для чужого значения нашёлся бы второй путь к разметке.
+    """
     await message.reply_text(
-        text,
+        text if isinstance(text, Safe) else fill(text),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
         reply_markup=keyboard,
@@ -338,7 +393,7 @@ async def connect_command(
         await _reply(message, ALREADY, replace_keyboard())
         return
     if clients.has_consent(client_id, path=path):
-        await _reply(message, f"{instruction_text()}\n\n{SEND_TOKEN}")
+        await _reply(message, token_prompt())
         return
     await _reply(message, instruction_text(), consent_keyboard())
 
@@ -362,7 +417,7 @@ async def token_message(
         return
 
     if not clients.has_consent(client_id, path=path):
-        refusal = NEED_CONSENT + "\n\n" + offer_line()
+        refusal = Safe(NEED_CONSENT + "\n\n" + offer_line())
         await _reply(message, refusal, consent_keyboard())
         await _forget(message)
         return
@@ -382,6 +437,10 @@ async def token_message(
     except (crypto.MissingKeyError, crypto.DecryptError):
         await _reply(message, texts.TOKENS_DISABLED)
     else:
+        if not result.probed:
+            # Обещание «проверю связь» держится задачей в очереди, а не словами:
+            # там пробный запрос может спокойно дождаться своего бюджета.
+            queue.enqueue(client_id, TOKEN_CHECK, notify=False, path=path)
         await _reply(message, confirm_text(result, path=path))
     await _forget(message)
 
@@ -398,7 +457,7 @@ async def agree_callback(
     if client_id is None:
         return
     clients.record_consent(client_id, path=path)
-    await _reply(query.message, f"{CONSENT_SAVED}\n\n{SEND_TOKEN}")
+    await _reply(query.message, Safe(CONSENT_SAVED + "\n\n" + SEND_TOKEN))
 
 
 async def replace_callback(
@@ -409,7 +468,7 @@ async def replace_callback(
     if query is None:
         return
     await query.answer()
-    await _reply(query.message, f"{instruction_text()}\n\n{SEND_TOKEN}")
+    await _reply(query.message, token_prompt())
 
 
 async def keep_callback(
@@ -496,6 +555,31 @@ def make_reminder(app, *, path=None, now: datetime | None = None):
     return job
 
 
+def make_token_check(*, path=None):
+    """Фоновая проверка связи для токена, который приняли без пробного запроса.
+
+    В очереди ждать бюджет запросов можно: там пауза никому не мешает, а в
+    хендлере она была бы молчанием бота для всех сразу. Отказ Wildberries
+    разбирать тут нечем и не нужно: 401 очередь отдаст обработчику паузы,
+    он же и напишет клиенту, а недоступность WB повторит сама.
+    """
+
+    async def job(task) -> None:
+        client_id = getattr(task, "client_id", None)
+        if client_id is None:
+            return
+        client = wbapi.get_wb_client(client_id, path=path)
+        try:
+            await client.ping(wbapi.HOSTS["finance"], wait=True)
+        except wbapi.WBForbiddenError:
+            # Отказ по категории означает, что токен живой: про недостающие
+            # категории клиенту уже сказано при подключении.
+            return
+        audit.log("connect", client_id, "Связь с Wildberries проверена.", path=path)
+
+    return job
+
+
 def make_auth_notice(app, *, path=None):
     """Что делает бот, когда WB отклонил токен в фоновой задаче.
 
@@ -549,3 +633,5 @@ def register(app, *, path=None) -> None:
     # Пауза при 401 живёт здесь же, рядом с подключением: снимать её будет
     # тот же обмен токена.
     queue.set_auth_handler(make_auth_notice(app, path=path))
+    # Своя задача регистрируется рядом со своим хендлером, как у агентов.
+    queue.register(TOKEN_CHECK, make_token_check(path=path))

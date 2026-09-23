@@ -7,6 +7,7 @@
 
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -316,3 +317,115 @@ async def test_any_other_error_does_not_kill_the_worker(db_path, client):
     assert any(_without_error_codes(text) for text in messages if text != "вторая задача дошла")
     journal = audit.recent(limit=10, level="error", path=db_path)
     assert any("broken_task" in record["message"] for record in journal)
+
+
+# --- повторы. Доказательства берутся из таблицы tasks, а не из текста ответа ---
+
+
+def _tasks(db_path, client=None):
+    rows = db.admin_repo(db_path).tasks(limit=100)
+    return [row for row in rows if client is None or row["client_id"] == client]
+
+
+def test_the_same_work_is_not_queued_twice(db_path, client):
+    messages = []
+    queue.set_notifier(lambda client_id, text: messages.append(text))
+
+    first = queue.enqueue(client, "finance_report", {"period": "2026-W37"}, path=db_path)
+    second = queue.enqueue(client, "finance_report", {"period": "2026-W37"}, path=db_path)
+
+    assert len(_tasks(db_path, client)) == 1
+    assert int(second) == int(first)
+    assert first.created is True and second.created is False
+    # Молчать на второе нажатие нельзя, и обещать второй отчёт тоже нельзя.
+    assert messages == [queue.ACCEPTED, queue.ALREADY_QUEUED]
+
+
+def test_a_task_in_work_still_blocks_a_second_one(db_path, client):
+    first = queue.enqueue(client, "finance_collect", notify=False, path=db_path)
+    db.admin_repo(db_path).update_task(first, state=queue.RUNNING)
+
+    second = queue.enqueue(client, "finance_collect", notify=False, path=db_path)
+
+    assert len(_tasks(db_path, client)) == 1
+    assert int(second) == int(first) and second.created is False
+
+
+def test_another_period_is_another_task(db_path, client):
+    queue.enqueue(client, "finance_report", {"period": "2026-W37"}, notify=False, path=db_path)
+    queue.enqueue(client, "finance_report", {"period": "2026-W36"}, notify=False, path=db_path)
+
+    assert len(_tasks(db_path, client)) == 2
+
+
+def test_the_neighbour_client_is_not_affected_by_my_queue(db_path, client):
+    other = db.admin_repo(db_path).ensure_client(100501)
+
+    queue.enqueue(client, "finance_report", notify=False, path=db_path)
+    mine = queue.enqueue(other, "finance_report", notify=False, path=db_path)
+
+    assert mine.created is True
+    assert len(_tasks(db_path)) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_finished_task_can_be_asked_for_again(db_path, client):
+    async def handler(task):
+        return None
+
+    queue.register("finance_report", handler)
+    first = queue.enqueue(client, "finance_report", notify=False, path=db_path)
+    await queue.run_once(path=db_path)
+
+    second = queue.enqueue(client, "finance_report", notify=False, path=db_path)
+
+    assert second.created is True and int(second) != int(first)
+    assert len(_tasks(db_path, client)) == 2
+
+
+@pytest.mark.asyncio
+async def test_eight_simultaneous_presses_leave_one_task(db_path, client):
+    """Восемь нажатий разом. Хендлеры бота теперь выполняются одновременно."""
+
+    async def press():
+        # Передача управления до постановки: так расходятся по циклу событий
+        # обработчики восьми сообщений, пришедших в одну секунду.
+        await asyncio.sleep(0)
+        return queue.enqueue(client, "finance_collect", notify=False, path=db_path)
+
+    placed = await asyncio.gather(*(press() for _ in range(8)))
+
+    assert len(_tasks(db_path, client)) == 1
+    assert len({int(task_id) for task_id in placed}) == 1
+    assert sum(1 for task_id in placed if task_id.created) == 1
+
+
+def test_the_base_itself_refuses_a_second_copy(db_path, client):
+    """Уникальность держит база, а не проверка в коде.
+
+    Это и есть ответ на гонку: между «посмотрел» и «вставил» второй вызов
+    ничего не успевает, потому что проверки в коде нет вовсе.
+    """
+    queue.enqueue(client, "finance_collect", {"date": "2026-09-16"}, notify=False, path=db_path)
+    repo = db.repo(client, db_path)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.insert(
+            "tasks",
+            kind="finance_collect",
+            payload=json.dumps({"date": "2026-09-16"}, ensure_ascii=False),
+            state=queue.PENDING,
+            next_run_at=None,
+        )
+
+    assert len(_tasks(db_path, client)) == 1
+
+
+def test_a_daily_job_without_a_client_is_not_doubled_either(db_path):
+    first = queue.enqueue(None, "token_expiry_reminder", {"date": "2026-09-16"}, path=db_path)
+    second = queue.enqueue(None, "token_expiry_reminder", {"date": "2026-09-16"}, path=db_path)
+    other_day = queue.enqueue(None, "token_expiry_reminder", {"date": "2026-09-17"}, path=db_path)
+
+    assert int(second) == int(first) and second.created is False
+    assert other_day.created is True
+    assert len(_tasks(db_path)) == 2

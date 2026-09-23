@@ -246,7 +246,7 @@ def test_fraction_of_a_kopeck_is_a_problem_not_a_silent_rounding(cabinet):
 
 
 def test_a_huge_but_honest_cost_is_accepted(cabinet):
-    """Порога сверху спецификация не решала, значит его нет."""
+    """Ровно под потолком `MAX_COST`: граница отсекает бред, а не дорогой товар."""
     client_id, path = cabinet
 
     result = costs.save_upload(
@@ -511,3 +511,71 @@ async def test_registered_task_sends_the_workbook_to_the_client(cabinet, monkeyp
 
 async def _fake_template(client_id, **kwargs):
     return costs.template_bytes([card(1, "art-1", "Носки")])
+
+
+def test_an_impossible_cost_is_one_bad_row_and_not_a_broken_file(cabinet):
+    """Decimal не переполняется молча.
+
+    На 1e30 quantize бросает InvalidOperation, и раньше она вылетала наружу:
+    из-за одной ячейки селлер терял разбор всего файла. Должно быть ровно
+    наоборот - одна строка в проблемах, остальные в базе.
+    """
+    client_id, path = cabinet
+    rows = [
+        [1, "art-1", "Носки", 100],
+        [2, "art-2", "Метеорит", 1e30],
+        [3, "art-3", "Шарф", 300],
+    ]
+
+    result = costs.save_upload(client_id, upload(rows), path=path)
+
+    assert result.saved == 2
+    assert sorted(costs.costs_for(client_id, path=path)) == [1, 3]
+    assert [problem.row for problem in result.problems] == [3]
+
+
+def test_float_infinity_never_survives_the_book_itself(cabinet):
+    """Проверено специально: до разбора inf и nan не доезжают.
+
+    Формат xlsx хранит числа десятичным текстом, и openpyxl кладёт такую
+    ячейку пустой. Значит, для селлера это незаполненная строка, а не ошибка,
+    и падения тут быть не может в принципе. Дверь в `_to_money` от этого не
+    лишняя: текстом «Infinity» пишется прекрасно, это следующий тест.
+    """
+    client_id, path = cabinet
+    rows = [
+        [1, "art-1", "Носки", float("inf")],
+        [2, "art-2", "Кепка", float("nan")],
+        [3, "art-3", "Плед", 250],
+    ]
+
+    result = costs.save_upload(client_id, upload(rows), path=path)
+
+    assert result.saved == 1
+    assert costs.costs_for(client_id, path=path) == {3: Decimal("250")}
+    assert result.problems == ()
+    assert result.blank == 2
+
+
+def test_infinity_written_by_hand_is_refused_the_same_way(cabinet):
+    """Decimal('Infinity') разбирает и текст, так что дверь нужна и тут."""
+    client_id, path = cabinet
+    rows = [[1, "art-1", "Носки", "Infinity"], [2, "art-2", "Кепка", "NaN"]]
+
+    result = costs.save_upload(client_id, upload(rows), path=path)
+
+    assert result.saved == 0
+    assert costs.costs_for(client_id, path=path) == {}
+    assert [problem.row for problem in result.problems] == [2, 3]
+
+
+def test_an_impossible_article_number_does_not_reach_the_base(cabinet):
+    """Тридцатизначное целое sqlite не принимает и роняет запись всего файла."""
+    client_id, path = cabinet
+    rows = [[1e30, "art-1", "Носки", 100], [2, "art-2", "Кепка", 200]]
+
+    result = costs.save_upload(client_id, upload(rows), path=path)
+
+    assert result.saved == 1
+    assert sorted(costs.costs_for(client_id, path=path)) == [2]
+    assert [problem.row for problem in result.problems] == [2]

@@ -461,3 +461,42 @@ def test_dynamics_table_says_the_same_about_its_percents(db_path, five_weeks):
 
     assert "удержал" in text
     assert "/finance" in text
+
+
+# --- чужой текст в таблице и в алерте ---
+#
+# Границы недели приезжают от Wildberries строкой: ими бот подписывает
+# строку таблицы и называет неделю в алерте. И то и другое уходит с
+# ParseMode.HTML, а таблица ещё и завёрнута в <pre>: одна угловая скобка, и
+# сторож расходов молчит не потому, что всё в порядке, а потому, что
+# Telegram не принял сообщение.
+
+TRAP = '<a href="http://zlo.example">нажми</a>'
+
+
+def test_a_week_name_from_wildberries_does_not_become_markup_in_the_table(
+    db_path, five_weeks
+):
+    from dataclasses import replace
+
+    table = watchdog.dynamics(five_weeks, "quarter", today=TODAY, path=db_path)
+    spoiled = replace(table.weeks[0], date_from=TRAP)
+
+    text = handler.table_text(replace(table, weeks=(spoiled,)))
+
+    assert "<a href" not in text
+    # Столбец узкий, и дата в нём обрезана: экранируется то, что осталось.
+    assert "&lt;a" in text
+    assert "<pre>" in text  # разметка самого бота при этом на месте
+
+
+def test_the_same_holds_for_the_weekly_alert(db_path, five_weeks):
+    from dataclasses import replace
+
+    watch = watchdog.check(five_weeks, today=TODAY, path=db_path)
+    spoiled = replace(watch.week, date_from=TRAP, date_to=TRAP)
+
+    text = handler.alerts_text(replace(watch, week=spoiled))
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text

@@ -13,6 +13,10 @@ Wildberries живёт только там.
 Второе: доступ к платному модулю проверяет `require_module`, своей проверки
 здесь нет. Без доступа клиент видит, что даёт модуль, цену и кнопку
 «Оформить», а не отказ.
+
+Разметку в сообщении ставит только бот: отчёт уходит с `ParseMode.HTML`, а
+внутрь попадают числа и артикулы из базы. Подстановка идёт через общий
+`bot.texts.fill`, граница стоит на ней, а не у каждого поля.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from telegram.ext import CommandHandler
 
 from agents import rnp
 from bot.handlers.tariffs import client_id_of, require_module, rubles
+from bot.texts import Safe, fill
 from core import db, scheduler
 
 logger = logging.getLogger(__name__)
@@ -71,6 +76,22 @@ NOT_A_NUMBER = (
     "Не понял числа. Выручку и заказы пишите цифрами, например: "
     "<code>/plan 500000 300</code>."
 )
+
+TOO_BIG = (
+    "Слишком большая сумма, проверьте ввод. План на месяц пишется в рублях, "
+    "например: <code>/plan 500000 300</code>."
+)
+
+# Потолок плана на месяц: триллион рублей выручки и миллиард заказов. Это
+# больше, чем оборот всего Wildberries за год, то есть заведомо промах по
+# клавише, а не цель.
+#
+# Проверка стоит до записи в базу, и это здесь важнее самой границы. Decimal
+# не переполняется молча: тридцатизначное число спокойно ляжет в план, а
+# упадёт потом rubles() - каждое утро, в каждом отчёте этого клиента. Починить
+# такое селлер не может, отчёт умирает раньше, чем покажет ему план.
+MAX_PLAN_REVENUE = Decimal("1000000000000")
+MAX_PLAN_ORDERS = 1_000_000_000
 
 
 def _date_ru(moment: date) -> str:
@@ -121,22 +142,31 @@ def _orders(count: int) -> str:
     )
 
 
-def report_text(report: rnp.RnpReport) -> str:
+def report_text(report: rnp.RnpReport) -> Safe:
     """Утренний отчёт словами.
 
     Блока план-факт нет, если плана нет: это требование R125 дословно.
     Отчёт при этом приходит целиком, а не заменяется словами «план не задан».
     """
-    lines = [HEADER.format(day=_date_ru(report.date)), ""]
+    lines = [fill(HEADER, day=_date_ru(report.date)), ""]
 
     if not report.has_data:
-        lines.append(NO_DATA.format(day=_date_ru(report.date)))
-        return "\n".join(lines)
+        lines.append(fill(NO_DATA, day=_date_ru(report.date)))
+        return Safe("\n".join(lines))
 
-    lines.append(f"Заказы: {report.orders}" + _against(report.avg_orders, _orders, report.avg_days))
     lines.append(
-        f"Выручка: {rubles(report.revenue)}"
-        + _against(report.avg_revenue, _money, report.avg_days)
+        fill(
+            "Заказы: {count}{against}",
+            count=report.orders,
+            against=_against(report.avg_orders, _orders, report.avg_days),
+        )
+    )
+    lines.append(
+        fill(
+            "Выручка: {amount}{against}",
+            amount=rubles(report.revenue),
+            against=_against(report.avg_revenue, _money, report.avg_days),
+        )
     )
     if 0 < report.avg_days < rnp.WINDOW_DAYS:
         lines.append(SHORT_BASE)
@@ -144,15 +174,21 @@ def report_text(report: rnp.RnpReport) -> str:
     if report.plan is not None:
         # Месяц берётся у самого плана, а не у вчерашней даты: первого числа
         # вчера это ещё прошлый месяц, а план уже новый.
-        lines.extend(["", f"<b>План на {_month_name(report.plan.year_month)}</b>"])
+        lines.extend(
+            ["", fill("<b>План на {month}</b>", month=_month_name(report.plan.year_month))]
+        )
         lines.extend(_plan_lines(report))
 
     lines.extend(["", "<b>Реклама за вчера</b>"])
     if report.ad_spend > 0:
         share = _percent(report.drr)
+        spent = rubles(report.ad_spend)
         lines.append(
-            f"Расход: {rubles(report.ad_spend)}"
-            + (f", ДРР {share}" if share else ", выручки за день нет, ДРР не считается")
+            fill("Расход: {amount}, ДРР {share}", amount=spent, share=share)
+            if share
+            else fill(
+                "Расход: {amount}, выручки за день нет, ДРР не считается", amount=spent
+            )
         )
     else:
         lines.append("Расхода не было.")
@@ -160,21 +196,26 @@ def report_text(report: rnp.RnpReport) -> str:
     if report.risks:
         lines.extend(["", "<b>Скоро закончится</b>"])
         lines.extend(_risk_line(risk) for risk in report.risks)
-    return "\n".join(lines)
+    return Safe("\n".join(lines))
 
 
-def _risk_line(risk: rnp.StockRisk) -> str:
+def _risk_line(risk: rnp.StockRisk) -> Safe:
     """Строка про остаток. «Хватит на 0 дней» не пишем: это не срок, а конец."""
     if risk.stock <= 0:
-        return f"Артикул {risk.nm_id}: на складе пусто, товар закончился."
-    if risk.days <= 0:
-        return (
-            f"Артикул {risk.nm_id}: осталось {_pieces(risk.stock)}, "
-            "при нынешней скорости это меньше дня."
+        return fill(
+            "Артикул {nm_id}: на складе пусто, товар закончился.", nm_id=risk.nm_id
         )
-    return (
-        f"Артикул {risk.nm_id}: осталось {_pieces(risk.stock)}, "
-        f"при нынешней скорости хватит на {_days(risk.days)}."
+    if risk.days <= 0:
+        return fill(
+            "Артикул {nm_id}: осталось {stock}, при нынешней скорости это меньше дня.",
+            nm_id=risk.nm_id,
+            stock=_pieces(risk.stock),
+        )
+    return fill(
+        "Артикул {nm_id}: осталось {stock}, при нынешней скорости хватит на {days}.",
+        nm_id=risk.nm_id,
+        stock=_pieces(risk.stock),
+        days=_days(risk.days),
     )
 
 
@@ -199,27 +240,46 @@ def _against(average: Decimal | None, shape, avg_days: int) -> str:
     return f", в среднем {value} в день, но собрано пока {_days(avg_days)}"
 
 
-def _plan_lines(report: rnp.RnpReport) -> list[str]:
+def _plan_lines(report: rnp.RnpReport) -> list[Safe]:
     plan = report.plan
-    lines: list[str] = []
+    lines: list[Safe] = []
     if plan.revenue is not None:
         share = _percent(report.revenue_percent)
+        done = rubles(report.month_revenue)
+        target = rubles(plan.revenue)
         lines.append(
-            f"Выручка: {rubles(report.month_revenue)} из {rubles(plan.revenue)}"
-            + (f", это {share}" if share else "")
+            fill("Выручка: {done} из {target}, это {share}", done=done, target=target, share=share)
+            if share
+            else fill("Выручка: {done} из {target}", done=done, target=target)
         )
     else:
-        lines.append(f"Выручка с начала месяца: {rubles(report.month_revenue)}")
+        lines.append(
+            fill("Выручка с начала месяца: {amount}", amount=rubles(report.month_revenue))
+        )
     if plan.orders is not None:
         share = _percent(report.orders_percent)
         lines.append(
-            f"Заказы: {report.month_orders} из {plan.orders}" + (f", это {share}" if share else "")
+            fill(
+                "Заказы: {done} из {target}, это {share}",
+                done=report.month_orders,
+                target=plan.orders,
+                share=share,
+            )
+            if share
+            else fill(
+                "Заказы: {done} из {target}",
+                done=report.month_orders,
+                target=plan.orders,
+            )
         )
     else:
-        lines.append(f"Заказов с начала месяца: {report.month_orders}")
+        lines.append(fill("Заказов с начала месяца: {count}", count=report.month_orders))
     lines.append(
-        "По нынешнему темпу к концу месяца выйдет "
-        f"{rubles(report.forecast_revenue)} и {_orders(report.forecast_orders)}."
+        fill(
+            "По нынешнему темпу к концу месяца выйдет {revenue} и {orders}.",
+            revenue=rubles(report.forecast_revenue),
+            orders=_orders(report.forecast_orders),
+        )
     )
     return lines
 
@@ -272,29 +332,36 @@ async def plan_command(
 
     revenue = numbers[0]
     orders = int(numbers[1]) if len(numbers) > 1 else None
+    if revenue > MAX_PLAN_REVENUE or (orders is not None and orders > MAX_PLAN_ORDERS):
+        await message.reply_text(TOO_BIG, parse_mode=ParseMode.HTML)
+        return
     rnp.set_plan(client_id, month, revenue=revenue, orders=orders, path=path)
 
-    lines = [f"Выручка: {rubles(revenue)}"]
+    lines = [fill("Выручка: {amount}", amount=rubles(revenue))]
     if orders is not None:
-        lines.append(f"Заказы: {orders}")
+        lines.append(fill("Заказы: {count}", count=orders))
     await message.reply_text(
-        PLAN_SAVED.format(month=MONTHS[moment.month - 1], lines="\n".join(lines)),
+        fill(
+            PLAN_SAVED,
+            month=MONTHS[moment.month - 1],
+            lines=Safe("\n".join(lines)),
+        ),
         parse_mode=ParseMode.HTML,
     )
 
 
-def _current_plan_text(client_id: int, month: str, moment: date, path) -> str:
+def _current_plan_text(client_id: int, month: str, moment: date, path) -> Safe:
     plan = rnp.plan_of(client_id, month, path=path)
     if plan is None:
-        return HOW_TO_SET_PLAN
-    lines = [f"План на {MONTHS[moment.month - 1]}:"]
+        return Safe(HOW_TO_SET_PLAN)
+    lines = [fill("План на {month}:", month=MONTHS[moment.month - 1])]
     if plan.revenue is not None:
-        lines.append(f"Выручка: {rubles(plan.revenue)}")
+        lines.append(fill("Выручка: {amount}", amount=rubles(plan.revenue)))
     if plan.orders is not None:
-        lines.append(f"Заказы: {plan.orders}")
+        lines.append(fill("Заказы: {count}", count=plan.orders))
     lines.append("")
     lines.append(HOW_TO_SET_PLAN)
-    return "\n".join(lines)
+    return Safe("\n".join(lines))
 
 
 async def rnp_command(

@@ -20,7 +20,7 @@ import httpx
 import pytest
 
 from bot.handlers import connect
-from core import access, audit, clients, crypto, db, wbapi
+from core import access, audit, clients, crypto, db, queue, wbapi
 
 # Маска посчитана руками, а не кодом под тестом: Контент 1, Аналитика 2,
 # Статистика 5, Продвижение 6, Финансы 13 -> 2 + 4 + 32 + 64 + 8192 = 8294.
@@ -638,3 +638,144 @@ async def test_a_disconnect_that_left_rows_behind_is_not_called_done(db_path, re
 
     assert connect.DISCONNECT_DONE not in answer.sent[0][0]
     assert db.repo(ready, db_path).count("wb_tokens") == 1
+
+
+# --- обещание проверить связь ---
+
+
+@pytest.fixture
+def worker():
+    """Чистый реестр очереди: задачи регистрируют их владельцы."""
+    queue.reset()
+    yield
+    queue.reset()
+
+
+@pytest.mark.asyncio
+async def test_a_token_taken_without_a_probe_is_not_called_checked(db_path, ready, wb, worker):
+    clients.record_consent(ready, now=NOW, path=db_path)
+    # Бюджет пробных запросов маленький и общий: три штуки за полминуты.
+    # Четвёртое подключение подряд идёт уже без проверки связи.
+    for _ in range(3):
+        await connect.token_message(
+            FakeUpdate(500500, FakeMessage(make_token())), FakeContext(), path=db_path
+        )
+    message = FakeMessage(make_token())
+
+    await connect.token_message(FakeUpdate(500500, message), FakeContext(), path=db_path)
+
+    answer = message.sent[0][0]
+    assert "подключён" in answer.lower()
+    # Про связь сказано честно: разобрали, а проверим позже.
+    assert "проверю" in answer.lower() and "фоне" in answer.lower()
+    # И обещание подкреплено задачей, а не только словами.
+    planned = [
+        row
+        for row in db.admin_repo(db_path).tasks(limit=50)
+        if row["kind"] == connect.TOKEN_CHECK
+    ]
+    assert len(planned) == 1
+    assert planned[0]["client_id"] == ready
+    assert planned[0]["state"] == queue.PENDING
+
+
+@pytest.mark.asyncio
+async def test_a_probed_token_says_nothing_about_a_later_check(db_path, ready, wb, worker):
+    clients.record_consent(ready, now=NOW, path=db_path)
+    message = FakeMessage(make_token())
+
+    await connect.token_message(FakeUpdate(500500, message), FakeContext(), path=db_path)
+
+    assert "фоне" not in message.sent[0][0].lower()
+    assert db.admin_repo(db_path).tasks(limit=50) == []
+
+
+@pytest.mark.asyncio
+async def test_the_promised_check_happens_and_a_dead_token_pauses_the_modules(
+    db_path, ready, wb, worker, monkeypatch
+):
+    clients.record_consent(ready, now=NOW, path=db_path)
+    await clients.connect(ready, make_token(), http=http(), path=db_path, now=NOW)
+    access.grant_access(
+        ready, "finance", 30, "WBR-2026-0006", "invoice", "owner", now=NOW, path=db_path
+    )
+    app = FakeApp()
+    queue.register(connect.TOKEN_CHECK, connect.make_token_check(path=db_path))
+    queue.set_auth_handler(connect.make_auth_notice(app, path=db_path))
+    # Фоновая проверка идёт через общего клиента WB, там же и шов транспорта.
+    monkeypatch.setattr("core.wbapi.client.shared_session", lambda: http(401))
+    task_id = queue.enqueue(ready, connect.TOKEN_CHECK, notify=False, path=db_path)
+
+    assert await queue.run_once(path=db_path) is True
+
+    chat_id, text = app.bot.sent[0]
+    assert chat_id == 500500
+    assert "паузу" in text.lower()
+    assert _state(ready, db_path) == access.PAUSED
+    # Повторять бессмысленно: дело в ключе, а не в доступности WB.
+    assert db.admin_repo(db_path).task(task_id)["state"] == queue.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_a_living_token_is_checked_quietly(db_path, ready, wb, worker, monkeypatch):
+    clients.record_consent(ready, now=NOW, path=db_path)
+    await clients.connect(ready, make_token(), http=http(), path=db_path, now=NOW)
+    app = FakeApp()
+    queue.register(connect.TOKEN_CHECK, connect.make_token_check(path=db_path))
+    queue.set_auth_handler(connect.make_auth_notice(app, path=db_path))
+    monkeypatch.setattr("core.wbapi.client.shared_session", lambda: http(200))
+    task_id = queue.enqueue(ready, connect.TOKEN_CHECK, notify=False, path=db_path)
+
+    await queue.run_once(path=db_path)
+
+    # Хорошая новость это не повод писать клиенту: он ничего не спрашивал.
+    assert app.bot.sent == []
+    assert db.admin_repo(db_path).task(task_id)["state"] == queue.DONE
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_token_does_not_plan_a_second_check(db_path, ready, wb, worker):
+    clients.record_consent(ready, now=NOW, path=db_path)
+    for _ in range(5):
+        await connect.token_message(
+            FakeUpdate(500500, FakeMessage(make_token())), FakeContext(), path=db_path
+        )
+
+    planned = [
+        row
+        for row in db.admin_repo(db_path).tasks(limit=50)
+        if row["kind"] == connect.TOKEN_CHECK
+    ]
+    assert len(planned) == 1
+
+
+# --- чужой текст в подтверждении подключения ---
+#
+# ID продавца бот берёт из самого токена, а токен приносит человек. Ответ
+# уходит с ParseMode.HTML: осмысленная угловая скобка стала бы разметкой от
+# имени бота, случайная - ошибкой Telegram, и тогда клиент не узнает даже
+# того, что кабинет подключился.
+
+TRAP = '<a href="http://zlo.example">нажми</a>'
+
+
+@pytest.mark.asyncio
+async def test_a_seller_id_from_the_token_does_not_become_markup(db_path, ready, wb):
+    clients.record_consent(ready, now=NOW, path=db_path)
+    message = FakeMessage(make_token(sid=TRAP))
+
+    await connect.token_message(FakeUpdate(500500, message), FakeContext(), path=db_path)
+
+    answer = message.sent[0][0]
+    assert "<a href" not in answer
+    assert "&lt;a href=&quot;" in answer
+    assert "<b>" in answer  # разметка самого бота при этом на месте
+
+
+def test_the_offer_link_from_the_environment_does_not_become_markup(monkeypatch):
+    monkeypatch.setenv("OFFER_URL", TRAP)
+
+    text = connect.offer_line()
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text

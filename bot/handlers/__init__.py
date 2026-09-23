@@ -11,6 +11,8 @@ import logging
 import pkgutil
 from types import ModuleType
 
+from core import audit
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,8 +30,18 @@ def register_all(app, package: ModuleType | None = None) -> list[str]:
         full_name = f"{package.__name__}.{info.name}"
         try:
             module = importlib.import_module(full_name)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - один сбойный файл не роняет бота
             logger.exception("хендлер %s не импортировался, пропускаю", full_name)
+            # Молча пропустить нельзя: без admin.py бот поднимется без
+            # ограничителя частоты и без админ-команд, и узнать об этом
+            # будет неоткуда, кроме вывода в консоль.
+            audit.log(
+                "handlers",
+                None,
+                f"Хендлер {full_name} не импортировался и выключен: "
+                f"{type(exc).__name__}: {exc}",
+                level="error",
+            )
             continue
         register = getattr(module, "register", None)
         if not callable(register):
@@ -37,8 +49,15 @@ def register_all(app, package: ModuleType | None = None) -> list[str]:
             continue
         try:
             register(app)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
             logger.exception("хендлер %s не зарегистрировался", full_name)
+            audit.log(
+                "handlers",
+                None,
+                f"Хендлер {full_name} не зарегистрировался и выключен: "
+                f"{type(exc).__name__}: {exc}",
+                level="error",
+            )
             continue
         registered.append(info.name)
     return registered

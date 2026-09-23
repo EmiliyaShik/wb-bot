@@ -4,6 +4,8 @@
 пользуются финансовые отчёты, прибыльность артикулов и реестр актов.
 """
 
+from decimal import Decimal
+
 import pytest
 
 from core import xlsx
@@ -157,6 +159,78 @@ def test_row_limit_counts_the_whole_book_not_one_sheet():
 
     with pytest.raises(xlsx.TooManyRowsError):
         xlsx.read_book(data, max_rows=2)
+
+
+# --- деньги в ячейке ---
+#
+# Excel показывает число так, как его записали: без формата 2290,10 выглядит
+# как 2290,1, и две копейки пропадают с экрана. По реестру владелец сверяется
+# с банковской выпиской, поэтому копейки в денежной колонке видны всегда.
+
+
+def money_formats(data: bytes, column: str) -> list[str]:
+    """Форматы ячеек одной колонки, кроме заголовка."""
+    import io
+
+    from openpyxl import load_workbook
+
+    book = load_workbook(io.BytesIO(data))
+    try:
+        cells = book.worksheets[0][column]
+        return [cell.number_format for cell in cells[xlsx.HEADER_ROW:]]
+    finally:
+        book.close()
+
+
+def test_a_column_signed_in_rubles_shows_kopecks():
+    data = xlsx.write_book(
+        xlsx.Sheet("Лист", ["Номер", "Сумма, ₽"], [["С-1", Decimal("2290.10")]])
+    )
+
+    assert money_formats(data, "B") == [xlsx.MONEY_FORMAT]
+    # И число при этом осталось числом, а не текстом: его складывают в Excel.
+    assert xlsx.read_sheet(data).rows[0].cells["Сумма, ₽"] == 2290.1
+
+
+def test_a_column_without_the_ruble_sign_is_left_as_it_was():
+    """Формат ставится по подписи колонки, а не всему числовому подряд."""
+    data = xlsx.write_book(
+        xlsx.Sheet("Лист", ["Период, мес.", "Сумма, ₽"], [[3, Decimal("990.00")]])
+    )
+
+    assert money_formats(data, "A") == ["General"]
+    assert money_formats(data, "B") == [xlsx.MONEY_FORMAT]
+
+
+def test_the_ruble_sign_is_recognized_with_a_trailing_space():
+    assert xlsx.is_money_header("Сумма, ₽ ")
+    assert xlsx.is_money_header("Себестоимость за единицу, ₽")
+    assert not xlsx.is_money_header("Комиссия WB, %")
+    assert not xlsx.is_money_header(None)
+
+
+def test_an_empty_money_cell_keeps_the_format_for_what_the_seller_types():
+    """Шаблон себестоимости уходит селлеру пустым, и вписывать он будет деньги."""
+    data = xlsx.write_book(xlsx.Sheet("Лист", ["Себестоимость, ₽"], [[None]]))
+
+    assert money_formats(data, "A") == [xlsx.MONEY_FORMAT]
+
+
+def test_kopecks_survive_the_trip_through_the_cell():
+    """openpyxl печатает число через %.16g, то есть Decimal идёт в файл
+    через float. Для денег этого хватает с большим запасом, и обратно
+    читается ровно та же сумма."""
+    data = xlsx.write_book(
+        xlsx.Sheet("Лист", ["Сумма, ₽"], [[Decimal(cents) / 100] for cents in (229010, 1, 99999999)])
+    )
+
+    got = [row.cells["Сумма, ₽"] for row in xlsx.read_sheet(data).rows]
+
+    assert [Decimal(str(value)) for value in got] == [
+        Decimal("2290.10"),
+        Decimal("0.01"),
+        Decimal("999999.99"),
+    ]
 
 
 def test_unreadable_workbook_tells_the_owner_the_real_reason(monkeypatch):

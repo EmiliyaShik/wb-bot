@@ -638,3 +638,96 @@ def test_average_says_plainly_that_it_is_a_daily_average(db_path, half_a_month):
     text = handler.report_text(rnp.daily(half_a_month, today=TODAY, path=db_path))
 
     assert "в среднем 10 заказов в день за прошлую неделю" in text
+
+
+@pytest.mark.asyncio
+async def test_a_plan_beyond_reason_never_reaches_the_base(db_path, cabinet):
+    """Плохой план, попавший в базу, ломает отчёт клиента навсегда.
+
+    Тридцатидвузначная выручка спокойно легла бы в plans, а падало бы уже
+    форматирование, каждое утро и по требованию. Селлер такое не чинит:
+    отчёт умирает раньше, чем покажет ему план. Значит, отсекать надо до
+    записи, и проверять надо состояние базы, а не текст отказа.
+    """
+    message = FakeMessage()
+
+    await handler.plan_command(
+        FakeUpdate(4040, message),
+        SimpleNamespace(args=["9" * 32, "300"]),
+        path=db_path,
+        today=TODAY,
+    )
+
+    assert rnp.plan_of(cabinet, "2026-09", path=db_path) is None
+    assert db.repo(cabinet, db_path).count("plans") == 0
+
+
+@pytest.mark.asyncio
+async def test_a_refused_plan_leaves_the_daily_report_alive(db_path, cabinet):
+    """Главное последствие: после отказа отчёт по-прежнему собирается."""
+    put_day(cabinet, db_path, "2026-09-15", orders=4, revenue="400")
+    message = FakeMessage()
+
+    await handler.plan_command(
+        FakeUpdate(4040, message),
+        SimpleNamespace(args=["1" + "0" * 40]),
+        path=db_path,
+        today=TODAY,
+    )
+
+    text = handler.report_text(rnp.daily(cabinet, today=TODAY, path=db_path))
+    assert "Заказы: 4" in text
+
+
+@pytest.mark.asyncio
+async def test_a_huge_orders_target_is_refused_too(db_path, cabinet):
+    message = FakeMessage()
+
+    await handler.plan_command(
+        FakeUpdate(4040, message),
+        SimpleNamespace(args=["500000", "9" * 20]),
+        path=db_path,
+        today=TODAY,
+    )
+
+    assert db.repo(cabinet, db_path).count("plans") == 0
+
+
+@pytest.mark.asyncio
+async def test_a_big_but_believable_plan_is_still_accepted(db_path, cabinet):
+    """Граница отсекает опечатку, а не крупного селлера."""
+    message = FakeMessage()
+
+    await handler.plan_command(
+        FakeUpdate(4040, message),
+        SimpleNamespace(args=["900000000", "40000"]),
+        path=db_path,
+        today=TODAY,
+    )
+
+    plan = rnp.plan_of(cabinet, "2026-09", path=db_path)
+    assert plan.revenue == Decimal("900000000")
+    assert plan.orders == 40000
+
+
+# --- чужой текст в утреннем отчёте ---
+#
+# Артикул приходит из базы, а туда из ответа Wildberries, и в отчёте он
+# стоит рядом с разметкой бота. Сегодня это число, но подстановка тут не про
+# сегодняшнее поле: она про то, что следующее поле в этом отчёте числом уже
+# может и не быть, а автор шаблона про экранирование не вспомнит.
+
+TRAP = '<a href="http://zlo.example">нажми</a>'
+
+
+def test_an_article_from_wildberries_does_not_become_markup(db_path, half_a_month):
+    from dataclasses import replace
+
+    report = rnp.daily(half_a_month, today=TODAY, path=db_path)
+    spoiled = replace(report.risks[0], nm_id=TRAP)
+
+    text = handler.report_text(replace(report, risks=(spoiled,)))
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text
+    assert "<b>" in text  # разметка самого бота при этом на месте

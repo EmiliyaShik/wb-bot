@@ -18,6 +18,12 @@
 в отдельном блоке, и прибыль по нему не посчитана. Нет категории
 «Продвижение» - в колонке «реклама» стоит «нет данных», а прибыль посчитана
 без рекламы, и в сообщении написано, почему.
+
+Разметку в сообщении ставит только бот. Артикул продавца селлер вписывает
+руками в кабинете Wildberries, оттуда он и приезжает в строку топа, а
+сводка уходит с `ParseMode.HTML`: одна угловая скобка в артикуле, и отчёта
+клиент не увидит вовсе. Поэтому подстановка идёт через общий
+`bot.texts.fill`, а граница стоит на ней, а не у каждого поля.
 """
 
 from __future__ import annotations
@@ -33,7 +39,9 @@ from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from agents import profit
+from core import queue
 from bot.handlers.tariffs import client_id_of, require_module
+from bot.texts import Safe, fill
 
 logger = logging.getLogger(__name__)
 
@@ -165,17 +173,28 @@ def _week_days(week: Any) -> str:
     return f"{_day(week.date_from)} - {_day(week.date_to)}"
 
 
-def _line(number: int, item: Any) -> str:
-    """Одна строка топа: артикул, прибыль, маржинальность, доля."""
+def _line(number: int, item: Any) -> Safe:
+    """Одна строка топа: артикул, прибыль, маржинальность, доля.
+
+    Артикул продавца селлер пишет сам в кабинете Wildberries, поэтому имя
+    уходит в сообщение через ту же подстановку, что и всё остальное.
+    """
     name = f"{item.nm_id}"
     if item.vendor_code:
         name += f" ({item.vendor_code})"
-    parts = [f"{number}. {name}: {_money(item.profit)}"]
+    parts = [
+        fill(
+            "{number}. {name}: {profit}",
+            number=number,
+            name=name,
+            profit=_money(item.profit),
+        )
+    ]
     if item.margin is not None:
-        parts.append(f"маржа {_percent(item.margin)}")
+        parts.append(fill("маржа {percent}", percent=_percent(item.margin)))
     if item.share is not None:
-        parts.append(f"доля {_percent(item.share)}")
-    return ", ".join(parts)
+        parts.append(fill("доля {percent}", percent=_percent(item.share)))
+    return Safe(", ".join(parts))
 
 
 def keyboard() -> InlineKeyboardMarkup:
@@ -188,19 +207,22 @@ def keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def summary_text(report: Any) -> str:
+def summary_text(report: Any) -> Safe:
     """Топ 5 и антитоп 5 в сообщении. Полная таблица уходит файлом."""
     if report.empty:
-        return NO_DATA
+        return Safe(NO_DATA)
 
     period = f"{_day(report.date_from.isoformat())} - {_day(report.date_to.isoformat())}"
     lines = [
-        HEADER.format(title=report.title, period=period),
+        fill(HEADER, title=report.title, period=period),
         "",
-        f"Прибыль за период: <b>{_money(report.total_profit)}</b>",
-        f"Выручка за вычетом возвратов: {_money(report.total_revenue)}",
-        f"Реклама: {_money(report.total_ad_spend)}",
-        f"Артикулов в отчёте: {len(report.articles)}",
+        fill("Прибыль за период: <b>{amount}</b>", amount=_money(report.total_profit)),
+        fill(
+            "Выручка за вычетом возвратов: {amount}",
+            amount=_money(report.total_revenue),
+        ),
+        fill("Реклама: {amount}", amount=_money(report.total_ad_spend)),
+        fill("Артикулов в отчёте: {count}", count=len(report.articles)),
     ]
 
     if report.top:
@@ -210,26 +232,36 @@ def summary_text(report: Any) -> str:
         lines.append(EAT)
         lines += [_line(number, item) for number, item in enumerate(report.bottom, 1)]
 
-    text = "\n".join(lines)
+    text = Safe("\n".join(lines))
     if report.losses:
-        text += LOSSES.format(count=len(report.losses), sheet=profit.PROBLEMS_SHEET)
+        text = Safe(
+            text + fill(LOSSES, count=len(report.losses), sheet=profit.PROBLEMS_SHEET)
+        )
     if report.without_cost:
-        text += NO_COSTS.format(count=len(report.without_cost))
+        text = Safe(text + fill(NO_COSTS, count=len(report.without_cost)))
     if report.without_commission:
-        text += NO_COMMISSION.format(count=len(report.without_commission))
+        text = Safe(text + fill(NO_COMMISSION, count=len(report.without_commission)))
     if report.unallocated > 0:
-        text += FACELESS.format(amount=_money(report.unallocated))
+        text = Safe(text + fill(FACELESS, amount=_money(report.unallocated)))
         if report.unallocated_left:
-            text += FACELESS_LEFT.format(amount=_money(report.unallocated_left))
+            text = Safe(
+                text + fill(FACELESS_LEFT, amount=_money(report.unallocated_left))
+            )
     if not report.ads.available:
-        text += ADS_MISSING.get(report.ads.reason, ADS_MISSING[profit.ADS_NOT_REQUESTED])
+        text = Safe(
+            text
+            + ADS_MISSING.get(report.ads.reason, ADS_MISSING[profit.ADS_NOT_REQUESTED])
+        )
     # Неделя называется обеими датами, а не одной. Сторож расходов неполные
     # недели пропускает, а тут они посчитаны: без точных границ два ответа
     # выглядели бы как противоречие, а не как разные взгляды на одну неделю.
     for template, weeks in ((INCOMPLETE, report.incomplete), (UNVERIFIED, report.unverified)):
         if weeks:
-            text += template.format(weeks="; ".join(_week_days(week) for week in weeks))
-    return text + FILE_NOTE
+            text = Safe(
+                text
+                + fill(template, weeks="; ".join(_week_days(week) for week in weeks))
+            )
+    return Safe(text + FILE_NOTE)
 
 
 # --- команда и кнопки --------------------------------------------------------
@@ -268,8 +300,11 @@ async def period_chosen(
         await query.answer()
         return
 
-    profit.request_report(client_id, period, path=path)
-    await query.answer("Принято")
+    # Задача могла уже стоять: тогда честный ответ «уже считаю», а не второе
+    # «принято». Текст берётся у очереди, чтобы всплывающее окно и сообщение
+    # не рассказывали клиенту разное.
+    task = profit.request_report(client_id, period, path=path)
+    await query.answer("Принято" if task.created else queue.ALREADY_QUEUED)
     if period == "year" and query.message is not None:
         await query.message.reply_text(LONG_PERIOD)
 

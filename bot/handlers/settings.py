@@ -10,6 +10,11 @@
 
 Целевого ДРР в настройках нет намеренно: по брифу он относится к модулю
 ads, отложенному до этапа 3.
+
+Разметку в сообщениях ставит только бот. Название модуля приходит из
+конфига, а все эти сообщения уходят с `ParseMode.HTML`, поэтому подстановка
+идёт через общий `bot.texts.fill`: граница стоит на ней, а не у каждого
+поля.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from agents import lifecycle
 from bot.handlers import tariffs
+from bot.texts import Safe, fill
 from core import config, db, scheduler
 
 logger = logging.getLogger(__name__)
@@ -47,22 +53,29 @@ EXPLAIN = (
 ON = "включена"
 OFF = "выключена"
 
+BODY = (
+    "Ежедневный отчёт по плану-факту: <b>{daily}</b>\n"
+    "Время: <b>{at}</b> ({zone})\n"
+    "Недельный разбор финансов: <b>{weekly}</b>\n"
+    "Недельный разбор уходит не по расписанию, а когда Wildberries "
+    "выложит новый финансовый отчёт."
+)
+
 
 def _mark(flag: bool) -> str:
     return "✅" if flag else "⬜"
 
 
-def settings_text(prefs: lifecycle.Prefs) -> str:
+def settings_text(prefs: lifecycle.Prefs) -> Safe:
     """Что сейчас включено. Время показывается в часовом поясе расписания."""
-    return (
-        f"{HEAD}\n\n"
-        f"Ежедневный отчёт по плану-факту: <b>{ON if prefs.daily else OFF}</b>\n"
-        f"Время: <b>{prefs.daily_at_text}</b> ({scheduler.timezone_name()})\n"
-        f"Недельный разбор финансов: <b>{ON if prefs.weekly else OFF}</b>\n"
-        "Недельный разбор уходит не по расписанию, а когда Wildberries "
-        "выложит новый финансовый отчёт.\n\n"
-        f"{EXPLAIN}"
+    body = fill(
+        BODY,
+        daily=ON if prefs.daily else OFF,
+        at=prefs.daily_at_text,
+        zone=scheduler.timezone_name(),
+        weekly=ON if prefs.weekly else OFF,
     )
+    return Safe(HEAD + "\n\n" + body + "\n\n" + EXPLAIN)
 
 
 def keyboard(prefs: lifecycle.Prefs) -> InlineKeyboardMarkup:
@@ -128,70 +141,99 @@ def _weeks_word(weeks: int) -> str:
     return f"{weeks} недель"
 
 
-def backfill_text(event: lifecycle.Event) -> str:
-    return (
-        f"📥 Модуль «{_module_title(event.module)}» работает. Бот подтягивает вашу "
-        f"историю за {_weeks_word(event.days_left)}: без неё не с чем сравнивать, "
-        "и он не увидит, что расход вырос.\n\n"
-        "Wildberries отдаёт такие отчёты медленно, поэтому это займёт время, "
-        "иногда несколько часов. Ничего делать не нужно: первые отчёты и "
-        "предупреждения о выросших расходах придут сами, как только история "
-        "соберётся."
+BACKFILL = (
+    "📥 Модуль «{title}» работает. Бот подтягивает вашу "
+    "историю за {weeks}: без неё не с чем сравнивать, "
+    "и он не увидит, что расход вырос.\n\n"
+    "Wildberries отдаёт такие отчёты медленно, поэтому это займёт время, "
+    "иногда несколько часов. Ничего делать не нужно: первые отчёты и "
+    "предупреждения о выросших расходах придут сами, как только история "
+    "соберётся."
+)
+
+RENEWAL = (
+    "⏳ Доступ к модулю «{title}» заканчивается через {days}.\n\n"
+    "Чтобы ничего не прерывалось, продлите его заранее: нажмите кнопку ниже, "
+    "и бот выставит счёт. Оплата по счёту для ИП и ООО, обычно доступ "
+    "включается в день оплаты."
+)
+
+GRACE = (
+    "⚠️ Срок доступа к модулю «{title}» вышел.\n\n"
+    "Льготные дни уже идут: всё работает ещё {days}, "
+    "отчёты приходят как обычно. Если продлить за это время, перерыва не будет "
+    "вовсе."
+)
+
+SHUTDOWN = (
+    "🔒 Модуль «{title}» выключен: льготные дни кончились.\n\n"
+    "Данные никуда не делись. Они хранятся {kept} после выключения всех модулей, "
+    "и как только вы продлите доступ, отчёты продолжатся с той же историей."
+)
+
+RETENTION = (
+    "🗂 Через {days} бот удалит ваши данные: историю продаж, "
+    "себестоимость, планы и отчёты.\n\n"
+    "Так устроено хранение: данные живут {kept} после того, как выключился "
+    "последний модуль.\n\n"
+    "Чтобы всё сохранилось, включите любой модуль до этой даты. Ничего "
+    "переносить и восстанавливать не придётся, история останется на месте."
+)
+
+DELETED = (
+    "🗑 Срок хранения вышел, и данные удалены: история продаж, себестоимость, "
+    "планы и отчёты.\n\n"
+    "Восстановить их нельзя, но начать заново можно в любой момент: "
+    "подключите кабинет командой <code>/connect</code>, и бот снова начнёт "
+    "копить историю."
+)
+
+
+def backfill_text(event: lifecycle.Event) -> Safe:
+    return fill(
+        BACKFILL,
+        title=_module_title(event.module),
+        weeks=_weeks_word(event.days_left),
     )
 
 
-def renewal_text(event: lifecycle.Event) -> str:
-    return (
-        f"⏳ Доступ к модулю «{_module_title(event.module)}» заканчивается через "
-        f"{_days_word(event.days_left)}.\n\n"
-        "Чтобы ничего не прерывалось, продлите его заранее: нажмите кнопку ниже, "
-        "и бот выставит счёт. Оплата по счёту для ИП и ООО, обычно доступ "
-        "включается в день оплаты."
+def renewal_text(event: lifecycle.Event) -> Safe:
+    return fill(
+        RENEWAL,
+        title=_module_title(event.module),
+        days=_days_word(event.days_left),
     )
 
 
-def grace_text(event: lifecycle.Event) -> str:
-    return (
-        f"⚠️ Срок доступа к модулю «{_module_title(event.module)}» вышел.\n\n"
-        f"Льготные дни уже идут: всё работает ещё {_days_word(event.days_left)}, "
-        "отчёты приходят как обычно. Если продлить за это время, перерыва не будет "
-        "вовсе."
+def grace_text(event: lifecycle.Event) -> Safe:
+    return fill(
+        GRACE,
+        title=_module_title(event.module),
+        days=_days_word(event.days_left),
     )
 
 
-def shutdown_text(event: lifecycle.Event) -> str:
-    return (
-        f"🔒 Модуль «{_module_title(event.module)}» выключен: льготные дни кончились.\n\n"
-        "Данные никуда не делись. Они хранятся "
-        f"{_days_word(lifecycle.retention_days())} после выключения всех модулей, "
-        "и как только вы продлите доступ, отчёты продолжатся с той же историей."
+def shutdown_text(event: lifecycle.Event) -> Safe:
+    return fill(
+        SHUTDOWN,
+        title=_module_title(event.module),
+        kept=_days_word(lifecycle.retention_days()),
     )
 
 
-def retention_text(event: lifecycle.Event) -> str:
-    return (
-        "🗂 Через "
-        f"{_days_word(event.days_left)} бот удалит ваши данные: историю продаж, "
-        "себестоимость, планы и отчёты.\n\n"
-        "Так устроено хранение: данные живут "
-        f"{_days_word(lifecycle.retention_days())} после того, как выключился "
-        "последний модуль.\n\n"
-        "Чтобы всё сохранилось, включите любой модуль до этой даты. Ничего "
-        "переносить и восстанавливать не придётся, история останется на месте."
+def retention_text(event: lifecycle.Event) -> Safe:
+    return fill(
+        RETENTION,
+        days=_days_word(event.days_left),
+        kept=_days_word(lifecycle.retention_days()),
     )
 
 
-def deleted_text(event: lifecycle.Event) -> str:
-    return (
-        "🗑 Срок хранения вышел, и данные удалены: история продаж, себестоимость, "
-        "планы и отчёты.\n\n"
-        "Восстановить их нельзя, но начать заново можно в любой момент: "
-        "подключите кабинет командой <code>/connect</code>, и бот снова начнёт "
-        "копить историю."
-    )
+def deleted_text(event: lifecycle.Event) -> Safe:
+    return Safe(DELETED)
 
 
-def notice(event: lifecycle.Event) -> tuple[str, InlineKeyboardMarkup | None]:
+def notice(event: lifecycle.Event) -> tuple[Safe, InlineKeyboardMarkup | None]:
     """Текст и кнопки одного события. Кнопки ведут в уже готовые диалоги."""
     if event.kind == lifecycle.RENEWAL:
         return renewal_text(event), _invoice_keyboard(event.module)

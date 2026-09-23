@@ -19,6 +19,18 @@
 Исключение ровно одно: реестр для актов, где ИНН и название организации
 нужны бухгалтерии по закону.
 
+Третье свойство - в ответах владельцу разметку ставит только бот. Сообщения
+уходят с `ParseMode.HTML`, а подставляется в них чужое: имя модуля из
+аргумента команды, номер платежа, текст упавшей задачи, запись журнала.
+Угловая скобка в таком значении либо становится нашей же разметкой (ссылка
+в личке владельца, от его собственного бота), либо ломает сообщение целиком,
+и владелец не получает сводку вообще. Поэтому граница здесь одна и стоит на
+подстановке: `bot.texts.fill` экранирует всё, что в неё попало, а собранный
+ботом текст помечается `Safe` вслух. Инструмент общий, а не свой: он нужен
+каждому, кто шлёт с `ParseMode.HTML`, и вторая его копия однажды разошлась
+бы с первой. Экранируется сообщение, а не данные: в базе и в книгах Excel
+имя лежит так, как его написали.
+
 Доступ включается только через `core.access.grant_access` и гасится только
 через `core.access.revoke_access`: других дверей в системе нет, и ни `/grant`,
 ни `/revoke` их не обходят. Реестр актов собирает `core.billing`: он
@@ -34,17 +46,17 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
-    MessageHandler,
-    filters,
+    TypeHandler,
 )
 
 from bot import texts
+from bot.texts import Safe, fill
 from bot.handlers.tariffs import local_date, rubles
 from core import access, audit, billing, config, db, metering, queue, ratelimit, scheduler
 
@@ -54,8 +66,17 @@ PREFIX = "adm:"
 RETRY = f"{PREFIX}retry:"
 
 # Проверка частоты стоит раньше всех остальных хендлеров: она решает, дойдёт
-# ли команда до своего обработчика вообще.
+# ли обновление до своего обработчика вообще. И стоит она на всех типах
+# обновлений, а не на командах: дорогое в этом боте как раз не команда, а
+# присланный файл и присланный токен, который проверяется живым запросом к
+# Wildberries. Бот обрабатывает по одному обновлению за раз, поэтому поток
+# таких сообщений от одного человека останавливает бота для всех остальных.
 GUARD_GROUP = -100
+
+# Ответ на слишком частое нажатие кнопки. Уходит всплывающей подсказкой:
+# молчание Telegram показывает как вечно крутящуюся кнопку, и человек решит,
+# что бот сломался.
+BUTTON_WAIT = "Слишком часто. Подождите немного."
 
 ACTS_JOB = "acts_monthly"
 
@@ -86,6 +107,7 @@ CLIENT_NOTE = (
 )
 NO_CLIENTS = "Клиентов пока нет."
 NO_CALLS = "Вызовов к Wildberries за месяц не было."
+STATS_MARGIN = "<b>Маржа по клиентам</b>"
 
 ACTS_EMPTY = "За {title} оплаченных счетов нет, реестр собирать не из чего."
 ACTS_CAPTION = "Оплаченные счета за {title}. Номер, дата, ИНН, название, модуль, период, сумма."
@@ -155,22 +177,43 @@ def _owner(update) -> int | None:
     return int(telegram_id) if config.is_admin(telegram_id) else None
 
 
-async def _reply(update, text: str, **kwargs) -> None:
+async def _reply(update, text: str, *, reply_markup: Any = None, **fields: Any) -> None:
+    """Единственная отправка с разметкой в этом файле, она же и граница.
+
+    Либо шаблон и поля к нему, и тогда поля экранируются здесь, либо готовый
+    текст с пометкой `Safe`. Третьего пути к `ParseMode.HTML` из этого файла
+    нет, и обойти его случайной f-строкой не выйдет: незаполненный шаблон без
+    полей всё равно проходит через `fill`.
+    """
     message = getattr(update, "effective_message", None)
     if message is None:
         return
-    await message.reply_text(text, parse_mode=ParseMode.HTML, **kwargs)
+    body = text if isinstance(text, Safe) else fill(text, **fields)
+    extra = {"reply_markup": reply_markup} if reply_markup is not None else {}
+    await message.reply_text(body, parse_mode=ParseMode.HTML, **extra)
 
 
 # --- H5: ограничение частоты команд ---
 
 
 async def rate_guard(update, context) -> None:
-    """Пропускает команду или вежливо просит подождать. Стоит раньше всех.
+    """Пропускает обновление или вежливо просит подождать. Стоит раньше всех.
 
     Считается человек, а не клиент: защищаться нужно от собеседника, и ходить
-    за этим в базу на каждое сообщение незачем. Превышение это не молчание -
-    человек получает текст и понимает, что произошло.
+    за этим в базу на каждое сообщение незачем.
+
+    Три решения, которые тут видно.
+
+    Первое: под счёт попадает любое обновление, а не команда. Текст, документ
+    и нажатие кнопки стоят боту не меньше команды, а иногда куда больше.
+
+    Второе: у кнопок своё, более терпимое окно, и отвечают им всплывающей
+    подсказкой. Двойное нажатие это обычное дело, а не нападение, и молчание
+    в ответ на кнопку выглядит как сломанный бот.
+
+    Третье: словами бот отвечает один раз за окно. Иначе на поток сообщений
+    он ответил бы потоком же и сам стал бы усилителем нагрузки, а человек и
+    так уже прочитал, что надо подождать.
     """
     user = getattr(update, "effective_user", None)
     who = getattr(user, "id", None)
@@ -180,54 +223,101 @@ async def rate_guard(update, context) -> None:
     # а владелец гоняет /tasks и /stats как раз тогда, когда что-то упало.
     if config.is_admin(who):
         return
+
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        if ratelimit.allow(int(who), scope=ratelimit.BUTTONS, limit=ratelimit.button_per_minute()):
+            return
+        await query.answer(BUTTON_WAIT)
+        raise ApplicationHandlerStop
+
     if ratelimit.allow(int(who)):
         return
     message = getattr(update, "effective_message", None)
-    if message is not None:
+    if message is not None and ratelimit.allow(int(who), scope=ratelimit.WARNED, limit=1):
         await message.reply_text(texts.RATE_LIMITED)
-    # Дальше по группам команда не пойдёт: ни к своей команде, ни к чужой.
+    # Дальше по группам обновление не пойдёт: ни к своей команде, ни к чужой.
     raise ApplicationHandlerStop
 
 
 # --- H1: /stats ---
 
 
-def stats_text(result: metering.Stats) -> str:
-    """Бизнес одним экраном. Клиенты только внутренними id."""
-    lines = [STATS_HEAD.format(title=result.title), ""]
+def stats_text(result: metering.Stats) -> Safe:
+    """Бизнес одним экраном. Клиенты только внутренними id.
 
-    lines.append(f"Клиентов всего: {result.total_clients}, с рабочим доступом: {result.active_clients}")
+    Каждая строка собирается `fill`: имя модуля и имя метода WB приходят из
+    базы, а не из этого файла, и угловая скобка в них не должна становиться
+    разметкой. Готовая сводка помечается `Safe` уже целиком.
+    """
+    lines = [fill(STATS_HEAD, title=result.title), ""]
+
+    lines.append(
+        fill(
+            "Клиентов всего: {total}, с рабочим доступом: {active}",
+            total=result.total_clients,
+            active=result.active_clients,
+        )
+    )
     if result.modules:
         for module, count in sorted(result.modules.items(), key=lambda item: (-item[1], item[0])):
-            lines.append(f"  {module}: {count}")
+            lines.append(fill("  {module}: {count}", module=module, count=count))
     elif not result.total_clients:
         lines.append(NO_CLIENTS)
     lines.append("")
 
-    lines.append(f"Выручка за месяц: {rubles(result.revenue)}")
-    lines.append(f"Счета выставлены и не оплачены: {result.unpaid_count} на {rubles(result.unpaid_amount)}")
+    lines.append(fill("Выручка за месяц: {amount}", amount=rubles(result.revenue)))
+    lines.append(
+        fill(
+            "Счета выставлены и не оплачены: {count} на {amount}",
+            count=result.unpaid_count,
+            amount=rubles(result.unpaid_amount),
+        )
+    )
     if result.ai_cost:
-        lines.append(f"Расход на нейросеть: {rubles(result.ai_cost)}")
+        lines.append(fill("Расход на нейросеть: {amount}", amount=rubles(result.ai_cost)))
     lines.append("")
 
-    lines.append(f"<b>Расходы: вызовы WB</b> всего {result.calls_total}, с ошибкой {result.errors_total}")
+    lines.append(
+        fill(
+            "<b>Расходы: вызовы WB</b> всего {calls}, с ошибкой {errors}",
+            calls=result.calls_total,
+            errors=result.errors_total,
+        )
+    )
     if result.calls:
         for use in result.calls[:TASKS_LIMIT]:
-            tail = f", ошибок {use.errors}" if use.errors else ""
-            lines.append(f"  {use.method}: {use.count}{tail}")
+            if use.errors:
+                lines.append(
+                    fill(
+                        "  {method}: {count}, ошибок {errors}",
+                        method=use.method,
+                        count=use.count,
+                        errors=use.errors,
+                    )
+                )
+            else:
+                lines.append(fill("  {method}: {count}", method=use.method, count=use.count))
     else:
         lines.append(NO_CALLS)
     lines.append("")
 
     if result.clients:
-        lines.append("<b>Маржа по клиентам</b>")
+        lines.append(STATS_MARGIN)
         for item in result.clients:
-            modules = ", ".join(item.modules) if item.modules else "без доступа"
             lines.append(
-                f"  клиент #{item.client_id} ({modules}): выручка {rubles(item.revenue)}, "
-                f"расход {rubles(item.cost)}, маржа {rubles(item.margin)}, вызовов {item.calls}"
+                fill(
+                    "  клиент #{client_id} ({modules}): выручка {revenue}, "
+                    "расход {cost}, маржа {margin}, вызовов {calls}",
+                    client_id=item.client_id,
+                    modules=", ".join(item.modules) if item.modules else "без доступа",
+                    revenue=rubles(item.revenue),
+                    cost=rubles(item.cost),
+                    margin=rubles(item.margin),
+                    calls=item.calls,
+                )
             )
-    return "\n".join(lines).strip()
+    return Safe("\n".join(lines).strip())
 
 
 async def stats_command(
@@ -268,11 +358,13 @@ async def acts_command(
     title = billing.month_title(start)
     invoices = billing.paid_invoices(start, end, path=path)
     if not invoices:
-        await _reply(update, ACTS_EMPTY.format(title=title))
+        await _reply(update, ACTS_EMPTY, title=title)
         return
     message = getattr(update, "effective_message", None)
     if message is None:
         return
+    # Подпись к файлу уходит без разметки, поэтому и без экранирования: иначе
+    # владелец читал бы в ней `&quot;` вместо кавычек.
     await message.reply_document(
         document=billing.acts_book(invoices, path=path),
         filename=billing.acts_file_name(start),
@@ -363,13 +455,14 @@ async def _resolved(update, value: int, path) -> tuple[int, str] | None:
     except AmbiguousClient as clash:
         await _reply(
             update,
-            CLIENT_AMBIGUOUS.format(
-                value=clash.value, by_id=clash.by_id, by_telegram=clash.by_telegram
-            ),
+            CLIENT_AMBIGUOUS,
+            value=clash.value,
+            by_id=clash.by_id,
+            by_telegram=clash.by_telegram,
         )
         return None
     if found is None:
-        await _reply(update, UNKNOWN_CLIENT.format(client_id=value))
+        await _reply(update, UNKNOWN_CLIENT, client_id=value)
         return None
     return found
 
@@ -397,13 +490,15 @@ async def grant_command(
         await _reply(update, BAD_NUMBER)
         return
     if module not in config.modules():
-        await _reply(update, UNKNOWN_MODULE.format(module=module, known=", ".join(config.modules())))
+        # Имя модуля здесь ровно то, что владелец набрал в команде, и обратно
+        # в сообщение оно едет через ту же подстановку, что и всё остальное.
+        await _reply(update, UNKNOWN_MODULE, module=module, known=", ".join(config.modules()))
         return
     found = await _resolved(update, asked, path)
     if found is None:
         return
     client_id, how = found
-    note = ("\n" + FOUND_BY_TELEGRAM.format(client_id=client_id)) if how == "telegram" else ""
+    note = fill("\n" + FOUND_BY_TELEGRAM, client_id=client_id) if how == "telegram" else Safe("")
 
     days = billing.months_to_days(months)
     granted = access.grant_access(
@@ -412,22 +507,30 @@ async def grant_command(
     if granted.duplicate:
         await _reply(
             update,
-            GRANT_DUPLICATE.format(
-                ref=payment_ref, module=granted.module, until=local_date(granted.until)
-            )
-            + note,
+            Safe(
+                fill(
+                    GRANT_DUPLICATE,
+                    ref=payment_ref,
+                    module=granted.module,
+                    until=local_date(granted.until),
+                )
+                + note
+            ),
         )
         return
     await _reply(
         update,
-        GRANT_DONE.format(
-            client_id=client_id,
-            module=module,
-            until=local_date(granted.until),
-            ref=payment_ref,
-            method=raw_method,
-        )
-        + note,
+        Safe(
+            fill(
+                GRANT_DONE,
+                client_id=client_id,
+                module=module,
+                until=local_date(granted.until),
+                ref=payment_ref,
+                method=raw_method,
+            )
+            + note
+        ),
     )
 
 
@@ -462,20 +565,20 @@ async def revoke_command(
     reason = " ".join(args[2:]).strip()
     everything = module.strip().lower() in ALL_MODULES
     if not everything and module not in config.modules():
-        await _reply(update, UNKNOWN_MODULE.format(module=module, known=", ".join(config.modules())))
+        await _reply(update, UNKNOWN_MODULE, module=module, known=", ".join(config.modules()))
         return
     found = await _resolved(update, asked, path)
     if found is None:
         return
     client_id, how = found
-    note = ("\n" + FOUND_BY_TELEGRAM.format(client_id=client_id)) if how == "telegram" else ""
+    note = fill("\n" + FOUND_BY_TELEGRAM, client_id=client_id) if how == "telegram" else Safe("")
 
     if everything:
         names = [item.module for item in access.status(client_id, now=now, path=path) if item.works]
     else:
         names = [module] if access.access_of(client_id, module, now=now, path=path).works else []
     if not names:
-        await _reply(update, REVOKE_NOTHING.format(client_id=client_id, module=module))
+        await _reply(update, REVOKE_NOTHING, client_id=client_id, module=module)
         return
 
     burned = 0
@@ -485,27 +588,36 @@ async def revoke_command(
         burned += before.days_left
     await _reply(
         update,
-        REVOKE_DONE.format(client_id=client_id, module=", ".join(names), days=burned) + note,
+        Safe(
+            fill(REVOKE_DONE, client_id=client_id, module=", ".join(names), days=burned) + note
+        ),
     )
 
 
 # --- H1a и H1b: /tasks и перезапуск ---
 
 
-def _task_line(row) -> str:
+def _task_line(row) -> Safe:
     client = row["client_id"]
     who = f"клиент #{int(client)}" if client is not None else "общая"
-    line = f"#{row['id']} {row['kind']} ({who}), попыток {int(row['attempts'] or 0)}"
+    line = fill(
+        "#{task_id} {kind} ({who}), попыток {attempts}",
+        task_id=row["id"],
+        kind=row["kind"],
+        who=who,
+        attempts=int(row["attempts"] or 0),
+    )
     # last_error пишет очередь, и туда попадает сырой ответ WB. Показывать его
     # владельцу можно только через ту же чистку, что стоит у журнала: один раз
-    # увиденный в чате токен уже не развидеть.
+    # увиденный в чате токен уже не развидеть. Чистка снимает секреты, но не
+    # разметку, поэтому текст ошибки идёт дальше через ту же подстановку.
     error = audit.redact(str(row["last_error"] or "")).strip()
     if error:
-        line += f"\n    {error}"
+        line = Safe(line + fill("\n    {error}", error=error))
     return line
 
 
-def tasks_text(running, failed, errors) -> str:
+def tasks_text(running, failed, errors) -> Safe:
     lines = [TASKS_HEAD, CLIENT_NOTE, ""]
     if not running and not failed:
         lines.append(TASKS_NONE)
@@ -522,8 +634,16 @@ def tasks_text(running, failed, errors) -> str:
         for row in errors:
             client = row["client_id"]
             who = f"клиент #{int(client)}" if client is not None else "общая"
-            lines.append(f"{row['at']} {row['kind']} ({who}): {row['message']}")
-    return "\n".join(lines).strip()
+            lines.append(
+                fill(
+                    "{at} {kind} ({who}): {message}",
+                    at=row["at"],
+                    kind=row["kind"],
+                    who=who,
+                    message=row["message"],
+                )
+            )
+    return Safe("\n".join(lines).strip())
 
 
 def tasks_keyboard(failed) -> InlineKeyboardMarkup | None:
@@ -595,7 +715,9 @@ async def retry_callback(update, context, *, path: str | Path | None = None) -> 
 
 def register(app, *, path: str | Path | None = None) -> None:
     """Сам себя регистрирует: bot/app.py никто не трогает."""
-    app.add_handler(MessageHandler(filters.COMMAND, rate_guard), group=GUARD_GROUP)
+    # TypeHandler, а не MessageHandler: ограничитель должен видеть все типы
+    # обновлений, включая документы и нажатия кнопок.
+    app.add_handler(TypeHandler(Update, rate_guard), group=GUARD_GROUP)
     app.add_handler(CommandHandler("stats", functools.partial(stats_command, path=path)))
     app.add_handler(CommandHandler("acts", functools.partial(acts_command, path=path)))
     app.add_handler(CommandHandler("grant", functools.partial(grant_command, path=path)))

@@ -38,6 +38,9 @@ TOKEN_REJECTED = (
     "Токен выглядит так: 123456789:ABCdef-ГдеТоДлиннаяСтрокаБукв."
 )
 
+# Сколько сообщений бот разбирает одновременно.
+CONCURRENT_UPDATES = 32
+
 # Как часто воркер заглядывает в пустую очередь.
 WORKER_POLL_SEC = 5.0
 # Сколько ждём, пока воркер доработает текущую задачу при выключении.
@@ -193,6 +196,40 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def on_error(update: object, context) -> None:
+    """Единственный обработчик ошибок: клиент получает ответ, владелец запись.
+
+    Без него сбой в хендлере оставлял клиента вообще без ответа, а владельца
+    без строчки в журнале: искать было нечего и негде.
+    """
+    error = getattr(context, "error", None)
+    logger.exception("сбой в хендлере: %s", error, exc_info=error)
+
+    client_id = None
+    try:
+        user = getattr(update, "effective_user", None)
+        if user is not None:
+            row = db.admin_repo().client_by_telegram(int(user.id))
+            client_id = int(row["id"]) if row else None
+    except Exception:  # noqa: BLE001 - разбор апдейта не должен добавить второй сбой
+        logger.exception("не удалось определить клиента по апдейту")
+
+    audit.log(
+        "error",
+        client_id,
+        f"{type(error).__name__}: {error}" if error else "неизвестный сбой",
+        level="error",
+    )
+
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+    try:
+        await message.reply_text(texts.SOMETHING_WENT_WRONG)
+    except Exception:  # noqa: BLE001 - молчащий Telegram уже не наша авария
+        logger.exception("не удалось ответить клиенту на сбой")
+
+
 def register_base(app: Application) -> None:
     """Команды, которые есть всегда, даже когда ни один модуль не подключён."""
     app.add_handler(CommandHandler("start", start))
@@ -205,9 +242,13 @@ def build_app(token: str) -> Application:
     Фон (очередь и расписание) поднимается в post_init и гасится в
     post_shutdown: так он живёт ровно столько, сколько живёт бот.
     """
+    # concurrent_updates: иначе бот разбирает строго одно сообщение за раз, и
+    # любой хендлер, который чего-то ждёт (поход на витрину WB за карточкой,
+    # ответ Telegram), держит очередь для всех остальных клиентов.
     app = (
         Application.builder()
         .token(token)
+        .concurrent_updates(CONCURRENT_UPDATES)
         .post_init(start_background)
         .post_shutdown(stop_background)
         .build()
@@ -217,6 +258,7 @@ def build_app(token: str) -> Application:
     logger.info("Хендлеры модулей: %s", ", ".join(names) if names else "пока нет")
 
     register_base(app)
+    app.add_error_handler(on_error)
 
     # Запасной обработчик текста ставится последним, иначе он перехватил бы
     # сообщения, адресованные модулям (ввод токена, себестоимость и прочее).

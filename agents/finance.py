@@ -923,7 +923,7 @@ def _period_of(task: Any) -> str:
 
 def request_report(
     client_id: int, period: str = "week", *, path: str | Path | None = None
-) -> int:
+) -> queue.TaskId:
     """Ставит выгрузку в очередь. «Принято» клиенту говорит сама очередь."""
     if period not in PERIODS:
         raise ValueError(f"неизвестный период: {period}")
@@ -932,7 +932,7 @@ def request_report(
 
 def request_collect(
     client_id: int, period: str = "week", *, path: str | Path | None = None
-) -> int:
+) -> queue.TaskId:
     """Ставит в очередь сбор без отправки: расписание, а не просьба клиента.
 
     `notify=False` здесь не мелочь: клиент этой задачи не просил, и «принято,

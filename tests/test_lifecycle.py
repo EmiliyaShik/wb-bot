@@ -617,3 +617,28 @@ def test_the_weekly_probe_is_registered_once_and_by_the_lifecycle(db_path, monke
         "fin_weeks", report_id=7, date_from="2026-09-07", date_to="2026-09-13"
     )
     assert lifecycle.new_report_of(client_id, path=db_path) == 7
+
+
+# --- чужой текст в сообщениях жизненного цикла ---
+#
+# Название модуля бот берёт из конфига, а предупреждение о продлении уходит
+# с ParseMode.HTML. Эти сообщения бот шлёт сам, без просьбы: ошибка Telegram
+# здесь значит, что клиент просто не узнает о конце оплаченного срока.
+
+TRAP = '<a href="http://zlo.example">нажми</a>'
+
+
+def test_a_module_title_from_config_does_not_become_markup_in_a_notice(monkeypatch):
+    import copy
+
+    from core import config
+
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["rnp"]["title"] = TRAP
+    monkeypatch.setattr(config, "settings", lambda: patched)
+    event = lifecycle.Event(lifecycle.RENEWAL, 1, "rnp", 5, utc("2026-10-01 10:00"))
+
+    text, _ = settings_handler.notice(event)
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text

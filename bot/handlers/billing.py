@@ -20,6 +20,15 @@
 Реквизитов и цен в этом файле нет. Пока переменные SELLER_* пусты, счёт не
 формируется: клиент получает вежливое «счёт готовится», а владелец список
 ровно тех переменных, которых не хватает.
+
+Разметку в сообщениях ставим только мы. Наименование организации клиент
+пишет руками, а адрес приезжает из чужого справочника, и оба уходят в
+сообщение с разметкой HTML, в том числе владельцу. Поэтому подстановка идёт
+через `bot.texts.fill`, а не через `str.format`: всё, чего бот не писал сам,
+там экранируется. Одна точка вместо экранирования у каждой подстановки
+выбрана затем, что следующий шаблон напишут не глядя на этот файл. Сам
+инструмент общий и живёт в `bot/texts.py`: он нужен каждому, кто шлёт с
+`ParseMode.HTML`, а своя копия здесь однажды разошлась бы с чужой молча.
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ from telegram.ext import (
 )
 
 from bot.handlers import tariffs
+from bot.texts import Safe, fill
 from core import audit, billing, config, db, scheduler
 from core.billing import counterparty
 from core.billing import pdf as invoice_pdf
@@ -65,6 +75,8 @@ PICK_PERIOD = (
     "Модуль <b>{title}</b>. Выберите срок: чем длиннее, тем дешевле месяц."
 )
 
+PICK_SUMMARY = "{title}, {period}: {amount}.\n\n"
+
 ASK_INN = (
     "Счёт выставляется на организацию или ИП. Пришлите ИНН одним сообщением: "
     "10 цифр для компании, 12 для ИП.\n\n"
@@ -85,6 +97,13 @@ FOUND = (
 ASK_NAME = (
     "Реквизиты по этому ИНН подтянуть не удалось, это не страшно. "
     "Пришлите наименование организации или ИП одной строкой, как в документах."
+)
+
+LIMIT_INN = (
+    "Справочник реквизитов на сегодня исчерпан: слишком много проверок ИНН "
+    "за сутки. На счёт это не влияет.\n\n"
+    "Пришлите наименование организации или ИП одной строкой, как в документах, "
+    "и я выставлю счёт."
 )
 
 ASK_ADDRESS = "Теперь адрес одной строкой: город, улица, дом."
@@ -173,16 +192,16 @@ def owner_contact() -> str:
     return billing.owner_contact()
 
 
-def paysupport_text() -> str:
+def paysupport_text() -> Safe:
     """Ответ на /paysupport. Контакта нет - не выдумываем его."""
     contact = owner_contact()
-    return PAYSUPPORT.format(contact=contact) if contact else PAYSUPPORT_EMPTY
+    return fill(PAYSUPPORT, contact=contact) if contact else Safe(PAYSUPPORT_EMPTY)
 
 
-def card_text() -> str:
+def card_text() -> Safe:
     """Оплата картой или СБП. Бот про кассу не знает ничего."""
     contact = owner_contact()
-    return CARD.format(contact=contact) if contact else CARD_EMPTY
+    return fill(CARD, contact=contact) if contact else Safe(CARD_EMPTY)
 
 
 def module_title(module: str) -> str:
@@ -237,7 +256,7 @@ def paid_keyboard(number: str) -> InlineKeyboardMarkup:
     )
 
 
-def owner_new_text(item: billing.Invoice) -> str:
+def owner_new_text(item: billing.Invoice) -> Safe:
     """Уведомление владельцу: кто, что, сколько, номер.
 
     «Кто» это внутренний id, как везде в админке, а не Telegram ID. Наружу не
@@ -245,7 +264,8 @@ def owner_new_text(item: billing.Invoice) -> str:
     сделало бы правило необязательным. Выдать доступ по этому числу владелец
     может: команды понимают внутренний id.
     """
-    return OWNER_NEW.format(
+    return fill(
+        OWNER_NEW,
         number=item.number,
         client=f"клиент #{item.client_id}",
         title=module_title(item.module),
@@ -258,18 +278,23 @@ def owner_new_text(item: billing.Invoice) -> str:
 
 def owner_no_details_text(
     module: str, months: int, client_id: int, missing: tuple[str, ...]
-) -> str:
+) -> Safe:
     """Список ровно тех переменных, которых не хватает.
 
     Клиент назван внутренним id по той же причине, что и в уведомлении о
     счёте: в админке Telegram-аккаунтов не показывают.
     """
-    return OWNER_NO_DETAILS.format(
+    return fill(
+        OWNER_NO_DETAILS,
         client=f"клиент #{client_id}",
         title=module_title(module),
         period=billing.months_words(months),
         amount=tariffs.rubles(config.price_decimal(module, months)),
-        missing="\n".join(f"<code>{name}</code>" for name in missing),
+        # Единственная подстановка с нашей разметкой: имена переменных бот
+        # берёт из собственного списка, а теги вокруг них ставит сам. Внутрь
+        # тегов имя всё равно идёт через ту же подстановку, а не мимо неё:
+        # список собственный, но исключений из правила заводить не за что.
+        missing=Safe("\n".join(fill("<code>{name}</code>", name=name) for name in missing)),
     )
 
 
@@ -314,13 +339,15 @@ async def start_dialog(
     message = update.effective_message
     if message is None:
         return
-    if module not in config.visible_modules():
+    # Продаётся ли модуль, решает витрина, а не кнопка: имя модуля приехало
+    # из callback_data, то есть сочинить его мог и клиент.
+    if not tariffs.for_sale(module):
         await message.reply_text(tariffs.tariffs_text(), parse_mode=ParseMode.HTML)
         return
     if context is not None and context.user_data is not None:
         context.user_data[STATE] = {"module": module, "step": "period"}
     await message.reply_text(
-        PICK_PERIOD.format(title=module_title(module)),
+        fill(PICK_PERIOD, title=module_title(module)),
         parse_mode=ParseMode.HTML,
         reply_markup=period_keyboard(module),
     )
@@ -352,22 +379,51 @@ async def period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("p:"):
-        _, module, raw = data.split(":", 2)
-        if module not in config.visible_modules() or int(raw) not in config.periods():
+        picked = _picked(data)
+        if picked is None:
             return
+        module, months = picked
         if context.user_data is not None:
             context.user_data[STATE] = {
                 "module": module,
-                "months": int(raw),
+                "months": months,
                 "step": "inn",
             }
-        amount = tariffs.rubles(config.price_decimal(module, int(raw)))
+        amount = tariffs.rubles(config.price_decimal(module, months))
         await query.message.reply_text(
-            f"{module_title(module)}, {billing.months_words(int(raw))}: {amount}.\n\n"
+            fill(
+                PICK_SUMMARY,
+                title=module_title(module),
+                period=billing.months_words(months),
+                amount=amount,
+            )
             + ASK_INN,
             parse_mode=ParseMode.HTML,
             reply_markup=inn_keyboard(),
         )
+
+
+def _picked(data: str) -> tuple[str, int] | None:
+    """Модуль и срок из нажатой кнопки. None означает «такого не продаём».
+
+    Кнопки рисуем мы, но приходит `callback_data` от клиента: свой клиент
+    Telegram отправит сюда любые байты, нарисованные кнопки его не
+    ограничивают. Поэтому модуль сверяется с витриной, а срок со списком
+    периодов конфига: `config.price(module, months)` посчитает цену для
+    любого целого числа месяцев, и подделанный срок дал бы счёт на период,
+    которого в тарифах нет.
+    """
+    parts = data.split(":")
+    if len(parts) != 3:
+        return None
+    module = parts[1]
+    try:
+        months = int(parts[2])
+    except (TypeError, ValueError):
+        return None
+    if not tariffs.for_sale(module) or months not in config.periods():
+        return None
+    return module, months
 
 
 async def text_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -394,19 +450,26 @@ async def text_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await message.reply_text(BAD_INN, parse_mode=ParseMode.HTML)
             raise ApplicationHandlerStop
         state["inn"] = counterparty.normalize(text)
-        found = await counterparty.lookup(state["inn"])
+        # Клиент назван справочнику не своим ИНН, а внутренним id, и только
+        # ради счёта обращений: у ключа DaData дневная квота одна на сервис.
+        who = tariffs.client_id_of(update)
+        found = await counterparty.lookup(state["inn"], client_id=who)
         if found is not None and found.name:
             state.update(
                 {"name": found.name, "address": found.address, "step": "confirm"}
             )
             await message.reply_text(
-                FOUND.format(name=found.name, address=found.address or ""),
+                fill(FOUND, name=found.name, address=found.address or ""),
                 parse_mode=ParseMode.HTML,
                 reply_markup=confirm_keyboard(),
             )
             raise ApplicationHandlerStop
+        # Предел обращений меняет только слова: дорога та же, руками.
         state["step"] = "name"
-        await message.reply_text(ASK_NAME, parse_mode=ParseMode.HTML)
+        await message.reply_text(
+            LIMIT_INN if counterparty.throttled(who) else ASK_NAME,
+            parse_mode=ParseMode.HTML,
+        )
         raise ApplicationHandlerStop
 
     if step == "name":
@@ -432,8 +495,19 @@ async def _issue(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict
     client_id = tariffs.client_id_of(update)
     if client_id is None or message is None:
         return
-    module = state["module"]
-    months = int(state["months"])
+    module = str(state.get("module") or "")
+    try:
+        months = int(state.get("months"))
+    except (TypeError, ValueError):
+        return
+    # Последняя проверка перед деньгами. Состояние диалога наше, но пришло оно
+    # от нажатых кнопок, и счёт на скрытый модуль или на срок вне тарифов не
+    # должен возникнуть даже из-за ошибки в шаге диалога.
+    if not tariffs.for_sale(module) or months not in config.periods():
+        if context.user_data is not None:
+            context.user_data.pop(STATE, None)
+        await message.reply_text(tariffs.tariffs_text(), parse_mode=ParseMode.HTML)
+        return
 
     try:
         item = billing.create_invoice(
@@ -464,7 +538,8 @@ async def _issue(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict
         context.user_data.pop(STATE, None)
 
     await message.reply_text(
-        READY.format(
+        fill(
+            READY,
             number=item.number,
             amount=tariffs.rubles(item.amount),
             due=item.due_at.strftime("%d.%m.%Y") if item.due_at else "-",
@@ -482,7 +557,7 @@ async def _issue(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict
         )
     except invoice_pdf.FontMissing as gap:
         await tell_owner(
-            bot, OWNER_NO_FONT.format(number=item.number, hint=str(gap))
+            bot, fill(OWNER_NO_FONT, number=item.number, hint=str(gap))
         )
     except billing.DetailsMissing as gap:
         await tell_owner(
@@ -522,7 +597,10 @@ async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     if user is None or not config.is_admin(user.id):
         return
-    number = (query.data or "").removeprefix(PAY_PREFIX).strip()
+    # Номер приехал из callback_data: в базе он короткий, и длинная строка
+    # означает не счёт, а чужую самодеятельность. Обрезаем до разумного,
+    # дальше billing.mark_paid сам скажет, что такого счёта нет.
+    number = (query.data or "").removeprefix(PAY_PREFIX).strip()[:64]
     bot = getattr(context, "bot", None)
 
     try:
@@ -566,7 +644,8 @@ def make_overdue_job(app: Any):
             await tell_client(
                 app.bot,
                 item.client_id,
-                OVERDUE_NOTE.format(
+                fill(
+                    OVERDUE_NOTE,
                     number=item.number,
                     amount=tariffs.rubles(item.amount),
                     due=item.due_at.strftime("%d.%m.%Y") if item.due_at else "-",

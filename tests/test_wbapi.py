@@ -602,34 +602,18 @@ def test_diag_registers_itself_without_touching_the_schedule(owner):
     assert len(app.handlers) == 1
 
 
-@pytest.mark.asyncio
-async def test_diag_refuses_anyone_but_the_owner(owner):
-    from bot import texts
+def test_diag_report_explains_every_host_in_plain_russian(owner):
+    """Отчёт называет домен, код и причину. Собирается без сети и без бота."""
     from bot.handlers import diag as handler
 
-    update = FakeUpdate(4242)
-    await handler.diag(update, None)
-
-    assert update.message.sent == [texts.ADMIN_ONLY]
-
-
-@pytest.mark.asyncio
-async def test_diag_reports_every_host_in_plain_russian(owner, monkeypatch):
-    from bot.handlers import diag as handler
-
-    async def fake_probe(**kwargs):
-        return [
+    report = handler.report_text(
+        [
             wbapi.HostProbe("finance", wbapi.HOSTS["finance"], 200, True, wbapi.verdict_for(200)),
             wbapi.HostProbe("advert", wbapi.HOSTS["advert"], 401, False, wbapi.verdict_for(401)),
             wbapi.HostProbe("content", wbapi.HOSTS["content"], None, False, wbapi.verdict_for(None)),
         ]
+    )
 
-    monkeypatch.setattr(handler.wbapi, "probe_hosts", fake_probe)
-    update = FakeUpdate(owner)
-
-    await handler.diag(update, None)
-
-    report = update.message.sent[-1]
     assert wbapi.HOSTS["finance"] in report
     assert "401" in report and "токен" in report.lower()
     assert "адрес" in report.lower()
@@ -788,3 +772,123 @@ async def test_old_call_still_returns_plain_rows(cabinet):
     rows = await client.sales_report_detailed("2026-09-01", "2026-09-07", limit=2)
 
     assert rows == [{"rrdId": 1}]
+
+
+# --- /diag молчит для чужого и не ждёт лимит внутри хендлера ---
+
+
+class FakeBot:
+    def __init__(self) -> None:
+        self.sent: list[tuple] = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.sent.append((chat_id, str(text)))
+
+
+def fake_app() -> FakeApp:
+    app = FakeApp()
+    app.bot = FakeBot()
+    return app
+
+
+@pytest.mark.asyncio
+async def test_diag_says_nothing_at_all_to_a_stranger(owner):
+    """Для постороннего команды не существует: иначе перебор найдёт админку."""
+    from bot.handlers import diag as handler
+
+    update = FakeUpdate(4242)
+    await handler.diag(update, None)
+
+    assert update.message.sent == []
+    assert db.admin_repo().tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_diag_answers_at_once_and_walks_hosts_later(owner, monkeypatch):
+    """Обход с паузами уходит в очередь: бот не молчит минуту для всех."""
+    from bot.handlers import diag as handler
+
+    async def never(**kwargs):
+        raise AssertionError("обход хостов не должен идти внутри хендлера")
+
+    monkeypatch.setattr(handler.wbapi, "probe_hosts", never)
+    update = FakeUpdate(owner)
+
+    await handler.diag(update, None)
+
+    assert update.message.sent == [handler.STARTED]
+    queued = db.admin_repo().tasks()
+    assert [row["kind"] for row in queued] == [handler.TASK_KIND]
+
+
+@pytest.mark.asyncio
+async def test_diag_task_sends_the_report_when_it_runs(owner, monkeypatch):
+    from core import queue
+    from bot.handlers import diag as handler
+
+    async def fake_probe(**kwargs):
+        return [wbapi.HostProbe("common", wbapi.HOSTS["common"], 200, True, wbapi.verdict_for(200))]
+
+    monkeypatch.setattr(handler.wbapi, "probe_hosts", fake_probe)
+    app = fake_app()
+    run = handler.make_runner(app)
+
+    await run(queue.Task(id=1, client_id=None, kind=handler.TASK_KIND,
+                         payload={"chat_id": owner, "telegram_id": owner}, attempts=0))
+
+    assert len(app.bot.sent) == 1
+    chat_id, text = app.bot.sent[0]
+    assert chat_id == owner
+    assert wbapi.HOSTS["common"] in text
+
+
+# --- проверка токена не морозит бота ---
+
+
+@pytest.mark.asyncio
+async def test_check_token_does_not_wait_for_the_limit(tmp_path):
+    """Бюджет /ping исчерпан: проверка возвращается сразу, без запроса и паузы.
+
+    Ждать тут нельзя: бот обрабатывает одно сообщение за раз, и десять секунд
+    ожидания это десять секунд молчания для всех, включая владельца.
+    """
+    path = tmp_path / "check.db"
+    db.migrate(path)
+    time = FakeTime()
+    budget = wbapi.Budget(time.clock, time.sleep)
+    seen: list[httpx.Request] = []
+    http = make_http([ok({"Status": "OK"})], seen)
+
+    # всплеск у /ping это три запроса на домен, четвёртый уже ждал бы
+    for _ in range(3):
+        await wbapi.check_token(TOKEN, http=http, path=path, budget=budget)
+    assert len(seen) == 3
+
+    result = await wbapi.check_token_live(TOKEN, http=http, path=path, budget=budget)
+
+    assert len(seen) == 3, "четвёртый запрос ушёл бы только после паузы"
+    assert result.probed is False
+    assert result.info.sid == SID
+    assert time.slept == []
+    db.close_all()
+
+
+@pytest.mark.asyncio
+async def test_check_token_probes_when_the_budget_is_free(tmp_path):
+    path = tmp_path / "check.db"
+    db.migrate(path)
+    time = FakeTime()
+    seen: list[httpx.Request] = []
+
+    result = await wbapi.check_token_live(
+        TOKEN,
+        http=make_http([ok({"Status": "OK"})], seen),
+        path=path,
+        budget=wbapi.Budget(time.clock, time.sleep),
+    )
+
+    assert len(seen) == 1
+    assert result.probed is True
+    assert result.status == 200
+    assert result.alive is True
+    db.close_all()

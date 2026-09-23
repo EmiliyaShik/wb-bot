@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
@@ -438,6 +439,27 @@ async def test_finance_offers_four_periods_and_only_queues_the_work(cabinet, db_
     tasks = db.admin_repo(db_path).tasks_by_kind(finance.TASK_KIND)
     assert len(tasks) == 1
     assert json.loads(tasks[0]["payload"])["period"] == "quarter"
+
+
+@pytest.mark.asyncio
+async def test_the_same_period_pressed_twice_answers_that_the_work_is_already_going(
+    cabinet, db_path
+):
+    """Вторая такая же задача не ставится, и кнопка не говорит «принято» дважды."""
+    access.grant_access(cabinet, "finance", 30, "test-2", path=db_path)
+    telegram_id = int(db.admin_repo(db_path).client(cabinet)["telegram_id"])
+
+    answers = []
+    for _ in range(2):
+        query = FakeQuery("fin:month", FakeMessage())
+        await handlers_finance.period_chosen(
+            FakeUpdate(telegram_id, query.message, query), None, path=db_path
+        )
+        answers.append(query.answered)
+
+    assert answers[0] == "Принято"
+    assert answers[1] == queue.ALREADY_QUEUED
+    assert len(db.admin_repo(db_path).tasks_by_kind(finance.TASK_KIND)) == 1
 
 
 @pytest.mark.asyncio
@@ -876,3 +898,26 @@ def test_scheduled_collect_does_not_promise_anything_to_the_client(cabinet, db_p
 
     rows = db.admin_repo(db_path).tasks_by_kind(finance.COLLECT_KIND)
     assert [row["kind"] for row in rows] == [finance.COLLECT_KIND]
+
+
+# --- чужой текст в сводке ---
+#
+# Границы недели приезжают от Wildberries строкой и попадают в сообщение с
+# разметкой: ими бот называет неделю, по которой сверка не сошлась. Одна
+# угловая скобка в такой строке, и Telegram сообщение не примет, то есть
+# раскладки клиент не получит вовсе.
+
+TRAP = '<a href="http://zlo.example">нажми</a>'
+
+
+@pytest.mark.asyncio
+async def test_a_week_name_from_wildberries_does_not_become_markup(cabinet, db_path):
+    await collect(cabinet, db_path)
+    report = finance.build(cabinet, "week", today=date(2026, 9, 15), path=db_path)
+    spoiled = replace(report.weeks[0], date_from=TRAP, verified=False)
+
+    text = handlers_finance.summary_text(replace(report, weeks=(spoiled,)))
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text
+    assert "<b>" in text  # разметка самого бота при этом на месте

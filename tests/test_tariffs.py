@@ -177,3 +177,61 @@ def test_module_description_comes_from_config_not_from_the_code(monkeypatch):
 def test_descriptions_of_visible_modules_are_filled_in_config():
     for name in config.visible_modules():
         assert tariffs.what_it_gives(name), f"в конфиге нет gives у модуля {name}"
+
+
+@pytest.mark.asyncio
+async def test_buy_button_refuses_a_module_that_is_not_for_sale():
+    """Кнопки ads нет ни на одной клавиатуре, но callback_data можно прислать руками."""
+    message = FakeMessage()
+    update = FakeUpdate(400400, message, FakeQuery("buy:ads", message))
+    reached = []
+
+    async def fake_dialog(update_, context_, module):
+        reached.append(module)
+
+    tariffs.set_buy_dialog(fake_dialog)
+    try:
+        await tariffs.buy_callback(update, None)
+    finally:
+        tariffs.set_buy_dialog(None)
+
+    assert reached == [], "счёт не должен выставляться на скрытый модуль"
+    assert message.sent, "отказ должен быть понятным, а не тишиной"
+    assert tariffs.for_sale("ads") is False
+    assert tariffs.for_sale("finance") is True
+
+
+# --- чужой текст на витрине ---
+#
+# Название модуля и строка «что входит» лежат в конфиге, а витрина уходит с
+# ParseMode.HTML. Конфиг пишет владелец, но угловая скобка в нём не должна
+# ни превращаться в разметку, ни ронять отправку: тогда витрины не увидит
+# ни один клиент.
+
+TRAP = '<a href="http://zlo.example">нажми</a>'
+
+
+def _with_trap(monkeypatch):
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["finance"]["title"] = TRAP
+    patched["modules"]["finance"]["gives"] = TRAP
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+
+def test_a_module_title_from_config_does_not_become_markup(monkeypatch):
+    _with_trap(monkeypatch)
+
+    text = tariffs.tariffs_text()
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text
+    assert "<b>" in text  # а разметка самого бота на месте
+
+
+def test_the_same_holds_for_the_offer_shown_instead_of_a_refusal(monkeypatch):
+    _with_trap(monkeypatch)
+
+    text = tariffs.offer_text("finance")
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text

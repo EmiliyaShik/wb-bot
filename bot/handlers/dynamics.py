@@ -12,6 +12,12 @@
 
 Второе: доступ к платному модулю проверяет `require_module`, своей проверки
 здесь нет.
+
+Разметку в сообщении ставит только бот: и алерт, и таблица уходят с
+`ParseMode.HTML`, а внутрь идут названия показателей и границы недель из
+базы. Подстановка одна на файл, общий `bot.texts.fill`, и граница стоит на
+ней, а не у каждого поля. Таблица заворачивается в `<pre>` тем же способом:
+теги ставит шаблон, строки едут внутрь как значение.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from telegram.ext import CommandHandler
 
 from agents import finance, watchdog
 from bot.handlers.tariffs import client_id_of, require_module, rubles
+from bot.texts import Safe, fill
 from core import db, scheduler
 
 logger = logging.getLogger(__name__)
@@ -203,25 +210,31 @@ def _short_day(value: str) -> str:
 # --- тексты ------------------------------------------------------------------
 
 
-def alert_lines(alert: watchdog.Alert) -> list[str]:
+def alert_lines(alert: watchdog.Alert) -> list[Safe]:
     """Один алерт двумя строками: что изменилось и сколько это стоит."""
     grew, fell = PHRASES.get(alert.metric, (f"{alert.title} вырос", f"{alert.title} снизился"))
     template = SPP_LINE if alert.metric == "spp" else COST_LINE
     return [
-        f"{grew if alert.grew else fell} с {_percent(alert.was)} до {_percent(alert.now)}, "
-        f"это {_points(alert.delta)}",
-        template.format(revenue=rubles(alert.revenue), rubles=rubles(alert.rubles)),
-        "",
+        fill(
+            "{phrase} с {was} до {now}, это {delta}",
+            phrase=grew if alert.grew else fell,
+            was=_percent(alert.was),
+            now=_percent(alert.now),
+            delta=_points(alert.delta),
+        ),
+        fill(template, revenue=rubles(alert.revenue), rubles=rubles(alert.rubles)),
+        Safe(""),
     ]
 
 
-def alerts_text(watch: watchdog.Watch) -> str:
+def alerts_text(watch: watchdog.Watch) -> Safe:
     """Недельное сообщение. Молчания нет ни в одном из трёх случаев."""
     baseline = _weeks_word(max(0, watch.needed - 1))
     if not watch.enough:
         if watch.have == 0:
-            return NO_WEEKS
-        return NOT_ENOUGH.format(
+            return Safe(NO_WEEKS)
+        return fill(
+            NOT_ENOUGH,
             needed=_weeks_accusative(watch.needed),
             baseline=_weeks_accusative(watch.needed - 1),
             have=_weeks_word(watch.have),
@@ -230,23 +243,25 @@ def alerts_text(watch: watchdog.Watch) -> str:
 
     days = _week_days(watch.week)
     if not watch.alerts:
-        text = QUIET.format(week=days, baseline=baseline)
-        return text + (DOUBTFUL if watch.doubtful else "")
+        text = fill(QUIET, week=days, baseline=baseline)
+        return Safe(text + DOUBTFUL) if watch.doubtful else text
 
-    lines = [HEADER.format(week=days), ""]
+    lines = [fill(HEADER, week=days), ""]
     for alert in watch.alerts:
         lines.extend(alert_lines(alert))
-    text = "\n".join(lines).rstrip()
-    text += f"\n\nСравнение со средним за {baseline} до этой."
+    text = Safe("\n".join(lines).rstrip())
+    text = Safe(
+        text + fill("\n\nСравнение со средним за {baseline} до этой.", baseline=baseline)
+    )
     if any(alert.metric in WITHHELD_METRICS for alert in watch.alerts):
-        text += WITHHELD
-    return text + (DOUBTFUL if watch.doubtful else "")
+        text = Safe(text + WITHHELD)
+    return Safe(text + DOUBTFUL) if watch.doubtful else text
 
 
-def table_text(table: watchdog.Dynamics) -> str:
+def table_text(table: watchdog.Dynamics) -> Safe:
     """Таблица показателей по неделям. Моноширинная, чтобы столбцы сошлись."""
     if table.empty:
-        return NO_DYNAMICS.format(title=table.title) + "\n\n" + HOW_TO
+        return Safe(fill(NO_DYNAMICS, title=table.title) + "\n\n" + HOW_TO)
 
     head = f"{'Неделя':<7}{'Выручка':>10}" + "".join(f"{title:>7}" for title, _ in COLUMNS)
     rows = [head]
@@ -256,11 +271,12 @@ def table_text(table: watchdog.Dynamics) -> str:
         line += "".join(f"{_percent(week.value(name)):>7}" for _, name in COLUMNS)
         rows.append(line)
 
-    return (
-        DYNAMICS_HEADER.format(title=table.title)
-        + "\n<pre>"
-        + "\n".join(rows)
-        + "</pre>\n"
+    # Таблицу заворачивает в теги шаблон, а строки едут внутрь значением:
+    # ширина столбцов считается по исходным символам, и правило «разметку
+    # ставит только бот» от этого не меняется.
+    return Safe(
+        fill(DYNAMICS_HEADER, title=table.title)
+        + fill("\n<pre>{rows}</pre>\n", rows="\n".join(rows))
         + DYNAMICS_NOTE
         + "\n\n"
         + HOW_TO

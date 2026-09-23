@@ -2,6 +2,12 @@
 
 Работает для всех, включая тех, кто не подключал кабинет. Логика не менялась:
 из текста достаётся артикул, по нему собирается карточка с витрины.
+
+Название, бренд, описание и отзывы приходят с витрины Wildberries, и
+распоряжается ими продавец карточки, а не мы. Своего экранирования здесь
+больше нет: подстановка общая, `bot.texts.fill`, и граница стоит на ней, а
+не у каждого поля. Копия инструмента однажды разошлась бы с оригиналом
+молча, и дыра вернулась бы в самую посещаемую команду бота.
 """
 
 import logging
@@ -12,6 +18,7 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes, MessageHandler, filters
 
 from bot import texts
+from bot.texts import Safe, fill
 from legacy.card import (
     Product,
     ProductNotFoundError,
@@ -32,43 +39,52 @@ def parse_article(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def format_product(product: Product) -> str:
-    """Форматирует карточку товара для отправки в Telegram."""
-    lines = [f"<b>{product.name}</b>"]
+def format_product(product: Product) -> Safe:
+    """Форматирует карточку товара для отправки в Telegram.
+
+    Разметку ставим только мы. Всё, что пришло от Wildberries, уезжает в
+    сообщение полем подстановки и становится текстом: без этого продавец
+    подставил бы в описание свою ссылку, и она ушла бы клиенту от имени бота,
+    а одиночный «<» в названии не дал бы отправить карточку вообще.
+    """
+    lines = [fill("<b>{name}</b>", name=product.name)]
 
     if product.brand:
-        lines.append(f"🏷 Бренд: {product.brand}")
+        lines.append(fill("🏷 Бренд: {brand}", brand=product.brand))
     if product.supplier:
-        lines.append(f"🏪 Продавец: {product.supplier}")
+        lines.append(fill("🏪 Продавец: {supplier}", supplier=product.supplier))
 
     if product.price is not None:
-        price_line = f"💰 Цена: <b>{product.price:,.0f} ₽</b>".replace(",", " ")
+        price = f"{product.price:,.0f}".replace(",", " ")
+        price_line = fill("💰 Цена: <b>{price} ₽</b>", price=price)
         if product.old_price:
             old = f"{product.old_price:,.0f}".replace(",", " ")
-            price_line += f" <s>{old} ₽</s>"
+            price_line = Safe(price_line + fill(" <s>{old} ₽</s>", old=old))
         lines.append(price_line)
     else:
         lines.append("💰 Цена: нет данных (возможно, нет в наличии)")
 
     if product.rating:
         stars = "⭐" * round(product.rating)
-        lines.append(f"{stars} Рейтинг: {product.rating}")
+        lines.append(
+            fill("{stars} Рейтинг: {rating}", stars=stars, rating=product.rating)
+        )
     else:
         lines.append("⭐ Рейтинг: пока нет оценок")
 
-    lines.append(f"💬 Отзывов: {product.feedbacks}")
-    lines.append(f"🔢 Артикул: <code>{product.article}</code>")
+    lines.append(fill("💬 Отзывов: {count}", count=product.feedbacks))
+    lines.append(fill("🔢 Артикул: <code>{article}</code>", article=product.article))
 
     if product.characteristics:
         lines.append("\n<b>📋 Характеристики</b>")
         for name, value in product.characteristics[:6]:
-            lines.append(f"• {name}: {value}")
+            lines.append(fill("• {name}: {value}", name=name, value=value))
 
     if product.description:
         desc = product.description
         if len(desc) > 400:
             desc = desc[:400].rstrip() + "…"
-        lines.append(f"\n<b>📝 Описание</b>\n{desc}")
+        lines.append(fill("\n<b>📝 Описание</b>\n{desc}", desc=desc))
 
     if product.reviews:
         lines.append("\n<b>🗣 Отзывы</b>")
@@ -77,27 +93,32 @@ def format_product(product: Product) -> str:
             text = review.text
             if len(text) > 200:
                 text = text[:200].rstrip() + "…"
-            lines.append(f"• {stars}{text}")
+            lines.append(fill("• {stars}{text}", stars=stars, text=text))
 
-    lines.append(f'\n<a href="{product.url}">Открыть на Wildberries</a>')
+    # Ссылку на витрину бот собирает сам из артикула, и она остаётся живой
+    # разметкой: адрес всё равно идёт полем, а не мимо подстановки.
+    lines.append(fill('\n<a href="{url}">Открыть на Wildberries</a>', url=product.url))
 
-    return "\n".join(lines)
+    return Safe("\n".join(lines))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Любое текстовое сообщение: артикул отдаём карточкой, остальное объясняем."""
-    text = update.message.text or ""
+    message = update.effective_message
+    if message is None:  # правка старого сообщения приходит без message
+        return
+    text = message.text or ""
     article = parse_article(text)
 
     if article is None:
-        await update.message.reply_text(
+        await message.reply_text(
             texts.INTRO,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
         return
 
-    status = await update.message.reply_text("🔎 Ищу товар...")
+    status = await message.reply_text("🔎 Ищу товар...")
 
     try:
         product = await fetch_product(article)

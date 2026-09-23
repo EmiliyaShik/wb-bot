@@ -13,6 +13,7 @@ Tribute, если его когда-нибудь включат. Другого 
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,17 @@ HIDDEN = "hidden"
 WORKING = (ACTIVE, GRACE, PAUSED)
 
 _STAMP = "%Y-%m-%d %H:%M:%S"
+
+# Замок на решения о доступе. Хендлеры выполняются одновременно, а выдача,
+# отмена и пауза устроены как «прочитал состояние, решил, записал»: без замка
+# два одновременных вызова оба прочли бы старое состояние и записали дважды.
+# Одним оператором SQL это не выражается - решение читает module_access, а
+# пишет ещё и в access_log, - поэтому здесь замок, как у выдачи номеров счетов
+# в слое данных. Он рекурсивный: start_trial зовёт grant_access.
+# Замок не нижняя граница, а верхняя: он живёт в процессе и второму процессу
+# на той же базе не виден. Нижняя граница у выдачи это уникальный индекс
+# idx_access_log_grant_once, он держится и без замка.
+_decision = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -146,6 +158,11 @@ def grant_access(
     там же, где лежит выдача, так что забыть её при новом способе оплаты
     невозможно: другого пути к таблице доступов просто нет.
 
+    Держат это правило двое. Замок ниже закрывает всю последовательность
+    «прочитал состояние, решил, записал в две таблицы». Уникальный индекс
+    idx_access_log_grant_once в базе закрывает саму запись и работает даже
+    там, где замка нет: во втором процессе бота на той же базе.
+
     Срок считается от большей из двух дат - сегодня или текущее «до»: продление
     не сжигает уже оплаченные дни.
     """
@@ -162,11 +179,49 @@ def grant_access(
     moment = _now(now)
     repo = db.repo(client_id, path)
 
-    seen = repo.one("access_log", payment_ref=payment_ref, action="grant")
-    if seen is not None:
+    with _decision:
+        return _grant_locked(
+            client_id, module, days, payment_ref, method, actor, moment, repo, path
+        )
+
+
+def _grant_locked(
+    client_id: int,
+    module: str,
+    days: int,
+    payment_ref: str,
+    method: str,
+    actor: str,
+    moment: datetime,
+    repo,
+    path,
+) -> Access:
+    """Тело выдачи под замком: заявка на платёж и запись идут неразрывно.
+
+    Строка grant в журнале это и есть заявка на номер платежа: она пишется
+    первой, одним оператором, и уникальный индекс базы решает, первая она или
+    вторая. Порядок именно такой не случайно: если сначала продлить срок, а
+    потом упереться в индекс, продление уже случилось бы дважды. Ценой того,
+    что при падении процесса между двумя операторами платёж останется
+    заявленным без продления, владелец увидит это в журнале и выдаст доступ
+    новым основанием.
+    """
+    claimed = repo.insert_once(
+        "access_log",
+        module=module,
+        action="grant",
+        days=days,
+        payment_ref=payment_ref,
+        method=method,
+        actor=actor,
+        at=_stamp(moment),
+    )
+    if claimed is None:
+        seen = repo.one("access_log", payment_ref=payment_ref, action="grant")
+        paid_module = str(seen["module"]) if seen is not None else module
         repo.insert(
             "access_log",
-            module=str(seen["module"]),
+            module=paid_module,
             action="duplicate",
             days=days,
             payment_ref=payment_ref,
@@ -177,10 +232,10 @@ def grant_access(
         audit.log(
             "access.duplicate",
             client_id,
-            f"дубль платежа {payment_ref}, модуль {seen['module']}: доступ не продлён",
+            f"дубль платежа {payment_ref}, модуль {paid_module}: доступ не продлён",
             path=path,
         )
-        current = _read(client_id, str(seen["module"]), moment, path)
+        current = _read(client_id, paid_module, moment, path)
         return replace(current, duplicate=True)
 
     current = _read(client_id, module, moment, path)
@@ -194,16 +249,6 @@ def grant_access(
         source=method,
         state=ACTIVE,
         updated_at=_stamp(moment),
-    )
-    repo.insert(
-        "access_log",
-        module=module,
-        action="grant",
-        days=days,
-        payment_ref=payment_ref,
-        method=method,
-        actor=actor,
-        at=_stamp(moment),
     )
     audit.log(
         "access.grant",
@@ -243,6 +288,23 @@ def revoke_access(
     module = str(module)
     moment = _now(now)
     repo = db.repo(client_id, path)
+    with _decision:
+        return _revoke_locked(
+            client_id, module, reason, actor, payment_ref, moment, repo, path
+        )
+
+
+def _revoke_locked(
+    client_id: int,
+    module: str,
+    reason: str,
+    actor: str,
+    payment_ref: str | None,
+    moment: datetime,
+    repo,
+    path,
+) -> Access:
+    """Тело отмены под замком: состояние решает, и оно же меняется тут же."""
     current = _read(client_id, module, moment, path)
 
     if current.until is None and current.paused_at is None:
@@ -333,36 +395,37 @@ def pause(
     которые встали на паузу.
     """
     moment = _now(now)
-    repo = db.repo(client_id, path)
-    touched = 0
-    for row in repo.rows("module_access"):
-        if row["paused_at"] or not row["until"]:
-            continue
-        repo.update(
-            "module_access",
-            {"module": row["module"]},
-            paused_at=_stamp(moment),
-            state=PAUSED,
-            updated_at=_stamp(moment),
-        )
-        repo.insert(
-            "access_log",
-            module=str(row["module"]),
-            action="pause",
-            actor=reason,
-            at=_stamp(moment),
-        )
-        touched += 1
-    if touched:
-        db.admin_repo(path).set_client_fields(client_id, paused_since=_stamp(moment))
-        audit.log(
-            "access.pause",
-            client_id,
-            f"доступ на паузе ({reason}), модулей: {touched}",
-            level="warning",
-            path=path,
-        )
-    return touched
+    with _decision:
+        repo = db.repo(client_id, path)
+        touched = 0
+        for row in repo.rows("module_access"):
+            if row["paused_at"] or not row["until"]:
+                continue
+            repo.update(
+                "module_access",
+                {"module": row["module"]},
+                paused_at=_stamp(moment),
+                state=PAUSED,
+                updated_at=_stamp(moment),
+            )
+            repo.insert(
+                "access_log",
+                module=str(row["module"]),
+                action="pause",
+                actor=reason,
+                at=_stamp(moment),
+            )
+            touched += 1
+        if touched:
+            db.admin_repo(path).set_client_fields(client_id, paused_since=_stamp(moment))
+            audit.log(
+                "access.pause",
+                client_id,
+                f"доступ на паузе ({reason}), модулей: {touched}",
+                level="warning",
+                path=path,
+            )
+        return touched
 
 
 def resume(
@@ -378,40 +441,41 @@ def resume(
     дней.
     """
     moment = _now(now)
-    repo = db.repo(client_id, path)
-    touched = 0
-    for row in repo.rows("module_access"):
-        paused_at = _parse(row["paused_at"])
-        if paused_at is None:
-            continue
-        until = _parse(row["until"])
-        shifted = (until + (moment - paused_at)) if until else None
-        repo.update(
-            "module_access",
-            {"module": row["module"]},
-            until=_stamp(shifted) if shifted else None,
-            paused_at=None,
-            state=_state_of(shifted, None, moment),
-            updated_at=_stamp(moment),
-        )
-        repo.insert(
-            "access_log",
-            module=str(row["module"]),
-            action="resume",
-            days=max(0, (moment - paused_at).days),
-            actor="system",
-            at=_stamp(moment),
-        )
-        touched += 1
-    if touched:
-        db.admin_repo(path).set_client_fields(client_id, paused_since=None)
-        audit.log(
-            "access.resume",
-            client_id,
-            f"пауза снята, срок сдвинут у модулей: {touched}",
-            path=path,
-        )
-    return touched
+    with _decision:
+        repo = db.repo(client_id, path)
+        touched = 0
+        for row in repo.rows("module_access"):
+            paused_at = _parse(row["paused_at"])
+            if paused_at is None:
+                continue
+            until = _parse(row["until"])
+            shifted = (until + (moment - paused_at)) if until else None
+            repo.update(
+                "module_access",
+                {"module": row["module"]},
+                until=_stamp(shifted) if shifted else None,
+                paused_at=None,
+                state=_state_of(shifted, None, moment),
+                updated_at=_stamp(moment),
+            )
+            repo.insert(
+                "access_log",
+                module=str(row["module"]),
+                action="resume",
+                days=max(0, (moment - paused_at).days),
+                actor="system",
+                at=_stamp(moment),
+            )
+            touched += 1
+        if touched:
+            db.admin_repo(path).set_client_fields(client_id, paused_since=None)
+            audit.log(
+                "access.resume",
+                client_id,
+                f"пауза снята, срок сдвинут у модулей: {touched}",
+                path=path,
+            )
+        return touched
 
 
 class TrialDenied(Exception):
@@ -419,8 +483,8 @@ class TrialDenied(Exception):
 
     Причины: no_seller - кабинет WB ещё не подключён, и привязать пробный
     период не к чему; used - на этот кабинет пробный уже брали; not_sold -
-    модуль скрыт и не продаётся; too_many - в конфиге разрешено меньше
-    модулей, чем просят.
+    модуль скрыт и не продаётся; package - просят пакет, а пробуют по одному
+    модулю; too_many - в конфиге разрешено меньше модулей, чем просят.
     """
 
     def __init__(self, reason: str) -> None:
@@ -450,20 +514,27 @@ def start_trial(
     Привязка к seller_id, а не к Telegram-аккаунту: второй аккаунт с тем же
     кабинетом пробный уже не получит. Включение идёт через ту же дверь
     grant_access, поэтому пробный период виден в журнале наравне с оплатой.
+
+    Что можно пробовать, решается здесь, а не клавиатурой: callback_data
+    приходит от клиента и подделывается свободно, так что нарисованные кнопки
+    ничего не ограничивают. Пакет и скрытый модуль отсекаются до записи.
     """
     module = str(module)
     info = config.modules().get(module)
     if info is None or not info.visible:
         raise TrialDenied("not_sold")
+    if module in packages():
+        raise TrialDenied("package")
 
     admin = db.admin_repo(path)
     row = admin.client(client_id)
     seller_id = str((row["seller_id"] if row else "") or "").strip()
     if not seller_id:
         raise TrialDenied("no_seller")
-    if len(admin.trials(seller_id)) >= trial_modules():
-        raise TrialDenied("used")
-    if not admin.start_trial(seller_id, module):
+    # Квота проверяется внутри вставки, а не чтением перед ней: хендлеры
+    # выполняются одновременно, и два нажатия на разные модули успели бы
+    # прочитать ноль оба.
+    if not admin.start_trial(seller_id, module, trial_modules()):
         raise TrialDenied("used")
 
     return grant_access(

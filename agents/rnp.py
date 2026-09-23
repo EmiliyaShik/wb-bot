@@ -542,7 +542,7 @@ def fan_out_report(task: Any, *, path: str | Path | None = None) -> list[int]:
 
 def request_report(
     client_id: int, *, day: date | None = None, path: str | Path | None = None
-) -> int:
+) -> queue.TaskId:
     """Отчёт по требованию: задача в очередь, а не поход в WB из хендлера.
 
     «Принято, пришлю, когда будет готово» говорит сама очередь.

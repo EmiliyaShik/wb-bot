@@ -10,7 +10,8 @@ import pytest
 
 from types import SimpleNamespace
 
-from telegram.ext import ApplicationHandlerStop
+from telegram import Update
+from telegram.ext import ApplicationHandlerStop, TypeHandler
 
 from bot.handlers import admin
 from core import access, audit, billing, db, metering, queue, ratelimit, scheduler, xlsx
@@ -184,6 +185,64 @@ def test_acts_book_carries_all_seven_columns_of_the_registry(db_path, business):
     assert row.get("Сумма, ₽") == 3000
 
 
+def test_the_registry_carries_the_amount_as_a_decimal(db_path):
+    """Реестр сверяют с банком: копейки в ячейке должны быть те самые.
+
+    `float` не умеет представить 2290,10 точно, и в книге она могла бы
+    оказаться как 2290,099999999999. openpyxl знает `Decimal` как число,
+    поэтому сумма доезжает до ячейки, не побывав двоичной дробью.
+    """
+    invoice = billing.Invoice(
+        number="WBR-2026-0042", client_id=1, module="finance",
+        period_months=1, amount_kop=229010, status=billing.PAID,
+    )
+
+    amount = billing.acts_rows([invoice])[0][-1]
+
+    assert isinstance(amount, Decimal)
+    assert amount == Decimal("2290.10")
+
+
+def test_the_amount_in_the_book_is_the_exact_one(db_path, business):
+    """И до ячейки книги оно доезжает тем же числом, а не близким."""
+    first, _ = business
+    put_invoice(first, db_path, "WBR-2026-0042", amount_kop=229010, status=billing.PAID,
+                issued="2026-09-05 09:00:00", paid="2026-09-05 10:00:00")
+
+    sheet = xlsx.read_sheet(billing.acts_xlsx("2026-09", path=db_path))
+    cells = {row.get("Номер счёта"): row.get("Сумма, ₽") for row in sheet.rows}
+
+    assert Decimal(str(cells["WBR-2026-0042"])) == Decimal("2290.10")
+
+
+def test_the_amount_is_shown_with_kopecks(db_path, business):
+    """Точное число в ячейке ещё не значит, что копейки видны на экране.
+
+    Без формата Excel показал бы 2290,10 как 2290,1, и владелец сверял бы с
+    выпиской сумму, у которой не хватает двух копеек.
+    """
+    import io
+
+    from openpyxl import load_workbook
+
+    first, _ = business
+    put_invoice(first, db_path, "WBR-2026-0042", amount_kop=229010, status=billing.PAID,
+                issued="2026-09-05 09:00:00", paid="2026-09-05 10:00:00")
+
+    book = load_workbook(io.BytesIO(billing.acts_xlsx("2026-09", path=db_path)))
+    try:
+        sheet = book.worksheets[0]
+        column = billing.ACTS_HEADERS.index("Сумма, ₽") + 1
+        formats = {
+            sheet.cell(row=number, column=column).number_format
+            for number in range(xlsx.FIRST_DATA_ROW, sheet.max_row + 1)
+        }
+    finally:
+        book.close()
+
+    assert formats == {xlsx.MONEY_FORMAT}
+
+
 # --- хендлер владельца ---
 
 OWNER = 9001
@@ -237,6 +296,14 @@ class FakeUpdate:
         self.effective_message = message
         self.message = message
         self.callback_query = query
+
+
+class FakeDocumentMessage(FakeMessage):
+    """Сообщение с файлом: боту оно стоит дороже команды, значит и считается."""
+
+    def __init__(self):
+        super().__init__()
+        self.document = SimpleNamespace(file_size=5 * 1024 * 1024, file_name="book.xlsx")
 
 
 class FakeBot:
@@ -527,6 +594,112 @@ async def test_the_error_text_reaches_the_owner_cleaned_of_tokens(db_path, busin
     assert "401 от WB" in message.last  # сама ошибка при этом видна
 
 
+# --- чужой текст в сообщении владельцу ---
+#
+# Сообщения владельцу уходят с ParseMode.HTML, а внутрь попадает то, что
+# сочинил не бот: имя модуля из команды, номер платежа, ответ Wildberries в
+# last_error, запись журнала. Осмысленная угловая скобка стала бы ссылкой в
+# личке владельца от его собственного бота, случайная - ошибкой Telegram, и
+# тогда сводки не будет вовсе.
+
+TRAP = '<a href="http://example.invalid">нажми</a>'
+
+
+def no_foreign_markup(text: str) -> bool:
+    """В тексте нет чужих тегов, а сам подставленный кусок виден как текст."""
+    return "<a href" not in text and "&lt;a href=&quot;" in text
+
+
+@pytest.mark.asyncio
+async def test_a_module_name_from_the_command_does_not_become_markup(db_path, business, owner):
+    """Имя модуля берётся прямо из аргумента команды и едет обратно в ответ."""
+    message = FakeMessage()
+
+    await admin.grant_command(
+        FakeUpdate(OWNER, message), context("1", TRAP, "1", "счёт", "П-1"), path=db_path
+    )
+
+    assert no_foreign_markup(message.last)
+
+
+@pytest.mark.asyncio
+async def test_the_same_holds_for_revoke(db_path, business, owner):
+    message = FakeMessage()
+
+    await admin.revoke_command(
+        FakeUpdate(OWNER, message), context("1", TRAP, "возврат"), path=db_path
+    )
+
+    assert no_foreign_markup(message.last)
+
+
+@pytest.mark.asyncio
+async def test_the_payment_number_does_not_become_markup_either(db_path, business, owner):
+    first, _ = business
+    message = FakeMessage()
+
+    await admin.grant_command(
+        FakeUpdate(OWNER, message),
+        context(str(first), "finance", "1", "карта", TRAP),
+        path=db_path,
+    )
+
+    assert no_foreign_markup(message.last)
+    # Доступ при этом выдан: экранируется сообщение, а не данные.
+    assert access.has_access(first, "finance", path=db_path)
+    assert db.repo(first, db_path).one("access_log", payment_ref=TRAP) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_wildberries_error_does_not_become_markup_in_tasks(db_path, business, owner):
+    """last_error это кусок чужого ответа: чистка снимает секреты, но не теги."""
+    first, _ = business
+    db.repo(first, db_path).insert(
+        "tasks", kind="finance_report", payload="{}", state=queue.FAILED,
+        attempts=1, last_error=f"500 от WB: {TRAP}",
+    )
+    message = FakeMessage()
+
+    await admin.tasks_command(FakeUpdate(OWNER, message), context(), path=db_path)
+
+    assert no_foreign_markup(message.last)
+    assert "500 от WB" in message.last  # сама ошибка при этом читается
+    assert admin.TASKS_FAILED in message.last  # и заголовки бота остались тегами
+
+
+@pytest.mark.asyncio
+async def test_a_journal_record_does_not_become_markup_in_tasks(db_path, business, owner):
+    first, _ = business
+    audit.log("task.failed", first, f"задача упала: {TRAP}", level="error", path=db_path)
+    message = FakeMessage()
+
+    await admin.tasks_command(FakeUpdate(OWNER, message), context(), path=db_path)
+
+    assert no_foreign_markup(message.last)
+
+
+@pytest.mark.asyncio
+async def test_a_module_name_from_the_database_does_not_become_markup_in_stats(db_path, owner):
+    """Имена модулей и методов WB в сводку приходят из базы, а не из кода."""
+    admin_repo = db.admin_repo(db_path)
+    client_id = admin_repo.ensure_client(6060)
+    db.repo(client_id, db_path).insert(
+        "api_calls", host="statistics-api", method=TRAP, status=200, at="2026-09-10 08:00:00",
+    )
+    message = FakeMessage()
+
+    await admin.stats_command(FakeUpdate(OWNER, message), context(), path=db_path, today=TODAY)
+
+    assert no_foreign_markup(message.last)
+
+
+def test_a_ready_summary_is_marked_as_the_bots_own_text(db_path, business):
+    """Пометка `Safe` это единственный путь мимо экранирования, и он наш."""
+    result = metering.stats("month", today=TODAY, path=db_path)
+
+    assert isinstance(admin.stats_text(result), admin.Safe)
+
+
 @pytest.mark.asyncio
 async def test_the_owner_is_not_rate_limited(db_path, owner):
     """Владелец гоняет /tasks и /stats как раз тогда, когда что-то упало."""
@@ -537,6 +710,87 @@ async def test_the_owner_is_not_rate_limited(db_path, owner):
         await admin.rate_guard(update, context())
 
     assert message.sent == []
+
+
+def test_the_rate_guard_stands_on_every_kind_of_update(db_path, owner):
+    """Команда ничего не ждёт внутри себя, а присланный файл и токен ждут."""
+    scheduler.reset()
+    app = FakeApp()
+
+    admin.register(app, path=db_path)
+    guard, group = app.added[0]
+
+    assert isinstance(guard, TypeHandler)
+    assert guard.type is Update  # то есть любое обновление, а не только команда
+    assert group == admin.GUARD_GROUP
+
+
+@pytest.mark.asyncio
+async def test_a_flood_of_plain_text_runs_into_the_limit(db_path, owner):
+    """Строка, похожая на токен, идёт без слеша, а проверяется живым запросом."""
+    message = FakeMessage()
+    update = FakeUpdate(STRANGER, message)
+    for _ in range(ratelimit.per_minute()):
+        await admin.rate_guard(update, context())
+
+    with pytest.raises(ApplicationHandlerStop):
+        await admin.rate_guard(update, context())
+
+    assert "подожд" in message.last.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_flood_of_documents_runs_into_the_same_limit(db_path, owner):
+    message = FakeDocumentMessage()
+    update = FakeUpdate(STRANGER, message)
+    for _ in range(ratelimit.per_minute()):
+        await admin.rate_guard(update, context())
+
+    with pytest.raises(ApplicationHandlerStop):
+        await admin.rate_guard(update, context())
+
+
+@pytest.mark.asyncio
+async def test_button_taps_are_limited_too_and_the_button_stops_spinning(db_path, owner):
+    """Кнопке отвечают подсказкой: молчание Telegram показывает как поломку."""
+    query = FakeQuery(f"{admin.PREFIX}retry:1", FakeMessage())
+    update = FakeUpdate(STRANGER, query=query)
+    for _ in range(ratelimit.button_per_minute()):
+        await admin.rate_guard(update, context())
+
+    with pytest.raises(ApplicationHandlerStop):
+        await admin.rate_guard(update, context())
+
+    assert "подожд" in query.answers[-1].lower()
+
+
+@pytest.mark.asyncio
+async def test_a_flood_of_text_does_not_block_the_buttons(db_path, owner):
+    """Окна разные: захлебнувшийся текстом человек всё ещё может нажать кнопку."""
+    query = FakeQuery(f"{admin.PREFIX}retry:1", FakeMessage())
+    for _ in range(ratelimit.per_minute() + 5):
+        try:
+            await admin.rate_guard(FakeUpdate(STRANGER, FakeMessage()), context())
+        except ApplicationHandlerStop:
+            pass
+
+    await admin.rate_guard(FakeUpdate(STRANGER, query=query), context())
+
+    assert query.answers == []  # кнопка прошла, отказа не было
+
+
+@pytest.mark.asyncio
+async def test_the_bot_says_wait_once_per_window_and_does_not_echo_the_flood(db_path, owner):
+    """На поток сообщений бот не отвечает потоком: иначе он сам усилитель."""
+    message = FakeMessage()
+    update = FakeUpdate(STRANGER, message)
+    for _ in range(ratelimit.per_minute() + 10):
+        try:
+            await admin.rate_guard(update, context())
+        except ApplicationHandlerStop:
+            pass
+
+    assert len(message.sent) == 1
 
 
 @pytest.mark.asyncio

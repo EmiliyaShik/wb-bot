@@ -498,3 +498,31 @@ async def test_free_report_does_not_hand_out_the_paid_one(db_path, cabinet):
     await handler.make_delivery(app, db_path)(cabinet, result)
 
     assert len(app.bot.messages) == 1
+
+
+# --- чужой текст в бесплатном разборе ---
+#
+# Строка «что найдут платные модули» и название модуля лежат в конфиге, а
+# разбор уходит с ParseMode.HTML. Это первое, что человек видит от сервиса:
+# ошибка Telegram здесь означает, что он не увидит вообще ничего.
+
+TRAP = '<a href="http://zlo.example">нажми</a>'
+
+
+def test_a_module_line_from_config_does_not_become_markup(db_path, five_weeks, monkeypatch):
+    import copy
+
+    from core import config
+
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["finance"]["title"] = TRAP
+    patched["modules"]["finance"]["diagnostic_line"] = TRAP
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+    text = handler.report_text(
+        diagnostic.run("sid-1", five_weeks, today=TODAY, path=db_path)
+    )
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text
+    assert "<b>" in text  # разметка самого бота при этом на месте

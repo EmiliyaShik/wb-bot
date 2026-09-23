@@ -32,7 +32,14 @@ from core.wbapi.client import (
     WBClient,
     get_wb_client,
 )
-from core.wbapi.diag import HostProbe, check_token, probe_hosts, verdict_for
+from core.wbapi.diag import (
+    HostProbe,
+    TokenCheck,
+    check_token,
+    check_token_live,
+    probe_hosts,
+    verdict_for,
+)
 from core.wbapi.limits import Budget, Limit, reset_limits
 from core.wbapi.token import (
     ACC_TITLES,
@@ -60,7 +67,9 @@ __all__ = [
     "HOST_CATEGORY",
     "HostProbe",
     "Limit",
+    "TokenCheck",
     "check_token",
+    "check_token_live",
     "probe_hosts",
     "verdict_for",
     "WBClient",

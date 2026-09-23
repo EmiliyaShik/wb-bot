@@ -161,6 +161,106 @@ class TestLookup:
         assert await counterparty.lookup("1234567894", http=_BrokenClient()) is None
 
 
+def _party(name="ООО Пример", inn="1234567894"):
+    return {
+        "suggestions": [
+            {"value": name, "data": {"inn": inn, "address": {"value": "г Пример"}}}
+        ]
+    }
+
+
+class TestDadataQuota:
+    """Дневной предел обращений к DaData: квота ключа общая на весь сервис.
+
+    Доказывается состоянием счётчика и числом запросов, ушедших в двойника,
+    а не словами бота.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clean(self, monkeypatch):
+        counterparty.forget()
+        monkeypatch.setenv("DADATA_API_KEY", "ключ-для-теста")
+        monkeypatch.setattr(counterparty, "per_day", lambda: 2)
+        yield
+        counterparty.forget()
+
+    @pytest.mark.asyncio
+    async def test_one_client_cannot_burn_the_key(self):
+        client = _FakeClient(_party())
+        # Каждый ИНН свой, поэтому память об ответах тут ни при чём: предел
+        # держит именно счётчик.
+        for inn in ("1000000002", "1000000010", "1000000027", "1000000034"):
+            await counterparty.lookup(inn, client_id=7, http=client)
+        assert len(client.calls) == 2, "предел обращений не сработал"
+        assert counterparty.throttled(7) is True
+
+    @pytest.mark.asyncio
+    async def test_limit_is_counted_per_client(self):
+        client = _FakeClient(_party())
+        for inn in ("1000000002", "1000000010", "1000000027"):
+            await counterparty.lookup(inn, client_id=7, http=client)
+        # Сосед по боту за чужой перебор не платит.
+        assert counterparty.throttled(8) is False
+        await counterparty.lookup("1000000041", client_id=8, http=client)
+        assert len(client.calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_same_inn_is_answered_from_memory(self):
+        client = _FakeClient(_party())
+        first = await counterparty.lookup("1000000002", client_id=7, http=client)
+        for _ in range(5):
+            again = await counterparty.lookup("1000000002", client_id=7, http=client)
+        assert len(client.calls) == 1, "повтор того же ИНН ушёл в DaData"
+        assert again == first
+        # Квота при этом цела: повтор её не тратил.
+        assert counterparty.throttled(7) is False
+
+    @pytest.mark.asyncio
+    async def test_unknown_inn_is_remembered_too(self):
+        client = _FakeClient({"suggestions": []})
+        assert await counterparty.lookup("1000000002", client_id=7, http=client) is None
+        assert await counterparty.lookup("1000000002", client_id=7, http=client) is None
+        assert len(client.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_outage_is_not_remembered(self):
+        broken = _BrokenClient()
+        await counterparty.lookup("1000000002", client_id=7, http=broken)
+        # Минутная недоступность справочника не должна стоить клиенту суток.
+        good = _FakeClient(_party())
+        found = await counterparty.lookup("1000000002", client_id=7, http=good)
+        assert found is not None
+        assert len(good.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_new_day_starts_the_count_over(self):
+        client = _FakeClient(_party())
+        day_one = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+        day_two = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+        for inn in ("1000000002", "1000000010", "1000000027"):
+            await counterparty.lookup(inn, client_id=7, now=day_one, http=client)
+        assert counterparty.throttled(7, now=day_one) is True
+        assert counterparty.throttled(7, now=day_two) is False
+        await counterparty.lookup("1000000034", client_id=7, now=day_two, http=client)
+        assert len(client.calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_service_calls_without_client_are_not_limited(self):
+        client = _FakeClient(_party())
+        for inn in ("1000000002", "1000000010", "1000000027"):
+            await counterparty.lookup(inn, http=client)
+        assert len(client.calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_limit_of_zero_means_no_limit(self, monkeypatch):
+        monkeypatch.setattr(counterparty, "per_day", lambda: 0)
+        client = _FakeClient(_party())
+        for inn in ("1000000002", "1000000010", "1000000027"):
+            await counterparty.lookup(inn, client_id=7, http=client)
+        assert len(client.calls) == 3
+        assert counterparty.throttled(7) is False
+
+
 class _Response:
     def __init__(self, payload, status=200):
         self._payload = payload

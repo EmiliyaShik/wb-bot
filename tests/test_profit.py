@@ -554,6 +554,27 @@ async def test_profit_offers_periods_and_only_queues_the_work(seller, db_path):
     assert json.loads(tasks[0]["payload"])["period"] == "month"
 
 
+@pytest.mark.asyncio
+async def test_the_same_period_pressed_twice_answers_that_the_work_is_already_going(
+    seller, db_path
+):
+    """Вторая такая же задача не ставится, и кнопка не говорит «принято» дважды."""
+    queue.reset()
+    telegram_id = int(db.admin_repo(db_path).client(seller)["telegram_id"])
+
+    answers = []
+    for _ in range(2):
+        query = FakeQuery("profit:quarter", FakeMessage())
+        await handlers_profit.period_chosen(
+            FakeUpdate(telegram_id, query.message, query), None, path=db_path
+        )
+        answers.append(query.answered)
+
+    assert answers[0] == "Принято"
+    assert answers[1] == queue.ALREADY_QUEUED
+    assert len(db.admin_repo(db_path).tasks_by_kind(profit.TASK_KIND)) == 1
+
+
 def test_message_shows_who_feeds_and_who_eats(seller, db_path):
     text = handlers_profit.summary_text(report_of(seller, db_path))
 
@@ -605,3 +626,31 @@ def test_message_keeps_the_separate_block_for_problems(db_path):
     assert "без себестоимости" in text
     assert "обезличка" in text
     assert "/costs" in text
+
+
+# --- чужой текст в сообщении о прибыли ---
+#
+# Артикул продавца селлер вписывает сам в кабинете Wildberries, и оттуда он
+# приезжает прямо в строку топа. Сводка уходит с ParseMode.HTML: осмысленная
+# угловая скобка стала бы ссылкой от имени бота, случайная - ошибкой
+# Telegram, и тогда отчёта о прибыли клиент не увидит вообще, ни с первой
+# попытки, ни с любой следующей.
+
+TRAP = '<a href="http://zlo.example">нажми</a>'
+
+
+def test_a_vendor_code_from_the_cabinet_does_not_become_markup(db_path):
+    rows = [dict(row) for row in ROWS]
+    for row in rows:
+        if row.get("vendorCode") == "A-1":
+            row["vendorCode"] = TRAP
+    client_id = seed(
+        db_path, rows, {111: Decimal("500"), 222: Decimal("900")}, telegram_id=7171
+    )
+
+    text = handlers_profit.summary_text(report_of(client_id, db_path))
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text
+    assert "нажми" in text  # текст не потерян, он просто не ссылка
+    assert "<b>" in text  # а разметка самого бота на месте

@@ -205,6 +205,7 @@ def test_admin_repo_has_no_open_sql(db_path):
         "add_event",
         "events",
         "add_task",
+        "add_task_once",
         "task",
         "tasks",
         "tasks_by_kind",
@@ -327,7 +328,7 @@ def test_common_layer_writes_only_rows_without_client(db_path):
     import inspect
 
     admin = db.admin_repo(db_path)
-    for name in ("add_event", "add_task", "add_api_call", "add_ai_call"):
+    for name in ("add_event", "add_task", "add_task_once", "add_api_call", "add_ai_call"):
         params = inspect.signature(getattr(admin, name)).parameters
         assert "client_id" not in params, f"{name} снова принимает client_id"
 
@@ -395,8 +396,11 @@ def test_tasks_by_kind_does_not_depend_on_table_size(db_path):
     admin = db.admin_repo(db_path)
     morning = admin.add_task("daily_report")
     weekly = admin.add_task("weekly_check")
-    for _ in range(50):  # шум, за которым срез окна потерял бы утреннюю задачу
-        admin.add_task("housekeeping")
+    # Шум, за которым срез окна потерял бы утреннюю задачу. Номер в payload
+    # не для красоты: одинаковые незавершённые задачи база больше не хранит,
+    # и пятьдесят близнецов превратились бы в одну строку.
+    for number in range(50):
+        admin.add_task("housekeeping", f'{{"n": {number}}}')
 
     daily = admin.tasks_by_kind("daily_report")
     assert [row["id"] for row in daily] == [morning]

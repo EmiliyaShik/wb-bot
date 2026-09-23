@@ -45,6 +45,21 @@ class Task:
     attempts: int
 
 
+class TaskId(int):
+    """Номер задачи и ответ на вопрос, новая она или нашлась прежняя.
+
+    Это по-прежнему обычное целое: старые вызовы `enqueue` продолжают
+    работать без единой правки, а тому, кто хочет отличить повтор от новой
+    работы, доступно поле `created`. Отдельный тип понадобился именно
+    потому, что вызывающих у `enqueue` много и все они лежат в чужих файлах.
+    """
+
+    def __new__(cls, value: int, *, created: bool = True) -> "TaskId":
+        self = super().__new__(cls, int(value))
+        self.created = bool(created)
+        return self
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -62,29 +77,98 @@ def enqueue(
     run_at: datetime | None = None,
     notify: bool = True,
     path: str | Path | None = None,
-) -> int:
+) -> TaskId:
     """Ставит задачу в очередь и сразу возвращает управление.
 
     Клиенту тут же уходит «принято, пришлю, когда будет готово»: ждать
     этого обещания от каждого хендлера нельзя, его даёт сама очередь.
     `notify=False` для работ, о которых клиенту знать не надо: расписание,
     служебные задачи, повторная постановка.
+
+    Повтор не удваивает работу. Пока прежняя такая же задача не доделана,
+    вторая не создаётся: возвращается номер прежней, а `created` у ответа
+    False. Клиенту при этом говорится «уже считаю», а не «принято» второй
+    раз. «Такая же» это тот же клиент, тот же вид и тот же payload: отчёт за
+    другой период это другая работа, а второй сбор за тот же день нет.
+
+    Одинаковость проверяет база уникальным индексом, а не запрос перед
+    вставкой: хендлеры выполняются одновременно, и два нажатия подряд оба
+    увидели бы пустую очередь.
     """
     body = json.dumps(payload or {}, ensure_ascii=False)
     next_run_at = _stamp(run_at) if run_at is not None else None
-    if client_id is None:
-        task_id = db.admin_repo(path).add_task(kind, body, next_run_at)
-    else:
-        task_id = db.repo(client_id, path).insert(
-            "tasks",
-            kind=kind,
-            payload=body,
-            state=PENDING,
-            next_run_at=next_run_at,
-        )
+    # Три попытки, а не одна: между отказом вставки и поиском близнеца воркер
+    # мог успеть его доделать, и тогда место в очереди снова свободно.
+    for _ in range(3):
+        task_id = _insert_once(client_id, kind, body, next_run_at, path)
+        if task_id is not None:
+            if notify:
+                _notify_now(client_id, ACCEPTED)
+            return TaskId(task_id, created=True)
+        twin = _twin(client_id, kind, body, path)
+        if twin is not None:
+            if notify:
+                _notify_now(client_id, ALREADY_QUEUED)
+            return TaskId(twin, created=False)
+    # Сюда можно попасть, только если воркер трижды подряд успел закрыть
+    # близнеца между вставкой и поиском. Работу в таком случае ставим обычной
+    # вставкой: остаться без отчёта хуже, чем поставить лишнюю задачу.
+    logger.warning("задача %s клиента %s ставится в обход проверки", kind, client_id)
+    task_id = _insert(client_id, kind, body, next_run_at, path)
     if notify:
         _notify_now(client_id, ACCEPTED)
-    return task_id
+    return TaskId(task_id, created=True)
+
+
+def _insert(
+    client_id: int | None,
+    kind: str,
+    body: str,
+    next_run_at: str | None,
+    path: str | Path | None,
+) -> int:
+    if client_id is None:
+        return db.admin_repo(path).add_task(kind, body, next_run_at)
+    return db.repo(client_id, path).insert(
+        "tasks", kind=kind, payload=body, state=PENDING, next_run_at=next_run_at
+    )
+
+
+def _insert_once(
+    client_id: int | None,
+    kind: str,
+    body: str,
+    next_run_at: str | None,
+    path: str | Path | None,
+) -> int | None:
+    """Вставка, которая молчит, если такая задача уже стоит. None это повтор."""
+    if client_id is None:
+        return db.admin_repo(path).add_task_once(kind, body, next_run_at)
+    return db.repo(client_id, path).insert_once(
+        "tasks", kind=kind, payload=body, state=PENDING, next_run_at=next_run_at
+    )
+
+
+def _twin(
+    client_id: int | None, kind: str, body: str, path: str | Path | None
+) -> int | None:
+    """Номер такой же незавершённой задачи, если она есть.
+
+    Читается только после того, как вставку отклонил индекс, и нужен ровно
+    затем, чтобы ответить вызывающему номером прежней работы.
+    """
+    if client_id is None:
+        rows = [
+            row
+            for row in db.admin_repo(path).tasks_by_kind(kind)
+            if row["client_id"] is None
+        ]
+    else:
+        rows = db.repo(client_id, path).rows("tasks", kind=kind)
+    for row in rows:
+        if row["payload"] == body and row["state"] in (PENDING, RUNNING):
+            return int(row["id"])
+    return None
 
 
 # --- реестр обработчиков ---
@@ -294,6 +378,11 @@ async def run_worker(
 # --- тексты клиенту. Русский, без кодов ошибок и слова «таймаут» ---
 
 ACCEPTED = "Принято. Соберу и пришлю результат отдельным сообщением."
+
+ALREADY_QUEUED = (
+    "Эта работа уже идёт, повторно запускать её не нужно. "
+    "Результат пришлю отдельным сообщением, как только он будет готов."
+)
 
 FAILED_TEXT = (
     "Не получилось собрать данные: Wildberries сейчас не отвечает. "

@@ -190,6 +190,7 @@ AUTH_MESSAGE = (
     "у него кончился срок (180 дней) или он выпущен в другом кабинете."
 )
 UNAVAILABLE_MESSAGE = "Wildberries сейчас не отвечает."
+BUSY_MESSAGE = "Бюджет запросов к Wildberries исчерпан, нужна пауза."
 
 
 def day(value: date | datetime | str) -> str:
@@ -389,6 +390,7 @@ class WBClient:
         attempts: int | None = None,
         timeout: httpx.Timeout | float | None = None,
         raw: bool = False,
+        wait: bool = True,
     ) -> Any:
         """Один вызов WB с лимитами, ожиданием после 429 и переводом ошибок.
 
@@ -404,7 +406,12 @@ class WBClient:
         tries = policy.attempts if attempts is None else max(1, int(attempts))
 
         for attempt in range(1, tries + 1):
-            await self._budget.take(spot.lane)
+            if wait:
+                await self._budget.take(spot.lane)
+            elif not self._budget.try_take(spot.lane):
+                # Звать отсюда пришлось из места, где ждать нельзя (хендлер
+                # бота): говорим об этом сразу, а не занимаем очередь сообщений.
+                raise WBRateLimited(BUSY_MESSAGE, status=None, path=spot.label)
             started = self._clock()
             try:
                 response = await self._http.request(
@@ -489,7 +496,13 @@ class WBClient:
 
     # --- проверка связи ---
 
-    async def ping(self, host: str, *, timeout: httpx.Timeout | float | None = None) -> int:
+    async def ping(
+        self,
+        host: str,
+        *,
+        timeout: httpx.Timeout | float | None = None,
+        wait: bool = True,
+    ) -> int:
         """GET /ping на домен. Отдаёт код ответа, который прислал сам WB.
 
         Ожидание после 429 тут выключено: документация прямо запрещает
@@ -498,7 +511,7 @@ class WBClient:
         """
         spot = Endpoint("GET", host, "/ping", f"ping:{host}")
         response = await self.request_endpoint(
-            spot, attempts=1, timeout=timeout or PING_TIMEOUT, raw=True
+            spot, attempts=1, timeout=timeout or PING_TIMEOUT, raw=True, wait=wait
         )
         return int(response.status_code)
 

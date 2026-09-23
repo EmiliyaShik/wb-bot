@@ -10,6 +10,7 @@ SQL, схема и режим WAL остаются здесь.
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 import threading
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from core import config
+
+logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent.parent / "migrations"
 
@@ -102,26 +105,135 @@ def close_all() -> None:
         _connections.clear()
 
 
+def strip_sql_comments(sql: str) -> str:
+    """Убирает комментарии, не трогая их подобие внутри строк и кавычек.
+
+    Нужно двоим: миграции, чтобы назвать в журнале оператор, который база
+    отвергла, и сторожу идемпотентности, чтобы слово из комментария не сошло
+    за оператор. Поиск подстроки тут не годится, поэтому разбор посимвольный.
+    """
+    out: list[str] = []
+    quotes = {"'": "'", '"': '"', "`": "`", "[": "]"}
+    total = len(sql)
+    i = 0
+    while i < total:
+        char = sql[i]
+        closing = quotes.get(char)
+        if closing is not None:
+            out.append(char)
+            i += 1
+            while i < total:
+                out.append(sql[i])
+                if sql[i] == closing:
+                    # Удвоенная кавычка внутри литерала это она сама, не конец.
+                    if closing != "]" and sql[i + 1 : i + 2] == closing:
+                        out.append(closing)
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            continue
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            i = total if end < 0 else end
+            continue
+        if sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = total if end < 0 else end + 2
+            out.append(" ")
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
+def split_statements(sql: str) -> list[str]:
+    """Режет файл схемы на отдельные операторы.
+
+    Границу оператора определяет сам SQLite (sqlite3.complete_statement): он
+    знает и про комментарии, и про строковые литералы, и про CREATE TRIGGER,
+    внутри которого точка с запятой оператор не заканчивает. Свой разрез по
+    ';' ошибся бы на первом же триггере.
+    """
+    statements: list[str] = []
+    current = ""
+    for line in sql.splitlines(keepends=True):
+        current += line
+        if sqlite3.complete_statement(current):
+            statements.append(current.strip())
+            current = ""
+    tail = current.strip()
+    if tail and strip_sql_comments(tail).strip():
+        statements.append(tail)
+    return statements
+
+
+def _headline(statement: str) -> str:
+    """Оператор одной строкой: так его видно в журнале без всего файла."""
+    return " ".join(strip_sql_comments(statement).split())[:120]
+
+
+SCHEMA_FAILED = (
+    "Схема базы применена не полностью. Файл {file}, оператор «{headline}»: "
+    "{error}. Чаще всего это значит, что в таблице уже лежат строки, которые "
+    "новому правилу противоречат: правило не создано, остальная схема на "
+    "месте. Уберите лишние строки и перезапустите бота."
+)
+
+
 def migrate(path: str | Path | None = None) -> int:
-    """Применяет непринятые миграции по возрастанию. Возвращает версию схемы."""
+    """Приводит базу к схеме из migrations/*.sql. Возвращает версию схемы.
+
+    Файлы применяются при каждом старте, а не один раз. Схема здесь правится
+    на месте, одним файлом, и «применили, версию записали, больше не смотрим»
+    означало бы, что новый индекс не появится ни на одной базе, где версия уже
+    стоит, а кто-то обязан помнить про ручной оператор при деплое. Ручной шаг
+    забудут ровно один раз, и это будет важный раз.
+
+    Это безопасно ровно потому, что каждый оператор файла идемпотентен
+    (IF NOT EXISTS); за этим следит tests/test_migrations.py. Мерили: 32
+    оператора на готовой базе это около 1 мс вместе с чтением файла, на пустой
+    первый прогон около 40 мс. На фоне запуска бота этого не видно.
+
+    Оператор, который база отвергла, не останавливает остальные и не роняет
+    бота: владелец получает запись в журнале с текстом ошибки. Бот без одного
+    индекса лучше, чем молча не стартовавший бот.
+    """
     conn = connect(path)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version ("
         " version INTEGER PRIMARY KEY,"
         " applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
     )
-    applied = {row[0] for row in conn.execute("SELECT version FROM schema_version")}
     for file in sorted(MIGRATIONS_DIR.glob("*.sql")):
         version = int(file.name.split("_", 1)[0])
-        if version in applied:
-            continue
-        # executescript сам завершает открытую транзакцию, поэтому оборачивать
-        # его в BEGIN нельзя. Миграции пишутся идемпотентными (IF NOT EXISTS),
-        # и прерванный посередине запуск просто повторяется при следующем старте.
-        conn.executescript(file.read_text(encoding="utf-8"))
-        conn.execute("INSERT INTO schema_version(version) VALUES (?)", (version,))
+        for statement in split_statements(file.read_text(encoding="utf-8")):
+            try:
+                conn.execute(statement)
+            except sqlite3.Error as error:
+                _report_schema_failure(file.name, statement, error, path)
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version(version) VALUES (?)", (version,)
+        )
     row = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version").fetchone()
     return int(row[0])
+
+
+def _report_schema_failure(
+    file_name: str, statement: str, error: Exception, path: str | Path | None
+) -> None:
+    """Запись владельцу о непринятом операторе. Журнал пишет и в лог тоже."""
+    message = SCHEMA_FAILED.format(
+        file=file_name, headline=_headline(statement), error=error
+    )
+    # Импорт здесь, а не наверху: audit стоит на db, наверху вышло бы кольцо.
+    try:
+        from core import audit
+
+        audit.log("schema", None, message, level="error", path=path)
+    except Exception:  # журнал не имеет права остановить запуск
+        logger.error(message)
 
 
 class ClientRepo:
@@ -162,6 +274,25 @@ class ClientRepo:
             list(values.values()),
         )
         return int(cursor.lastrowid or 0)
+
+    def insert_once(self, table: str, **values: Any) -> int | None:
+        """Добавляет строку, если уникальный индекс этого не запрещает.
+
+        Возвращает rowid или None, если такая строка уже есть. Проверка и
+        вставка это один оператор: два одновременных вызова не могут оба
+        решить, что строки нет, и оба вставить. Сравните с next_invoice_number:
+        ручной BEGIN тут невозможен, соединение одно на всех.
+        """
+        table = self._table(table)
+        values = {"client_id": self._client_id, **values}
+        columns = [_check_column(name) for name in values]
+        placeholders = ", ".join("?" for _ in columns)
+        cursor = self._conn.execute(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
+            " ON CONFLICT DO NOTHING",
+            list(values.values()),
+        )
+        return int(cursor.lastrowid or 0) if cursor.rowcount else None
 
     def upsert(self, table: str, keys: dict[str, Any], **values: Any) -> None:
         """Вставляет или обновляет строку по ключу (client_id всегда в ключе)."""
@@ -381,6 +512,23 @@ class AdminRepo:
         )
         return int(cursor.lastrowid or 0)
 
+    def add_task_once(
+        self, kind: str, payload: str = "{}", next_run_at: str | None = None
+    ) -> int | None:
+        """То же самое, но молча пропускает повтор уже стоящей задачи.
+
+        None означает «такая задача уже в очереди или прямо сейчас идёт».
+        Отбор делает уникальный индекс по (клиент, вид, payload) среди
+        незавершённых задач, а не запрос перед вставкой: запрос и вставка
+        двумя шагами это гонка, хендлеры выполняются одновременно.
+        """
+        cursor = self._conn.execute(
+            "INSERT INTO tasks (client_id, kind, payload, next_run_at)"
+            " VALUES (NULL, ?, ?, ?) ON CONFLICT DO NOTHING",
+            (kind, payload, next_run_at),
+        )
+        return int(cursor.lastrowid or 0) if cursor.rowcount else None
+
     def task(self, task_id: int) -> sqlite3.Row | None:
         return self._conn.execute(
             "SELECT * FROM tasks WHERE id = ?", (int(task_id),)
@@ -537,11 +685,25 @@ class AdminRepo:
             )
         )
 
-    def start_trial(self, seller_id: str, module: str) -> bool:
-        """Отмечает начало пробного периода. False - он уже был."""
+    def start_trial(self, seller_id: str, module: str, limit: int = 1) -> bool:
+        """Отмечает начало пробного периода. False - лимит выбран или он уже был.
+
+        Квота «столько модулей на кабинет» проверяется тем же оператором,
+        который вставляет строку, а не отдельным чтением перед ним. Правило,
+        проверенное отдельно от записи, правилом не является: два
+        одновременных нажатия на разные модули оба прочитали бы ноль и оба
+        вставили бы строку, и кабинет получил бы два модуля бесплатно.
+
+        Одного оператора здесь достаточно, замок не нужен: SQLite выполняет
+        его целиком, и rowcount сам отвечает, дали или нет. Первичный ключ
+        (seller_id, module) закрывает только повтор того же модуля, поэтому
+        условие по количеству стоит внутри запроса.
+        """
         cursor = self._conn.execute(
-            "INSERT OR IGNORE INTO trials (seller_id, module) VALUES (?, ?)",
-            (str(seller_id), module),
+            "INSERT INTO trials (seller_id, module)"
+            " SELECT ?, ? WHERE (SELECT COUNT(*) FROM trials WHERE seller_id = ?) < ?"
+            " ON CONFLICT DO NOTHING",
+            (str(seller_id), module, str(seller_id), int(limit)),
         )
         return bool(cursor.rowcount)
 

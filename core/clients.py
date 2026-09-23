@@ -128,6 +128,10 @@ class Connected:
     missing: tuple[str, ...] = ()
     replaced: bool = False
     resumed: int = 0
+    # Пробный запрос к WB делается не всегда: бюджет на неподключённых общий
+    # и маленький. probed=False означает «ключ разобран, но связь не проверена»,
+    # и обещать клиенту проверку тогда нельзя, её надо доделать в фоне.
+    probed: bool = True
 
 
 def connected(client_id: int, *, path: str | Path | None = None) -> bool:
@@ -164,7 +168,11 @@ async def connect(
         raise ConsentRequired()
 
     moment = _now(now)
-    info = await wbapi.check_token(raw, http=http, path=path, client_id=client_id)
+    # check_token_live, а не check_token: нужен не только разбор ключа, но и
+    # ответ на вопрос, дошло ли дело до пробного запроса. От этого зависит,
+    # что бот пообещает клиенту.
+    check = await wbapi.check_token_live(raw, http=http, path=path, client_id=client_id)
+    info = check.info
     if info.is_expired(moment):
         raise TokenExpired()
 
@@ -201,6 +209,7 @@ async def connect(
         missing=missing_categories(info),
         replaced=was,
         resumed=resumed,
+        probed=check.probed,
     )
 
 

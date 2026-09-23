@@ -7,6 +7,12 @@
 
 Цен и сроков в этом файле нет ни одного: всё приходит из core.config, а
 состояние доступа из core.access.
+
+Разметку в сообщениях ставит только бот. Название модуля и строка «что
+входит» приходят из конфига, состояние доступа из базы, и всё это уезжает
+в сообщение с `ParseMode.HTML`. Поэтому подстановка идёт через общий
+`bot.texts.fill`, а готовый кусок помечается `Safe`: граница стоит на
+подстановке, а не у каждого поля.
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
+from bot.texts import Safe, fill
 from core import access, config, db, scheduler
 
 logger = logging.getLogger(__name__)
@@ -48,6 +55,11 @@ BUY_SOON = (
     "Напишите владельцу командой <code>/paysupport</code>, и счёт выставят вручную."
 )
 
+NOT_FOR_SALE = (
+    "Этот модуль пока не продаётся. Посмотрите, что есть сейчас: "
+    "команда <code>/tariffs</code>."
+)
+
 TRIAL_PICK = "Выберите один модуль: он будет работать бесплатно {days} дн."
 
 TRIAL_DENIED = {
@@ -61,6 +73,10 @@ TRIAL_DENIED = {
         "Посмотрите цены командой <code>/tariffs</code>."
     ),
     "not_sold": "Этот модуль пока не продаётся.",
+    "package": (
+        "Пакет «Всё сразу» на пробу не даём: выберите один модуль, "
+        "и он будет работать бесплатно несколько дней."
+    ),
     "too_many": "Пробный период даётся только на один модуль.",
 }
 
@@ -112,15 +128,30 @@ def local_date(moment: datetime | None) -> str:
     return moment.astimezone(scheduler.tz()).strftime("%d.%m.%Y")
 
 
-def price_line(module: str) -> str:
+def price_line(module: str) -> Safe:
     """Цены по всем периодам конфига, со скидками оттуда же."""
     parts = []
     for months in config.periods():
-        amount = rubles(config.price_decimal(module, months))
+        line = fill(
+            "{months} мес. {amount}",
+            months=months,
+            amount=rubles(config.price_decimal(module, months)),
+        )
         percent = config.discount_percent(months)
-        tail = f" (скидка {percent}%)" if percent > 0 else ""
-        parts.append(f"{months} мес. {amount}{tail}")
-    return "\n".join(parts)
+        if percent > 0:
+            line = fill("{line} (скидка {percent}%)", line=line, percent=percent)
+        parts.append(line)
+    return Safe("\n".join(parts))
+
+
+def for_sale(module: str) -> bool:
+    """Можно ли купить этот модуль. Скрытые не продаются.
+
+    Проверять это обязана функция, а не клавиатура: callback_data приходит от
+    клиента, и кнопку с любым текстом он пришлёт сам. Диалог счёта зовёт эту
+    же функцию, а не полагается на то, что кнопку нарисовали только у видимых.
+    """
+    return str(module) in config.visible_modules()
 
 
 def what_it_gives(module: str) -> str:
@@ -131,6 +162,11 @@ def what_it_gives(module: str) -> str:
     """
     info = config.modules().get(module)
     return (info.gives if info else "").strip()
+
+
+def denied_text(reason: str) -> Safe:
+    """Почему пробный период не дали. Тексты наши, выбирается только который."""
+    return Safe(TRIAL_DENIED.get(reason, TRIAL_DENIED["not_sold"]))
 
 
 def state_words(item: access.Access) -> str:
@@ -144,7 +180,7 @@ def tariffs_text(
     *,
     now: datetime | None = None,
     path: str | Path | None = None,
-) -> str:
+) -> Safe:
     """Витрина: только видимые модули, цены из конфига и текущий статус клиента."""
     current: dict[str, access.Access] = {}
     if client_id is not None:
@@ -153,30 +189,29 @@ def tariffs_text(
         }
     blocks = [HEAD]
     for name, info in config.visible_modules().items():
-        title = info.title or name
-        block = [f"<b>{title}</b>", price_line(name)]
+        block = [fill("<b>{title}</b>", title=info.title or name), price_line(name)]
         gives = what_it_gives(name)
         if gives:
-            block.append(f"Что входит: {gives}.")
+            block.append(fill("Что входит: {gives}.", gives=gives))
         item = current.get(name)
         if item is not None:
-            block.append(f"Сейчас: {state_words(item)}.")
-        blocks.append("\n".join(block))
+            block.append(fill("Сейчас: {state}.", state=state_words(item)))
+        blocks.append(Safe("\n".join(block)))
     blocks.append(FOOT)
     blocks.append(TRIAL_INVITE)
-    return "\n\n".join(blocks)
+    return Safe("\n\n".join(blocks))
 
 
-def offer_text(module: str) -> str:
+def offer_text(module: str) -> Safe:
     """Ответ платной команды без доступа: что даёт модуль и сколько стоит."""
     info = config.modules().get(module)
     title = (info.title if info and info.title else module) or module
-    lines = [f"🔒 Модуль <b>{title}</b> пока не подключён.", ""]
+    lines = [fill("🔒 Модуль <b>{title}</b> пока не подключён.", title=title), ""]
     gives = what_it_gives(module)
     if gives:
-        lines += [f"Что он даёт: {gives}.", ""]
+        lines += [fill("Что он даёт: {gives}.", gives=gives), ""]
     lines += [price_line(module), "", TRIAL_INVITE]
-    return "\n".join(lines)
+    return Safe("\n".join(lines))
 
 
 def offer_keyboard(module: str) -> InlineKeyboardMarkup:
@@ -270,19 +305,20 @@ async def trial_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if message is None:
         return
     await message.reply_text(
-        TRIAL_PICK.format(days=access.trial_days()),
+        fill(TRIAL_PICK, days=access.trial_days()),
         parse_mode=ParseMode.HTML,
         reply_markup=trial_keyboard(),
     )
 
 
-def granted_text(item: access.Access) -> str:
+def granted_text(item: access.Access) -> Safe:
     """Сообщение о включении. Дата окончания названа обязательно."""
     info = config.modules().get(item.module)
     title = (info.title if info and info.title else item.module) or item.module
-    return (
-        f"✅ Модуль <b>{title}</b> включён.\n"
-        f"Работает до {local_date(item.until)} включительно."
+    return fill(
+        "✅ Модуль <b>{title}</b> включён.\nРаботает до {until} включительно.",
+        title=title,
+        until=local_date(item.until),
     )
 
 
@@ -297,6 +333,9 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.message.reply_text(
             tariffs_text(client_id_of(update)), parse_mode=ParseMode.HTML
         )
+        return
+    if not for_sale(module):
+        await query.message.reply_text(NOT_FOR_SALE, parse_mode=ParseMode.HTML)
         return
     dialog = buy_dialog()
     if dialog is not None:
@@ -319,8 +358,7 @@ async def trial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         granted = access.start_trial(client_id, module)
     except access.TrialDenied as denied:
         await query.message.reply_text(
-            TRIAL_DENIED.get(denied.reason, TRIAL_DENIED["not_sold"]),
-            parse_mode=ParseMode.HTML,
+            denied_text(denied.reason), parse_mode=ParseMode.HTML
         )
         return
     await query.message.reply_text(granted_text(granted), parse_mode=ParseMode.HTML)

@@ -17,7 +17,7 @@ import httpx
 
 from core import db
 from core.wbapi.client import HOSTS, WBClient, load_token, shared_session
-from core.wbapi.token import verify_token
+from core.wbapi.token import TokenInfo, verify_token
 from core.wbapi.errors import (
     WBApiError,
     WBAuthError,
@@ -78,6 +78,7 @@ async def probe_hosts(
     client_id: int | None = None,
     http: httpx.AsyncClient | None = None,
     path: str | None = None,
+    budget=None,
     sleep=None,
     clock=None,
     hosts: dict[str, str] | None = None,
@@ -91,7 +92,13 @@ async def probe_hosts(
     """
     token = load_token(client_id, path) if client_id is not None else ""
     client = WBClient(
-        client_id, token, http or shared_session(), path=path, clock=clock, sleep=sleep
+        client_id,
+        token,
+        http or shared_session(),
+        path=path,
+        budget=budget,
+        clock=clock,
+        sleep=sleep,
     )
     probes: list[HostProbe] = []
     for index, (name, host) in enumerate((hosts or HOSTS).items()):
@@ -120,34 +127,71 @@ async def probe_hosts(
     return probes
 
 
-async def check_token(
+@dataclass(frozen=True)
+class TokenCheck:
+    """Что удалось узнать о присланном токене."""
+
+    info: TokenInfo
+    probed: bool
+    status: int | None = None
+
+    @property
+    def alive(self) -> bool:
+        """Пробный запрос был и WB принял токен."""
+        return self.probed and self.status is not None and 200 <= self.status < 400
+
+
+async def check_token_live(
     raw: str,
     *,
     http: httpx.AsyncClient | None = None,
     path: str | None = None,
     client_id: int | None = None,
     host: str | None = None,
+    budget=None,
+    wait: bool = False,
     sleep=None,
     clock=None,
-):
-    """Разбирает токен и делает ровно один пробный запрос: не отозван ли он.
+) -> TokenCheck:
+    """Разбирает токен и, если бюджет позволяет, делает один пробный запрос.
 
-    Всё остальное о токене известно без сети. Запрос нужен только затем, чтобы
-    отличить живой токен от отозванного: этого из JWT не видно.
+    Разбор JWT сети не требует вообще: срок, кабинет, тип и категории видны
+    сразу. Сетевой тут ровно один запрос, и нужен он только затем, чтобы
+    отличить живой токен от отозванного.
+
+    По умолчанию проверка **не ждёт** бюджет запросов. Звать её приходится из
+    хендлера, а бот обрабатывает одно сообщение за раз: пауза в десяток секунд
+    это молчание для всех сразу, включая владельца. Бюджет занят, значит
+    probed остаётся False, и подтвердить токен придётся первой же настоящей
+    работе. wait=True можно ставить там, где ждать безопасно: в очереди.
 
     403 отказом не считается: он означает, что токен приняли, просто у него
-    нет категории для этого домена. Такой токен годится, и что именно
-    перестанет работать, скажет уже хендлер подключения.
+    нет категории для этого домена.
     """
     info = verify_token(raw)
     client = WBClient(
-        client_id, raw, http or shared_session(), path=path, clock=clock, sleep=sleep
+        client_id,
+        raw,
+        http or shared_session(),
+        path=path,
+        budget=budget,
+        clock=clock,
+        sleep=sleep,
     )
     try:
-        await client.ping(host or HOSTS["finance"])
-    except WBForbiddenError:
-        pass
-    return info
+        status = await client.ping(host or HOSTS["finance"], wait=wait)
+    except WBForbiddenError as exc:
+        return TokenCheck(info=info, probed=True, status=exc.status or 403)
+    except (WBRateLimited, WBUnavailable):
+        # Бюджет занят или WB молчит. Токен от этого не хуже, просто мы
+        # о нём ничего нового не узнали.
+        return TokenCheck(info=info, probed=False)
+    return TokenCheck(info=info, probed=True, status=status)
+
+
+async def check_token(raw: str, **kwargs) -> TokenInfo:
+    """То же самое, но отдаёт только разбор токена. Совместимая форма."""
+    return (await check_token_live(raw, **kwargs)).info
 
 
 def last_probe_calls(path: str | None = None, limit: int = 12) -> list:

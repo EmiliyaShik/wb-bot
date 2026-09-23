@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS access_log (
     at          TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_access_log_client ON access_log(client_id, at);
+-- Один платёж продлевает доступ один раз. Замок в core.access это правило уже
+-- держит, но только внутри процесса: второй процесс бота на той же базе его
+-- не видит, а правило, которое держится на «мы пока не масштабировались»,
+-- правилом не является. Уникальность в базе остаётся и без замка.
+-- Индекс в пределах клиента, как и проверка в core.access: номер счёта
+-- сквозной, а вот «trial:...» и ручные основания у клиентов свои.
+-- Только action = 'grant': строк duplicate по одному платежу бывает сколько
+-- угодно, а pause, resume и revoke идут вообще без номера платежа.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_access_log_grant_once
+    ON access_log(client_id, payment_ref)
+    WHERE action = 'grant';
 
 CREATE TABLE IF NOT EXISTS invoices (
     number        TEXT PRIMARY KEY,
@@ -227,6 +238,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state, next_run_at);
+-- Одна и та же работа одного клиента не стоит в очереди дважды. Проверять это
+-- запросом перед вставкой нельзя: хендлеры выполняются одновременно, и два
+-- нажатия подряд оба увидели бы пустую очередь. Уникальность держит база, а
+-- вставка идёт одним оператором с ON CONFLICT DO NOTHING.
+-- Задача без клиента (расписание) тоже считается: COALESCE вместо NULL нужен
+-- потому, что в уникальном индексе SQLite все NULL различны между собой.
+-- Доделанные задачи (done, failed, cancelled) в индекс не попадают: повторить
+-- вчерашний отчёт клиент имеет полное право.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_no_duplicates
+    ON tasks(COALESCE(client_id, 0), kind, payload)
+    WHERE state IN ('queued', 'running');
 
 CREATE TABLE IF NOT EXISTS api_calls (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

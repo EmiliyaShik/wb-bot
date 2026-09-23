@@ -13,6 +13,11 @@
 Второе: доступ к платному модулю проверяет `require_module`, своей проверки
 здесь нет. Без доступа клиент видит, что даёт модуль, цену и кнопку
 «Оформить», а не отказ.
+
+Разметку в сообщении ставит только бот. Заголовок отчёта и даты недель
+приходят из базы, то есть из ответа Wildberries, а сводка уходит с
+`ParseMode.HTML`. Поэтому подстановка идёт через общий `bot.texts.fill`:
+граница стоит на подстановке, а не у каждого поля.
 """
 
 from __future__ import annotations
@@ -29,7 +34,8 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from agents import finance
 from bot.handlers.tariffs import client_id_of, require_module
-from core import db
+from bot.texts import Safe, fill
+from core import db, queue
 
 logger = logging.getLogger(__name__)
 
@@ -123,38 +129,46 @@ def keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def summary_text(report: Any) -> str:
+def summary_text(report: Any) -> Safe:
     """Короткая сводка в сообщении. Всё остальное в файле."""
     if report.empty:
-        return NO_DATA
+        return Safe(NO_DATA)
 
     totals = report.totals
     period = f"{_day(report.date_from.isoformat())} - {_day(report.date_to.isoformat())}"
     lines = [
-        HEADER.format(title=report.title, period=period),
+        fill(HEADER, title=report.title, period=period),
         "",
-        f"Продажи: {_money(totals.revenue)}",
-        f"Возвраты: {_money(totals.returns_amount)}",
-        f"<b>К перечислению: {_money(totals.for_pay)}</b>",
+        fill("Продажи: {amount}", amount=_money(totals.revenue)),
+        fill("Возвраты: {amount}", amount=_money(totals.returns_amount)),
+        fill("<b>К перечислению: {amount}</b>", amount=_money(totals.for_pay)),
         "",
         "Забрал Wildberries:",
     ]
 
     last = report.weeks[-1]
     lines += [
-        f"комиссия {_money(totals.commission)} ({_percent(last.commission_percent)})",
-        f"эквайринг {_money(totals.acquiring)} ({_percent(last.acquiring_percent)})",
-        f"логистика {_money(totals.logistics)}",
-        f"хранение {_money(totals.storage)}",
-        f"приёмка {_money(totals.acceptance)}",
-        f"штрафы {_money(totals.penalties)}",
-        f"прочие удержания {_money(totals.deductions)}",
+        fill(
+            "комиссия {amount} ({percent})",
+            amount=_money(totals.commission),
+            percent=_percent(last.commission_percent),
+        ),
+        fill(
+            "эквайринг {amount} ({percent})",
+            amount=_money(totals.acquiring),
+            percent=_percent(last.acquiring_percent),
+        ),
+        fill("логистика {amount}", amount=_money(totals.logistics)),
+        fill("хранение {amount}", amount=_money(totals.storage)),
+        fill("приёмка {amount}", amount=_money(totals.acceptance)),
+        fill("штрафы {amount}", amount=_money(totals.penalties)),
+        fill("прочие удержания {amount}", amount=_money(totals.deductions)),
         "",
-        f"СПП: {_percent(last.spp)}",
-        f"Недель в отчёте: {len(report.weeks)}",
+        fill("СПП: {percent}", percent=_percent(last.spp)),
+        fill("Недель в отчёте: {count}", count=len(report.weeks)),
     ]
 
-    text = "\n".join(lines) + FILE_NOTE
+    text = Safe("\n".join(lines) + FILE_NOTE)
     # Три оговорки, и они разные: расхождение, непроверенная неделя и
     # обрезанная выгрузка. Молчать ни про одну нельзя.
     for template, weeks in (
@@ -163,8 +177,9 @@ def summary_text(report: Any) -> str:
         (UNVERIFIED, report.unverified),
     ):
         if weeks:
-            text += template.format(
-                weeks=", ".join(_day(week.date_from) for week in weeks)
+            text = Safe(
+                text
+                + fill(template, weeks=", ".join(_day(week.date_from) for week in weeks))
             )
     return text
 
@@ -205,8 +220,11 @@ async def period_chosen(
         await query.answer()
         return
 
-    finance.request_report(client_id, period, path=path)
-    await query.answer("Принято")
+    # Задача могла уже стоять: тогда честный ответ «уже считаю», а не второе
+    # «принято». Текст берётся у очереди, чтобы всплывающее окно и сообщение
+    # не рассказывали клиенту разное.
+    task = finance.request_report(client_id, period, path=path)
+    await query.answer("Принято" if task.created else queue.ALREADY_QUEUED)
     if period == "year" and query.message is not None:
         await query.message.reply_text(LONG_PERIOD)
 

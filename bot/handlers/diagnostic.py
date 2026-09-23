@@ -14,6 +14,11 @@
 Второе: доступ не проверяется вовсе, и это не упущение. Диагностика
 бесплатная, `require_module` тут не нужен. Единственное ограничение это один
 разбор на кабинет WB, и оно стоит в агенте, потому что живёт в базе.
+
+Разметку в сообщении ставит только бот. Название статьи расходов приходит
+от агента, строка «что найдут модули» из конфига, а разбор уходит с
+`ParseMode.HTML`. Подстановка одна на файл, общий `bot.texts.fill`, и
+граница стоит на ней, а не у каждого поля.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from telegram.ext import CommandHandler
 
 from agents import diagnostic
 from bot.handlers.tariffs import client_id_of, rubles
+from bot.texts import Safe, fill
 from core import db
 
 logger = logging.getLogger(__name__)
@@ -157,14 +163,18 @@ def _weeks_word(count: int) -> str:
     return f"{count} неделя" if tail == 1 else f"{count} недели"
 
 
-def leak_line(number: int, leak: diagnostic.Leak) -> str:
+def leak_line(number: int, leak: diagnostic.Leak) -> Safe:
     """Одна утечка строкой. Рубли всегда названы, проценты - если они есть."""
     if not leak.deviation:
-        return COST_LINE.format(
-            number=number, title=leak.title.capitalize(), rubles=rubles(leak.rubles)
+        return fill(
+            COST_LINE,
+            number=number,
+            title=leak.title.capitalize(),
+            rubles=rubles(leak.rubles),
         )
     template = SPP_LINE if leak.metric == "spp" else DEVIATION_LINE
-    return template.format(
+    return fill(
+        template,
         number=number,
         title=leak.title.capitalize(),
         was=_percent(leak.was),
@@ -173,21 +183,21 @@ def leak_line(number: int, leak: diagnostic.Leak) -> str:
     )
 
 
-def refusal_text(reason: str) -> str:
+def refusal_text(reason: str) -> Safe:
     """Объяснение отказа. Неизвестной причины быть не должно, но молчать нельзя."""
-    return REFUSALS.get(reason, NO_DATA)
+    return Safe(REFUSALS.get(reason, NO_DATA))
 
 
-def report_text(result: diagnostic.Diagnostic) -> str:
+def report_text(result: diagnostic.Diagnostic) -> Safe:
     """Готовое сообщение разбора: неделя, три утечки, что дадут модули."""
     if not result.ok:
         return refusal_text(result.reason)
     if not result.leaks:
-        return NO_DATA
+        return Safe(NO_DATA)
 
-    lines = [HEADER.format(days=_days(result)), ""]
+    lines = [fill(HEADER, days=_days(result)), ""]
     if result.revenue > 0:
-        lines.append(REVENUE_LINE.format(revenue=rubles(result.revenue)))
+        lines.append(fill(REVENUE_LINE, revenue=rubles(result.revenue)))
         lines.append("")
 
     if result.deviation:
@@ -196,8 +206,10 @@ def report_text(result: diagnostic.Diagnostic) -> str:
         lines.append(LEAD_QUIET)
     else:
         lines.append(
-            LEAD_YOUNG.format(
-                have=_weeks_word(result.have), needed=_weeks_word(result.needed)
+            fill(
+                LEAD_YOUNG,
+                have=_weeks_word(result.have),
+                needed=_weeks_word(result.needed),
             )
         )
     lines.append("")
@@ -208,12 +220,12 @@ def report_text(result: diagnostic.Diagnostic) -> str:
     if result.lines:
         lines.extend(["", MODULES_HEAD, ""])
         for item in result.lines:
-            lines.append(MODULE_LINE.format(title=item.title, line=item.line))
+            lines.append(fill(MODULE_LINE, title=item.title, line=item.line))
 
     lines.extend(["", FOOTER])
     if result.repeat and result.done_at:
-        lines.extend(["", REPEAT_NOTE.format(when=str(result.done_at)[:10])])
-    return "\n".join(lines)
+        lines.extend(["", fill(REPEAT_NOTE, when=str(result.done_at)[:10])])
+    return Safe("\n".join(lines))
 
 
 # --- команда -----------------------------------------------------------------

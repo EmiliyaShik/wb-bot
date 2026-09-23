@@ -108,6 +108,21 @@ class Bucket:
             self._refill(self._clock())
         self._tokens = max(0.0, self._tokens - 1.0)
 
+    def try_take(self) -> bool:
+        """Пропустить запрос, только если ждать не придётся.
+
+        Нужно там, где ожидание недопустимо: хендлер бота обрабатывает одно
+        сообщение за раз, и пауза в нём это молчание для всех сразу.
+        """
+        now = self._clock()
+        if self._not_before > now:
+            return False
+        self._refill(now)
+        if self._tokens < 1.0:
+            return False
+        self._tokens -= 1.0
+        return True
+
     def penalize(self, seconds: float) -> None:
         """WB сказал «подожди»: корзина пуста и раньше срока никто не пойдёт."""
         self._tokens = 0.0
@@ -139,6 +154,10 @@ class Budget:
 
     async def take(self, lane: str) -> None:
         await self.bucket(lane).take()
+
+    def try_take(self, lane: str) -> bool:
+        """Взять из корзины, если это бесплатно по времени. Иначе False."""
+        return self.bucket(lane).try_take()
 
     def penalize(self, lane: str, seconds: float) -> None:
         self.bucket(lane).penalize(seconds)
