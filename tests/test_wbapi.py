@@ -379,9 +379,32 @@ async def test_cards_walk_by_cursor(cabinet):
     cards = await client.cards_list(limit=2)
 
     assert [card["nmID"] for card in cards] == [1, 2, 3]
+    # Первая страница просит только limit: пустой updatedAt Wildberries
+    # разбирает как дату и отвечает 400, то есть каталог не приходит вовсе.
+    first = json.loads(seen[0].content)["settings"]["cursor"]
+    assert first == {"limit": 2}
+    assert "updatedAt" not in first and "nmID" not in first
+    # Вторая несёт курсор из ответа на первую, а не выдуманные значения.
     second = json.loads(seen[1].content)["settings"]["cursor"]
     assert second["updatedAt"] == "2026-09-01T10:00:00Z"
     assert second["nmID"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cards_stop_when_the_answer_has_no_cursor(cabinet):
+    """Полная страница без курсора это не повод просить её же ещё раз."""
+    seen: list[httpx.Request] = []
+    client = build(
+        cabinet,
+        [ok({"cards": [{"nmID": 1}, {"nmID": 2}], "cursor": {"total": 2}})]
+        + [ok({"cards": [], "cursor": {"total": 0}})] * 3,
+        seen,
+    )
+
+    cards = await client.cards_list(limit=2)
+
+    assert [card["nmID"] for card in cards] == [1, 2]
+    assert len(seen) == 1, "без курсора второй запрос повторил бы первую страницу"
 
 
 @pytest.mark.asyncio

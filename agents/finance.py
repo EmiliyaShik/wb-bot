@@ -986,5 +986,6 @@ async def report_task(task: Any, *, path: str | Path | None = None) -> FinanceRe
 
 def register_jobs() -> None:
     """Связывает виды задач с обработчиками. Зовёт сборка бота, не импорт."""
-    queue.register(TASK_KIND, report_task)
-    queue.register(COLLECT_KIND, collect_task)
+    queue.register(TASK_KIND, report_task, title="деньги за неделю")
+    # Выгрузка отчёта о реализации идёт сама по себе, её никто не просил.
+    queue.register(COLLECT_KIND, collect_task, quiet=True)

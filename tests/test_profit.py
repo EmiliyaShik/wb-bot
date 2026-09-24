@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from agents import finance, profit
 from bot.handlers import profit as handlers_profit
 from core import costs as costs_module
-from core import config, crypto, db, queue, wbapi, xlsx
+from core import audit, config, crypto, db, queue, wbapi, xlsx
 
 TODAY = date(2026, 9, 7)
 
@@ -705,6 +705,47 @@ async def test_without_content_category_the_report_keeps_the_article_number(
     # Пометки «спрашивали» не осталось: категорию токена селлер может выдать,
     # и тогда названия приедут сами.
     assert profit.names_of(cabinet, path=db_path) == {}
+    # Даже у объяснимого отказа есть след: иначе на вопрос «почему у меня нет
+    # названий» ответить нечем.
+    assert any(
+        "Контент" in record["message"]
+        for record in audit.recent(limit=10, client_id=cabinet, path=db_path)
+    )
+
+
+@pytest.mark.asyncio
+async def test_refusal_of_wildberries_does_not_look_like_a_missing_card(
+    cabinet, db_path
+):
+    """Отказ WB и удалённая карточка снаружи одинаковы, в журнале нет.
+
+    Ровно на этом бот и обжёгся: запрос каталога уходил неверным, WB отвечал
+    400, названий не было ни разу, а отчёт выглядел штатным, потому что
+    артикул вместо имени это предусмотренный случай.
+    """
+    # Успешный ответ без нужной карточки: это «карточки нет», и это тишина.
+    good, _ = counting_http({CARDS_PATH: CARDS})
+    await names_for(cabinet, db_path, [222], good)
+    quiet = audit.recent(limit=20, client_id=cabinet, path=db_path)
+    assert not [record for record in quiet if record["level"] == "error"]
+
+    # Отказ Wildberries: отчёт по-прежнему не падает, но молчания больше нет.
+    bad, seen = counting_http({CARDS_PATH: 400})
+    names = await names_for(cabinet, db_path, [999], bad)
+
+    assert names == {}
+    assert seen == [CARDS_PATH]
+    loud = [
+        record
+        for record in audit.recent(limit=20, client_id=cabinet, path=db_path)
+        if record["level"] == "error"
+    ]
+    assert loud, "отказ Wildberries обязан быть виден в журнале"
+    assert "названия товаров не получены" in loud[0]["message"]
+    assert "400" in loud[0]["message"]
+    # Артикул, о котором спросили неудачно, не помечен как «карточки нет»:
+    # иначе после починки запроса название не приехало бы никогда.
+    assert 999 not in profit.names_of(cabinet, path=db_path)
 
 
 # --- итог по кабинету ---

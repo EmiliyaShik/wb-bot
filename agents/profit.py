@@ -47,7 +47,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from agents import finance
 from core import costs as costs_module
-from core import config, db, queue, wbapi
+from core import audit, config, db, queue, wbapi
 
 logger = logging.getLogger(__name__)
 
@@ -431,6 +431,12 @@ async def collect_names(
     Отсутствие названий отчёт не роняет. Нет категории «Контент», WB не
     отвечает - в книге останется артикул, и это честнее выдуманного имени.
     Наружу летит только 401: его разбирает `core.clients`.
+
+    Но отказ Wildberries и удалённая карточка это разные вещи, и снаружи они
+    выглядят одинаково: артикул вместо имени. Поэтому отказ пишется в журнал.
+    Ровно на этом проект и обжёгся: запрос каталога был собран неверно, WB
+    отвечал 400, а отчёт выглядел штатным, потому что пустое имя это
+    предусмотренный случай.
     """
     wanted = sorted({int(value) for value in nm_ids if value is not None})
     known = names_of(client_id, path=path)
@@ -444,9 +450,26 @@ async def collect_names(
         logger.info(
             "у клиента %s нет категории «Контент», названия товаров пропущены", client_id
         )
+        # Это единственный отказ, у которого есть понятная причина на стороне
+        # клиента, и он не ошибка бота. В журнал всё равно: иначе «почему у
+        # меня нет названий» не на что ответить.
+        audit.log(
+            "profit",
+            client_id,
+            "названия товаров не получены: у ключа нет категории «Контент»",
+            level="warning",
+            path=path,
+        )
         return {nm_id: known[nm_id] for nm_id in wanted if nm_id in known}
     except (wbapi.WBUnavailable, wbapi.WBRateLimited, wbapi.WBApiError) as error:
         logger.warning("названия товаров клиента %s не получены: %s", client_id, error)
+        audit.log(
+            "profit",
+            client_id,
+            f"названия товаров не получены, Wildberries отказал: {error}",
+            level="error",
+            path=path,
+        )
         return {nm_id: known[nm_id] for nm_id in wanted if nm_id in known}
     remember_names(client_id, cards, asked=wanted, path=path)
     return names_of(client_id, wanted, path=path)
@@ -1397,4 +1420,4 @@ async def report_task(task: Any, *, path: str | Path | None = None) -> ProfitRep
 
 def register_jobs() -> None:
     """Связывает вид задачи с обработчиком. Зовёт сборка бота, не импорт."""
-    queue.register(TASK_KIND, report_task)
+    queue.register(TASK_KIND, report_task, title="прибыль по артикулам")

@@ -13,7 +13,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core import audit, config, db, queue
-from core.wbapi import WBAuthError, WBForbiddenError, WBRateLimited, WBUnavailable
+from core.wbapi import (
+    WBApiError,
+    WBAuthError,
+    WBForbiddenError,
+    WBRateLimited,
+    WBUnavailable,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -429,3 +435,144 @@ def test_a_daily_job_without_a_client_is_not_doubled_either(db_path):
     assert int(second) == int(first) and second.created is False
     assert other_day.created is True
     assert len(_tasks(db_path)) == 2
+
+
+# --- сорвавшаяся задача больше не молчит ---------------------------------------
+#
+# Поломка была живая: селлер нажал «Внести себестоимость», задача упала на
+# неверно собранном запросе к Wildberries, и человек остался с мыслью, что
+# кнопка не работает. Проверяется не текст ради текста, а три разных случая:
+# заказанная работа, незаказанная и поток сбоев подряд.
+
+
+def _client_said(messages, client):
+    return [text for whom, text in messages if whom == client]
+
+
+def _owner_said(messages):
+    return [text for whom, text in messages if whom is None]
+
+
+@pytest.mark.asyncio
+async def test_failed_work_the_client_asked_for_comes_back_in_words(db_path, client):
+    """Клиент узнаёт, что именно не собралось, и код ошибки ему не показывают."""
+    messages = []
+    queue.set_notifier(lambda client_id, text: messages.append((client_id, text)))
+
+    async def handler(task):
+        raise WBApiError(
+            "Wildberries вернул ошибку 400. request body could not be decoded",
+            status=400,
+        )
+
+    queue.register("costs_template", handler, title="шаблон себестоимости")
+    task_id = queue.enqueue(client, "costs_template", path=db_path)
+
+    await queue.run_once(path=db_path)
+
+    assert db.admin_repo(db_path).task(task_id)["state"] == queue.FAILED
+    told = _client_said(messages, client)
+    assert len(told) == 2, "принято и сорвалось"
+    assert "шаблон себестоимости" in told[-1]
+    assert _without_error_codes(told[-1]), told[-1]
+    assert "request body" not in told[-1], "чужой текст Wildberries селлеру не нужен"
+    # А подробности достались владельцу, как и было обещано в сообщении.
+    journal = audit.recent(limit=10, level="error", path=db_path)
+    assert any("request body" in record["message"] for record in journal)
+
+
+@pytest.mark.asyncio
+async def test_a_task_without_a_handler_no_longer_dies_in_silence(db_path, client):
+    """Забытая регистрация это тоже сломанная кнопка, и она должна быть видна."""
+    messages = []
+    queue.set_notifier(lambda client_id, text: messages.append((client_id, text)))
+    task_id = queue.enqueue(client, "costs_template", notify=False, path=db_path)
+
+    await queue.run_once(path=db_path)
+
+    assert db.admin_repo(db_path).task(task_id)["state"] == queue.FAILED
+    assert len(_client_said(messages, client)) == 1
+    assert any(
+        "обработчик не зарегистрирован" in record["message"]
+        for record in audit.recent(limit=10, level="error", path=db_path)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_night_collector_does_not_wake_the_client(db_path, client):
+    """Сбор данных клиент не заказывал: про его сбой говорят владельцу."""
+    messages = []
+    queue.set_notifier(lambda client_id, text: messages.append((client_id, text)))
+
+    async def handler(task):
+        raise WBApiError("Wildberries вернул ошибку 400", status=400)
+
+    queue.register("rnp_collect_client", handler, quiet=True)
+    task_id = queue.enqueue(client, "rnp_collect_client", notify=False, path=db_path)
+
+    await queue.run_once(path=db_path)
+
+    assert db.admin_repo(db_path).task(task_id)["state"] == queue.FAILED
+    assert _client_said(messages, client) == []
+    owner = _owner_said(messages)
+    assert len(owner) == 1
+    assert "rnp_collect_client" in owner[0]
+    assert f"#{int(task_id)}" in owner[0]
+    # И журнал на месте: владелец увидит подробности, а не только сам факт.
+    assert any(
+        "rnp_collect_client" in record["message"]
+        for record in audit.recent(limit=10, level="error", path=db_path)
+    )
+
+
+@pytest.mark.asyncio
+async def test_ten_broken_tasks_do_not_turn_into_ten_messages(db_path, client):
+    """Десять писем подряд это не забота, а наказание."""
+    messages = []
+    queue.set_notifier(lambda client_id, text: messages.append((client_id, text)))
+
+    async def handler(task):
+        raise RuntimeError("делить на ноль нельзя")
+
+    queue.register("finance_report", handler, title="деньги за неделю")
+    for number in range(10):
+        queue.enqueue(
+            client, "finance_report", {"period": f"2026-W{number}"},
+            notify=False, path=db_path,
+        )
+
+    for _ in range(10):
+        assert await queue.run_once(path=db_path) is True
+
+    assert len(_client_said(messages, client)) == 1
+    # Промолчали, но не забыли: каждый сбой лежит в журнале.
+    journal = audit.recent(limit=50, level="error", path=db_path)
+    assert len([r for r in journal if "finance_report" in r["message"]]) == 10
+    assert len(db.admin_repo(db_path).tasks(state=queue.FAILED, limit=50)) == 10
+
+
+@pytest.mark.asyncio
+async def test_a_silent_notifier_does_not_become_a_second_accident(db_path, client):
+    """Телеграм молчит, а очередь работает дальше: авария остаётся одна."""
+
+    def broken_notifier(client_id, text):
+        raise RuntimeError("телеграм не отвечает")
+
+    queue.set_notifier(broken_notifier)
+
+    async def handler(task):
+        raise WBApiError("Wildberries вернул ошибку 400", status=400)
+
+    queue.register("costs_template", handler, title="шаблон себестоимости")
+    task_id = queue.enqueue(client, "costs_template", notify=False, path=db_path)
+
+    assert await queue.run_once(path=db_path) is True
+    assert db.admin_repo(db_path).task(task_id)["state"] == queue.FAILED
+
+
+def test_the_pause_between_messages_comes_from_the_config(db_path, monkeypatch):
+    monkeypatch.setattr(config, "settings", lambda: {"queue": {"notice_gap_sec": 60}})
+    assert queue.notice_gap_sec() == 60.0
+
+    monkeypatch.setattr(config, "settings", lambda: {"queue": {"notice_gap_sec": "нет"}})
+    assert queue.notice_gap_sec() == 900.0

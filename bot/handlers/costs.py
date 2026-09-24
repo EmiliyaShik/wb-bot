@@ -315,7 +315,9 @@ def register(app, *, path: str | Path | None = None) -> None:
     """Сам себя регистрирует: bot/app.py никто не трогает."""
     # Единственное место, где задача попадает в очередь: импорт модуля сам
     # по себе ничего не регистрирует.
-    queue.register(costs.TASK_KIND, costs.template_task)
+    queue.register(
+        costs.TASK_KIND, costs.template_task, title="шаблон себестоимости"
+    )
     costs.set_sender(make_sender(app, path))
     # Путь к базе передаётся так же, как у остальных хендлеров: без этого шва
     # команда в тестах молча ушла бы в боевую базу.

@@ -912,11 +912,17 @@ class WBClient:
     ) -> list[dict]:
         """Карточки для шаблона себестоимости. Курсор updatedAt плюс nmID.
 
-        Алгоритм из документации: повторять, пока total в ответе не станет
-        меньше запрошенного limit.
+        Алгоритм из документации: первая страница просит только limit, а
+        updatedAt и nmID берутся из курсора предыдущего ответа. Повторять,
+        пока total в ответе не станет меньше запрошенного limit.
+
+        Пустых updatedAt и нулевого nmID в первом запросе быть не должно:
+        Wildberries разбирает updatedAt как дату и на пустую строку отвечает
+        400, то есть каталог не приходит вовсе. Отсюда и форма курсора: поля
+        появляются только тогда, когда их назвал сам WB.
         """
         found: list[dict] = []
-        cursor: dict[str, Any] = {"limit": int(limit), "updatedAt": "", "nmID": 0}
+        cursor: dict[str, Any] = {"limit": int(limit)}
         for _ in range(max_pages):
             body = {
                 "settings": {
@@ -932,11 +938,13 @@ class WBClient:
             total = int((answer or {}).get("total", len(page)))
             if total < int(limit) or not page:
                 break
-            cursor = {
-                "limit": int(limit),
-                "updatedAt": (answer or {}).get("updatedAt", ""),
-                "nmID": (answer or {}).get("nmID", 0),
-            }
+            updated_at = str((answer or {}).get("updatedAt") or "")
+            nm_id = (answer or {}).get("nmID")
+            if not updated_at or nm_id is None:
+                # Курсора в ответе нет, а страница полная: следующий запрос
+                # без курсора вернул бы ту же самую страницу, и так до потолка.
+                break
+            cursor = {"limit": int(limit), "updatedAt": updated_at, "nmID": int(nm_id)}
         return found
 
 

@@ -715,5 +715,7 @@ def register_jobs() -> None:
     остаётся здесь и идёт у всех подключённых кабинетов.
     """
     scheduler.register_daily(COLLECT_ALL, fan_out_collect)
-    queue.register(COLLECT_ONE, collect_client)
-    queue.register(REPORT_ONE, report_client)
+    queue.register(COLLECT_ONE, collect_client, quiet=True)
+    # Суточный план-факт ставит и расписание, и сам клиент командой. Молчать
+    # о его сбое нельзя: в обоих случаях селлер ждёт этот разбор утром.
+    queue.register(REPORT_ONE, report_client, title="план-факт")

@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MODULE",
     "TASK_KIND",
+    "CLEANUP",
     "PERIODS",
     "PERIOD_TITLES",
     "TOP_SIZE",
@@ -72,6 +73,7 @@ __all__ = [
     "NO_CATEGORY",
     "NO_JEM",
     "UNAVAILABLE",
+    "NO_CABINET",
     "VISIBILITY",
     "TO_CART",
     "TO_ORDER",
@@ -90,6 +92,10 @@ __all__ = [
     "min_orders",
     "coverage",
     "daily_articles",
+    "history_days",
+    "history_since",
+    "history_trouble",
+    "cleanup",
     "windows",
     "visibility_rows",
     "collect_visibility",
@@ -108,6 +114,15 @@ MODULE = "funnel"
 # Вид задачи один: собрать видимость (если она есть) и отдать отчёт. Суточного
 # сбора у этого агента нет намеренно, его делает план-факт.
 TASK_KIND = "funnel_report"
+
+# Работа расписания одна и в Wildberries не ходит: убрать суточную историю
+# глубже срока хранения. Она живёт здесь, а не у плана-факта, потому что
+# глубина нужна именно воронке: план-факт читает текущий месяц, а воронка
+# сравнивает квартал с кварталом.
+CLEANUP = "funnel_cleanup"
+
+# Сколько суток храним суточную историю, если в config.toml про это молчат.
+HISTORY_DAYS_DEFAULT = 400
 
 # Периоды те же по смыслу, что у соседних отчётов. Года здесь нет: суточную
 # историю бот копит сам, и год её набирается только у давних кабинетов, а
@@ -130,6 +145,7 @@ OK = "ok"
 NO_CATEGORY = "no_category"      # у токена нет категории «Аналитика»
 NO_JEM = "no_jem"                # категория есть, а подписки Джем нет
 UNAVAILABLE = "unavailable"      # Wildberries не ответил
+NO_CABINET = "no_cabinet"        # кабинет ещё не подключён, токена нет вовсе
 
 # Этапы. Первый необязательный, три остальных есть у всех.
 VISIBILITY = "visibility"
@@ -239,6 +255,20 @@ def daily_articles() -> int:
         return int(_section().get("daily_articles", 200))
     except (TypeError, ValueError):
         return 200
+
+
+def history_days() -> int:
+    """Срок хранения суточной истории в днях. Число из `config.toml`.
+
+    Секция `[storage]`, общая с рекламой: срок один и тот же, а два числа с
+    одним смыслом разошлись бы в первый же раз. Ноль и меньше значат «не
+    чистить».
+    """
+    try:
+        section = config.settings().get("storage") or {}
+        return int(section.get("daily_history_days", HISTORY_DAYS_DEFAULT))
+    except (KeyError, TypeError, ValueError, OSError):
+        return HISTORY_DAYS_DEFAULT
 
 
 # --- чистые расчёты ----------------------------------------------------------
@@ -657,6 +687,13 @@ async def collect_visibility(
     keys = {"date_from": date_from.isoformat(), "date_to": date_to.isoformat()}
     for nm_id, values in visibility_rows(items).items():
         repo.upsert("funnel_visibility", {**keys, "nm_id": nm_id}, updated_at=stamp, **values)
+    # Видимость это срез, а не история: Wildberries отдаёт её средней за
+    # запрошенный период, и прошлый срез уже ни с чем не сравнивается. Границы
+    # периода входят в ключ, а период считается от вчера и каждый день другой,
+    # поэтому без уборки каждый /funnel оставлял бы в таблице новый набор строк
+    # навсегда. Наборы, кончающиеся раньше нынешнего, уходят; наборы с тем же
+    # последним днём остаются, это неделя, месяц и квартал одного дня.
+    repo.delete_before("funnel_visibility", "date_to", date_to.isoformat())
     return OK
 
 
@@ -698,18 +735,18 @@ def _collected(rows: Iterable[Any]) -> list[Any]:
     return [row for row in rows if row["raw"] is not None]
 
 
-def _since_of(rows: Iterable[Any]) -> date | None:
-    """Первый день среди собранных суток."""
-    found: str | None = None
-    for row in rows:
-        stamp = str(row["date"])[:10]
-        if found is None or stamp < found:
-            found = stamp
-    if found is None:
-        return None
+def _first_collected(repo: Any) -> date | None:
+    """Первый день среди собранных суток. Считает база, а не Python.
+
+    Признак собранных суток тот же самый: непустая колонка `raw`. Читать ради
+    одной даты всю историю кабинета нельзя, поэтому за наименьшей датой идёт
+    отдельный запрос: база проходит по индексу и останавливается на первой
+    подходящей строке.
+    """
+    raw = repo.first_value("nm_daily", "date", not_null="raw")
     try:
-        return date.fromisoformat(found)
-    except ValueError:
+        return date.fromisoformat(str(raw)[:10])
+    except (TypeError, ValueError):
         return None
 
 
@@ -719,7 +756,63 @@ def history_since(client_id: int, *, path: str | Path | None = None) -> date | N
     Нужна задаче очереди до сборки отчёта: по этому дню считаются границы
     периода, а по границам спрашивается видимость.
     """
-    return _since_of(_collected(db.repo(client_id, path).rows("nm_daily")))
+    return _first_collected(db.repo(client_id, path))
+
+
+def history_trouble(
+    client_id: int,
+    *,
+    http: Any = None,
+    path: str | Path | None = None,
+) -> str:
+    """Появится ли суточная история вообще. Пусто - появится, надо подождать.
+
+    Суточную воронку копит сбор плана-факта, а он требует категории токена
+    «Аналитика». Без неё `nm_daily` не наполнится никогда, и обещание «через
+    пару дней сравнение появится» это неправда, которую клиент будет слушать
+    месяцами. Проверка стоит здесь, а не в хендлере: про категории токена
+    знает агент, а хендлер знает слова.
+
+    В Wildberries отсюда не ходят: категории записаны в самом токене, и
+    читаются они без сети. Отсутствие токена это не отказ Wildberries, поэтому
+    ловится отдельно и модули на паузу не ставит: клиенту просто ещё нечего
+    показывать.
+    """
+    try:
+        client = wbapi.get_wb_client(client_id, http=http, path=path)
+    except wbapi.WBTokenMissing:
+        return NO_CABINET
+    except wbapi.WBError:  # токен есть, а разобрать его не вышло
+        logger.exception("токен клиента %s не прочитался", client_id)
+        return ""
+    return "" if client.has_category("analytics") else NO_CATEGORY
+
+
+def cleanup(task: Any = None, *, path: str | Path | None = None) -> int:
+    """Убирает суточную историю глубже срока хранения. Возвращает число строк.
+
+    В Wildberries отсюда не ходят: это работа по базе. Чистятся обе таблицы,
+    которые копятся сами: суточная воронка с остатками и наборы видимости,
+    если какой-то из них остался от кабинета, который давно не спрашивал
+    отчёт.
+    """
+    days = history_days()
+    if days <= 0:
+        return 0
+    today = _payload_date(getattr(task, "payload", None) or {}) or datetime.now(
+        scheduler.tz()
+    ).date()
+    edge = (today - timedelta(days=days)).isoformat()
+    removed = 0
+    for row in db.admin_repo(path).all_clients():
+        client_id = int(row["id"])
+        try:
+            repo = db.repo(client_id, path)
+            removed += repo.delete_before("nm_daily", "date", edge)
+            removed += repo.delete_before("funnel_visibility", "date_to", edge)
+        except Exception:  # noqa: BLE001 - один клиент не ломает обход
+            logger.exception("не удалось почистить историю клиента %s", client_id)
+    return removed
 
 
 def build(
@@ -738,14 +831,20 @@ def build(
     if period not in PERIODS:
         raise ValueError(f"неизвестный период: {period}")
     repo = db.repo(client_id, path)
-    # Таблица читается целиком и один раз, а не по запросу на каждый день
-    # периода: у квартала это были бы сто восемьдесят запросов ради одного и
-    # того же среза. Границы периода зависят от накопленной истории, поэтому
-    # строки сначала читаются, и только потом считаются границы.
-    rows = _collected(repo.rows("nm_daily"))
-    since = _since_of(rows)
+    # Границы периода зависят от накопленной истории, поэтому сначала
+    # спрашивается её первый день, и только потом читаются строки. Читаются
+    # они одним запросом на оба периода сразу, нынешний и прошлый: ни по
+    # запросу на каждый день (у квартала это сто восемьдесят запросов ради
+    # одного среза), ни всей таблицей (у кабинета за год это десятки тысяч
+    # строк, а sqlite3 живёт в одном процессе с ботом).
+    since = _first_collected(repo)
     date_from, date_to, past_from, past_to, span, shortened = windows(
         period, today=today, since=since
+    )
+    rows = _collected(
+        repo.rows_between(
+            "nm_daily", "date", past_from.isoformat(), date_to.isoformat()
+        )
     )
 
     now_slots: dict[int, dict[str, int]] = {}
@@ -1122,6 +1221,11 @@ async def report_task(task: Any, *, path: str | Path | None = None) -> FunnelRep
         trouble = await collect_visibility(
             client_id, date_from, date_to, (past_from, past_to), path=path
         )
+    else:
+        # Истории нет. Она либо ещё не накопилась, либо не накопится никогда:
+        # без категории токена «Аналитика» суточную воронку забрать нечем.
+        # Разницу клиент обязан узнать сразу, а не ждать вечно.
+        trouble = history_trouble(client_id, path=path)
     report = build(
         client_id,
         period,
@@ -1138,9 +1242,12 @@ async def report_task(task: Any, *, path: str | Path | None = None) -> FunnelRep
 
 
 def register_jobs() -> None:
-    """Своя задача одна. Суточного сбора здесь нет: его делает план-факт.
+    """Задача клиента и утренняя чистка. Суточного сбора здесь нет: он у
+    плана-факта.
 
     Второй сбор суточной воронки означал бы вторую пачку запросов к
     Wildberries у каждого клиента каждый день, а данные там ровно те же.
+    Чистка это не сбор: она в Wildberries не ходит и работает по базе.
     """
-    queue.register(TASK_KIND, report_task)
+    queue.register(TASK_KIND, report_task, title="разбор воронки")
+    scheduler.register_daily(CLEANUP, cleanup)

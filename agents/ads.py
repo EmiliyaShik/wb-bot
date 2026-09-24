@@ -61,6 +61,7 @@ __all__ = [
     "TASK_KIND",
     "COLLECT_ALL",
     "COLLECT_ONE",
+    "CLEANUP",
     "PERIODS",
     "TOP_SIZE",
     "TOLERANCE",
@@ -83,6 +84,8 @@ __all__ = [
     "set_target_drr",
     "default_target_drr",
     "collect_days",
+    "history_days",
+    "cleanup",
     "campaign_days",
     "campaign_articles",
     "upd_rows",
@@ -106,6 +109,10 @@ MODULE = "ads"
 TASK_KIND = "ads_report"
 COLLECT_ALL = "ads_collect"
 COLLECT_ONE = "ads_collect_client"
+# Третья работа расписания: убрать суточную рекламу глубже срока хранения.
+# Данные копятся у всех подключённых кабинетов каждый день и независимо от
+# подписки, а удалять их до сих пор было некому.
+CLEANUP = "ads_cleanup"
 
 # Периоды те же, что у соседних отчётов: селлер не должен запоминать, что в
 # рекламе кнопки другие.
@@ -121,6 +128,9 @@ TOLERANCE = Decimal("1")
 
 # Сколько суток забираем за один заход, если в config.toml про это молчат.
 COLLECT_DAYS_DEFAULT = 7
+
+# Сколько суток храним собранную рекламу, если в config.toml про это молчат.
+HISTORY_DAYS_DEFAULT = 400
 
 # Целевой ДРР по умолчанию, если в config.toml его нет.
 TARGET_DRR_DEFAULT = Decimal("15")
@@ -235,6 +245,22 @@ def collect_days() -> int:
         return max(1, int(section.get("collect_days", COLLECT_DAYS_DEFAULT)))
     except (KeyError, TypeError, ValueError, OSError):
         return COLLECT_DAYS_DEFAULT
+
+
+def history_days() -> int:
+    """Срок хранения суточной рекламы в днях. Число из `config.toml`.
+
+    Секция `[storage]`, а не `[ads]`: тот же срок держит суточную воронку, и
+    два числа с одним смыслом разошлись бы в первый же раз. С
+    `[access] retention_days` это не одно и то же: там про данные клиента,
+    который ушёл совсем, а тут про глубину истории у работающего кабинета.
+    Ноль и меньше значат «не чистить».
+    """
+    try:
+        section = config.settings().get("storage") or {}
+        return int(section.get("daily_history_days", HISTORY_DAYS_DEFAULT))
+    except (KeyError, TypeError, ValueError, OSError):
+        return HISTORY_DAYS_DEFAULT
 
 
 def target_drr(client_id: int, *, path: str | Path | None = None) -> Decimal:
@@ -362,19 +388,36 @@ def upd_rows(records: Iterable[Mapping[str, Any]], fallback: date) -> list[dict]
     поля нельзя: тогда фактический расход занизился бы, и бот сам себе
     нарисовал бы расхождение, которого нет. Такая запись кладётся на
     последний день окна, и об этом написано на листе «Методология».
+
+    Номер документа тоже бывает пустым, и вот его придумать нельзя: два
+    списания по одной кампании за одни сутки без номера ничем не различаются.
+    Раньше оба получали номер ноль и схлопывались в одну строку, то есть факт
+    занижался. Теперь каждое такое списание получает свой отрицательный номер
+    по порядку внутри пары «сутки плюс кампания»: с настоящими номерами
+    Wildberries (они положительные) он не столкнётся, а хранить их по
+    отдельности позволяет. Порядковый номер придуман нами и сам по себе
+    ничего не значит; работает он только потому, что окно списаний
+    переписывается целиком, одним ответом Wildberries, а не дополняется
+    строками от прошлых заходов (см. `collect`).
     """
     found: list[dict] = []
+    nameless: dict[tuple[str, int], int] = {}
     for record in records or []:
         row = record or {}
         advert_id = _int(row.get("advertId"))
         if not advert_id:
             continue
         stamp = str(row.get("updTime") or "")[:10] or fallback.isoformat()
+        upd_num = _int(row.get("updNum"))
+        if not upd_num:
+            slot = nameless.get((stamp, advert_id), 0) + 1
+            nameless[(stamp, advert_id)] = slot
+            upd_num = -slot
         found.append(
             {
                 "date": stamp,
                 "advert_id": advert_id,
-                "upd_num": _int(row.get("updNum")),
+                "upd_num": upd_num,
                 "sum_kop": _kop(row.get("updSum")),
                 "payment_type": str(row.get("paymentType") or "").strip(),
                 "name": str(row.get("campName") or "").strip(),
@@ -541,6 +584,8 @@ async def collect(
     # Фактически списанное. Его отсутствие отчёт не роняет: остаётся
     # статистический расход, а сверять его будет не с чем, и так и написано.
     charges = 0
+    records: list[dict] = []
+    upd_known = True
     try:
         records = upd_rows(await client.advert_upd(date_from, date_to), date_to)
     except (
@@ -550,7 +595,22 @@ async def collect(
         wbapi.WBApiError,
     ) as error:
         logger.warning("история затрат клиента %s не получена: %s", client_id, error)
-        records = []
+        upd_known = False
+
+    # Окно списаний переписывается целиком, а не дополняется. Причина в том,
+    # что часть ключа строки бот придумывает сам: у списания без времени дата
+    # это последний день окна, а у списания без номера документа номер
+    # порядковый. Окно суточного сбора скользящее, поэтому дополнение
+    # записывало бы одно и то же безвременное списание каждый день под новой
+    # датой и складывало бы его с самим собой. Ответ Wildberries за окно и
+    # есть вся правда об этом окне, поэтому прежние строки окна уходят, а на
+    # их место ложится то, что приехало сейчас. Если поход за историей
+    # сорвался, окно не трогается вовсе: пустой ответ это «не знаем», а не
+    # «списаний не было».
+    if upd_known:
+        repo.delete_between(
+            "ad_upd", "date", date_from.isoformat(), date_to.isoformat()
+        )
     for record in records:
         name = record.pop("name", "")
         repo.upsert(
@@ -804,11 +864,6 @@ class AdsReport:
 # --- сборка отчёта -----------------------------------------------------------
 
 
-def _days_between(date_from: date, date_to: date) -> list[str]:
-    span = (date_to - date_from).days
-    return [(date_from + timedelta(days=shift)).isoformat() for shift in range(span + 1)]
-
-
 def _revenue_by_article(
     client_id: int,
     date_from: date,
@@ -851,7 +906,7 @@ def build(
     товаров агент 1. Отчёт только читает и считает.
     """
     date_from, date_to = finance.period_bounds(period, today)
-    stamps = set(_days_between(date_from, date_to))
+    first, last = date_from.isoformat(), date_to.isoformat()
     repo = db.repo(client_id, path)
 
     names: dict[int, dict] = {}
@@ -861,14 +916,15 @@ def build(
             "status": None if row["status"] is None else int(row["status"]),
         }
 
-    # Таблицы читаются целиком по одному разу, а не по запросу на каждый день
-    # периода: у года это были бы сотни запросов ради одного и того же.
+    # Суточные таблицы читаются одним запросом на границы периода, а не
+    # запросом на каждый его день и не целиком: индексы по дате в схеме стоят
+    # ровно для этого. Целиком читается только справочник кампаний: в нём
+    # строка на кампанию, а не на кампанию за сутки. Дат в базе нет иных, кроме
+    # ГГГГ-ММ-ДД, поэтому сравнение строк тут это сравнение дат.
     totals: dict[int, dict[str, Any]] = {}
     days: dict[str, dict[str, Any]] = {}
-    for row in repo.rows("ad_daily"):
+    for row in repo.rows_between("ad_daily", "date", first, last):
         stamp = str(row["date"])
-        if stamp not in stamps:
-            continue
         advert_id = int(row["advert_id"])
         slot = totals.setdefault(
             advert_id,
@@ -888,9 +944,7 @@ def build(
     # Какие товары рекламировала каждая кампания и сколько на них ушло.
     by_campaign_nm: dict[int, set[int]] = {}
     by_article: dict[int, dict[str, int]] = {}
-    for row in repo.rows("ad_nm_daily"):
-        if str(row["date"]) not in stamps:
-            continue
+    for row in repo.rows_between("ad_nm_daily", "date", first, last):
         advert_id = int(row["advert_id"])
         nm_id = int(row["nm_id"])
         by_campaign_nm.setdefault(advert_id, set()).add(nm_id)
@@ -903,9 +957,7 @@ def build(
 
     charges: dict[int, int] = {}
     fact_known = False
-    for row in repo.rows("ad_upd"):
-        if str(row["date"]) not in stamps:
-            continue
+    for row in repo.rows_between("ad_upd", "date", first, last):
         fact_known = True
         advert_id = int(row["advert_id"])
         charges[advert_id] = charges.get(advert_id, 0) + int(row["sum_kop"] or 0)
@@ -1057,7 +1109,10 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
         "часть расхода могла уйти бонусами или кэшбэком. Расхождение больше "
         "рубля показывается, а не прячется. Списание, у которого Wildberries "
         "не указал время, отнесено к последнему дню запрошенного окна: оно "
-        "точно внутри периода, а выбросить его значило бы занизить факт.",
+        "точно внутри периода, а выбросить его значило бы занизить факт. "
+        "Учтено оно при этом один раз, сколько бы раз бот ни забирал этот "
+        "период заново. Списания без номера документа тоже сохраняются все: "
+        "различить их нечем, но сумма от этого не страдает.",
     ),
     (
         "Заказы, шт",
@@ -1262,6 +1317,32 @@ def fan_out_collect(task: Any, *, path: str | Path | None = None) -> list[int]:
     ]
 
 
+CLEANED_TABLES = ("ad_daily", "ad_nm_daily", "ad_upd")
+
+
+def cleanup(task: Any = None, *, path: str | Path | None = None) -> int:
+    """Убирает суточную рекламу глубже срока хранения. Возвращает число строк.
+
+    В Wildberries отсюда не ходят: это работа по базе. Справочник кампаний
+    (`ad_campaigns`) не чистится: в нём строка на кампанию, а не на кампанию
+    за сутки, и по нему в отчёте находится название.
+    """
+    days = history_days()
+    if days <= 0:
+        return 0
+    edge = (_payload_date(task) - timedelta(days=days)).isoformat()
+    removed = 0
+    for row in db.admin_repo(path).all_clients():
+        client_id = int(row["id"])
+        try:
+            repo = db.repo(client_id, path)
+            for table in CLEANED_TABLES:
+                removed += repo.delete_before(table, "date", edge)
+        except Exception:  # noqa: BLE001 - один клиент не ломает обход
+            logger.exception("не удалось почистить рекламу клиента %s", client_id)
+    return removed
+
+
 async def collect_client(task: Any, *, path: str | Path | None = None) -> Collected:
     """Сбор одного кабинета за окно из конфига. Повтор делает очередь."""
     day = _payload_date(task)
@@ -1296,5 +1377,8 @@ async def report_task(task: Any, *, path: str | Path | None = None) -> AdsReport
 def register_jobs() -> None:
     """Ставит суточный сбор в расписание, а разбор по клиентам в очередь."""
     scheduler.register_daily(COLLECT_ALL, fan_out_collect)
-    queue.register(COLLECT_ONE, collect_client)
-    queue.register(TASK_KIND, report_task)
+    # Чистка идёт тем же утром и в WB не ходит: это работа по базе.
+    scheduler.register_daily(CLEANUP, cleanup)
+    # Сбор идёт ночью и клиентом не заказан: о его сбое знает владелец.
+    queue.register(COLLECT_ONE, collect_client, quiet=True)
+    queue.register(TASK_KIND, report_task, title="разбор рекламы")

@@ -606,6 +606,169 @@ async def test_a_charge_without_a_time_is_not_thrown_away(cabinet, db_path):
     assert report.fact_spend == Decimal("1250")
 
 
+async def collect_window(client_id, db_path, recorder, last, *, days=7):
+    """Один заход сбора окном, которое кончается днём `last`."""
+    clock = FakeTime()
+    return await ads.collect(
+        client_id,
+        last - timedelta(days=days - 1),
+        last,
+        path=db_path,
+        http=recorder.client(),
+        clock=clock.clock,
+        sleep=clock.sleep,
+    )
+
+
+def charges_of(client_id, db_path):
+    """Состояние таблицы списаний: сколько строк и на какую сумму."""
+    rows = db.repo(client_id, db_path).rows("ad_upd")
+    return len(rows), sum(int(row["sum_kop"]) for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_a_charge_without_a_time_is_counted_once_however_many_collections(
+    cabinet, db_path
+):
+    """Три захода подряд разными окнами: сумма списаний не выросла.
+
+    Дату списанию без времени придумывает бот, а не Wildberries: это
+    последний день запрошенного окна. Окно суточного сбора скользящее, сегодня
+    оно кончается сегодня, завтра завтра, поэтому одно и то же списание
+    приезжало бы каждый день под новой датой и ложилось бы рядом с прежним: за
+    неделю до семи раз. Проверяется именно повторение, одним заходом такую
+    поломку не увидеть.
+    """
+    nameless = [dict(item) for item in UPD]
+    nameless[1]["updTime"] = None      # 450 рублей без времени
+
+    seen = []
+    for shift in range(3):
+        # 3, 4 и 5 сентября: оба датированных списания (1 и 2 сентября)
+        # остаются внутри окна, а безвременное каждый раз получает новую дату.
+        await collect_window(
+            cabinet, db_path, Recorder(upd=nameless), date(2026, 9, 3 + shift)
+        )
+        seen.append(charges_of(cabinet, db_path))
+
+    # 700 + 450 + 100 это 1250 рублей, и после каждого захода их всё столько же.
+    assert seen == [(3, 125000)] * 3
+
+
+@pytest.mark.asyncio
+async def test_two_charges_of_one_day_without_a_number_are_both_kept(cabinet, db_path):
+    """Номер документа у Wildberries тоже бывает пустым.
+
+    Два списания по одной кампании за одни сутки без номера ничем не
+    различаются, и раньше оба получали номер ноль, то есть схлопывались в одну
+    строку: факт занижался. Ошибка обратная к задвоению и из того же места.
+    """
+    twins = [
+        {
+            "updTime": "2026-09-01T10:00:00+03:00",
+            "updSum": 300,
+            "advertId": 777,
+            "paymentType": "Счёт",
+        },
+        {
+            "updTime": "2026-09-01T18:00:00+03:00",
+            "updSum": 200,
+            "advertId": 777,
+            "paymentType": "Бонусы",
+        },
+    ]
+
+    await collect_into(cabinet, db_path, Recorder(upd=twins))
+    assert charges_of(cabinet, db_path) == (2, 50000)
+
+    # И повтор сбора их не удваивает: окно переписывается целиком.
+    await collect_into(cabinet, db_path, Recorder(upd=twins))
+    assert charges_of(cabinet, db_path) == (2, 50000)
+    assert report_of(cabinet, db_path).fact_spend == Decimal("500")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_request_for_charges_does_not_erase_the_window(cabinet, db_path):
+    """Пустой ответ это «не знаем», а не «списаний не было».
+
+    Окно списаний переписывается целиком, и это правило обязано кончаться там,
+    где Wildberries не ответил: иначе одна пятисотка стёрла бы собранное.
+    """
+    await collect_into(cabinet, db_path, Recorder())
+    assert charges_of(cabinet, db_path) == (3, 125000)
+
+    await collect_into(cabinet, db_path, Recorder(codes={UPD_PATH: 500}))
+
+    assert charges_of(cabinet, db_path) == (3, 125000)
+    assert report_of(cabinet, db_path).fact_spend == Decimal("1250")
+
+
+# --- отчёт читает только свой период ---
+
+
+@pytest.mark.asyncio
+async def test_the_report_reads_only_the_period_it_builds(cabinet, db_path, monkeypatch):
+    """Отчёт за месяц не поднимает в память всю историю кабинета.
+
+    `sqlite3` тут синхронный и живёт в одном процессе с ботом: долгое чтение
+    это пауза у всех клиентов сразу, а не медленный отчёт у одного. Индексы по
+    дате в схеме стоят, значит границы периода обязаны быть в запросе.
+    """
+    await collect_into(cabinet, db_path, Recorder())
+    repo = db.repo(cabinet, db_path)
+
+    # Прошлогодние строки: в период они не входят и в отчёт попасть не должны.
+    old = "2025-09-01"
+    repo.upsert("ad_daily", {"date": old, "advert_id": 777}, spend_kop=9_900_000)
+    repo.upsert(
+        "ad_nm_daily", {"date": old, "advert_id": 777, "nm_id": 111}, spend_kop=9_900_000
+    )
+    repo.upsert(
+        "ad_upd", {"date": old, "advert_id": 777, "upd_num": 99}, sum_kop=9_900_000
+    )
+
+    whole = db.ClientRepo.rows
+
+    def guard(self, table, *args, **kwargs):
+        assert table not in ads.CLEANED_TABLES, f"таблица {table} прочитана целиком"
+        return whole(self, table, *args, **kwargs)
+
+    monkeypatch.setattr(db.ClientRepo, "rows", guard)
+
+    report = report_of(cabinet, db_path)
+
+    assert report.spend == Decimal("1100")
+    assert report.fact_spend == Decimal("1250")
+    assert {item.date for item in report.days} == {"2026-09-01", "2026-09-02"}
+
+
+def test_the_old_days_are_cleaned_up_and_the_term_lives_in_the_config(
+    cabinet, db_path, monkeypatch
+):
+    """Срок хранения суточной истории это настройка владельца, а не число в коде."""
+    repo = db.repo(cabinet, db_path)
+    fresh, ancient = TODAY.isoformat(), (TODAY - timedelta(days=500)).isoformat()
+    for stamp in (fresh, ancient):
+        repo.upsert("ad_daily", {"date": stamp, "advert_id": 777}, spend_kop=100)
+        repo.upsert(
+            "ad_nm_daily", {"date": stamp, "advert_id": 777, "nm_id": 111}, spend_kop=100
+        )
+        repo.upsert("ad_upd", {"date": stamp, "advert_id": 777, "upd_num": 1}, sum_kop=100)
+
+    patched = copy.deepcopy(config.settings())
+    patched["storage"]["daily_history_days"] = 30
+    monkeypatch.setattr(config, "settings", lambda: patched)
+    assert ads.history_days() == 30
+
+    task = SimpleNamespace(client_id=None, payload={"date": TODAY.isoformat()})
+    assert ads.cleanup(task, path=db_path) == 3
+
+    for table in ads.CLEANED_TABLES:
+        assert {str(row["date"]) for row in repo.rows(table)} == {fresh}, table
+    # Справочник кампаний не чистится: в нём строка на кампанию, а не на сутки.
+    assert repo.count("ad_campaigns") == 0
+
+
 # --- ограничения Wildberries ---
 
 

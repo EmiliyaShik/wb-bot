@@ -664,4 +664,5 @@ def register(app, *, path=None) -> None:
     # тот же обмен токена.
     queue.set_auth_handler(make_auth_notice(app, path=path))
     # Своя задача регистрируется рядом со своим хендлером, как у агентов.
-    queue.register(TOKEN_CHECK, make_token_check(path=path))
+    # Проверка срока токена служебная: клиент её не заказывал.
+    queue.register(TOKEN_CHECK, make_token_check(path=path), quiet=True)

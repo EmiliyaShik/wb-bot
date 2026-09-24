@@ -184,6 +184,49 @@ def test_repo_refuses_tables_without_client_id(db_path):
         repo.rows("invoice_seq")
     with pytest.raises(ValueError):
         repo.rows("sqlite_master")
+    # Чтение и чистка по диапазону живут по тому же правилу.
+    with pytest.raises(ValueError):
+        repo.rows_between("invoice_seq", "year", 2020, 2030)
+    with pytest.raises(ValueError):
+        repo.delete_before("invoice_seq", "year", 2030)
+    with pytest.raises(ValueError):
+        repo.first_value("sqlite_master", "name")
+    # Имя колонки тоже не подставляется как попало.
+    with pytest.raises(ValueError):
+        repo.rows_between("nm_daily", "date; drop table nm_daily", "a", "b")
+
+
+def test_a_range_reads_and_cleans_only_its_own_client(db_path):
+    """Границы периода не отменяют изоляцию: чужие сутки не видны и не стёрты."""
+    admin = db.admin_repo(db_path)
+    first = admin.ensure_client(telegram_id=2101)
+    second = admin.ensure_client(telegram_id=2102)
+    for client_id, stamp in ((first, "2026-01-10"), (first, "2026-02-10"), (second, "2026-01-10")):
+        db.repo(client_id, db_path).upsert(
+            "nm_daily", {"date": stamp, "nm_id": 111}, orders=1, raw="{}"
+        )
+
+    mine = db.repo(first, db_path)
+    found = mine.rows_between("nm_daily", "date", "2026-01-01", "2026-01-31")
+    assert [str(row["date"]) for row in found] == ["2026-01-10"]
+    assert mine.first_value("nm_daily", "date", not_null="raw") == "2026-01-10"
+
+    assert mine.delete_before("nm_daily", "date", "2026-02-01") == 1
+    assert mine.count("nm_daily") == 1
+    # У соседа всё на месте: чистка идёт только по своим строкам.
+    assert db.repo(second, db_path).count("nm_daily") == 1
+
+
+def test_first_value_skips_rows_where_the_marked_column_is_empty(db_path):
+    """«Сутки собраны» это непустая колонка raw, и наименьшая дата ищется по ней."""
+    client_id = db.admin_repo(db_path).ensure_client(telegram_id=2103)
+    repo = db.repo(client_id, db_path)
+    repo.upsert("nm_daily", {"date": "2026-01-01", "nm_id": 111}, stocks_wb=5)
+    repo.upsert("nm_daily", {"date": "2026-01-05", "nm_id": 111}, raw="{}")
+
+    assert repo.first_value("nm_daily", "date") == "2026-01-01"
+    assert repo.first_value("nm_daily", "date", not_null="raw") == "2026-01-05"
+    assert repo.first_value("nm_daily", "date", not_null="raw", nm_id=222) is None
 
 
 def test_every_repo_method_takes_client_id_by_construction(db_path):

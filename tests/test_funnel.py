@@ -433,11 +433,23 @@ def test_the_report_never_goes_to_wildberries(cabinet, db_path, monkeypatch):
     assert db.repo(cabinet, db_path).count("api_calls") == 0
 
 
-def test_the_funnel_has_no_daily_collector_of_its_own():
-    """Второго суточного сбора у воронки нет: те же данные копит план-факт."""
+def test_the_funnel_has_no_daily_collector_of_its_own(db_path, monkeypatch):
+    """Второго суточного сбора у воронки нет: те же данные копит план-факт.
+
+    Работ у неё две: разбор по просьбе клиента и утренняя чистка. Чистка это
+    не сбор, и доказывается это тем же способом, что и в отчёте: клиент WB на
+    время сломан нарочно, а работа всё равно проходит.
+    """
     queue.reset()
     funnel.register_jobs()
-    assert set(queue.handlers()) == {funnel.TASK_KIND}
+    assert set(queue.handlers()) == {funnel.TASK_KIND, funnel.CLEANUP}
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("чистка сходила в Wildberries")
+
+    monkeypatch.setattr(wbapi, "get_wb_client", forbidden)
+    monkeypatch.setattr(wbapi.client, "get_wb_client", forbidden)
+    assert funnel.cleanup(None, path=db_path) == 0
 
 
 @pytest.mark.asyncio
@@ -564,6 +576,76 @@ async def fetch_visibility(client_id, db_path, *, code=None):
     )
 
 
+@pytest.mark.asyncio
+async def test_the_visibility_keeps_only_the_newest_snapshot(cabinet, db_path):
+    """Видимость это срез, а не история.
+
+    Границы периода входят в ключ, а период считается от вчера и каждый день
+    другой: без уборки каждый /funnel оставлял бы в таблице новый набор строк
+    навсегда.
+    """
+    repo = db.repo(cabinet, db_path)
+    stale = {"date_from": "2026-01-01", "date_to": "2026-01-07"}
+    repo.upsert("funnel_visibility", {**stale, "nm_id": 111}, visibility=3.0)
+
+    assert await fetch_visibility(cabinet, db_path) == funnel.OK
+
+    ends = {str(row["date_to"]) for row in repo.rows("funnel_visibility")}
+    assert ends == {LAST.isoformat()}, "прошлый срез остался лежать в базе"
+
+
+def test_the_report_reads_only_the_period_it_builds(cabinet, db_path, monkeypatch):
+    """Отчёт за неделю не поднимает в память всю историю кабинета.
+
+    `sqlite3` тут синхронный и живёт в одном процессе с ботом: долгое чтение
+    это пауза у всех клиентов сразу. Индекс по дате в схеме стоит, значит
+    границы периода обязаны быть в запросе.
+    """
+    # Прошлогодние сутки: в период они не входят, но историю удлиняют.
+    put_day(cabinet, db_path, LAST - timedelta(days=300), 111, opens=9000, carts=9000)
+
+    whole = db.ClientRepo.rows
+
+    def guard(self, table, *args, **kwargs):
+        assert table != "nm_daily", "суточная история прочитана целиком"
+        return whole(self, table, *args, **kwargs)
+
+    monkeypatch.setattr(db.ClientRepo, "rows", guard)
+
+    report = report_of(cabinet, db_path)
+
+    # Те же числа, что и без прошлогодней строки: 700 + 350 заходов.
+    assert report.now.opens == 1050
+    assert report.span == 7
+
+
+def test_the_old_days_are_cleaned_up_and_the_term_lives_in_the_config(
+    cabinet, db_path, monkeypatch
+):
+    """Срок хранения суточной истории это настройка владельца, а не число в коде."""
+    repo = db.repo(cabinet, db_path)
+    ancient = LAST - timedelta(days=500)
+    put_day(cabinet, db_path, ancient, 111, opens=10)
+    repo.upsert(
+        "funnel_visibility",
+        {"date_from": "2024-01-01", "date_to": "2024-01-07", "nm_id": 111},
+        visibility=3.0,
+    )
+    before = repo.count("nm_daily")
+
+    patched = copy.deepcopy(config.settings())
+    patched["storage"]["daily_history_days"] = 60
+    monkeypatch.setattr(config, "settings", lambda: patched)
+    assert funnel.history_days() == 60
+
+    task = SimpleNamespace(client_id=None, payload={"date": TODAY.isoformat()})
+    assert funnel.cleanup(task, path=db_path) == 2
+
+    assert repo.count("nm_daily") == before - 1
+    assert repo.count("funnel_visibility") == 0
+    assert ancient.isoformat() not in {str(row["date"]) for row in repo.rows("nm_daily")}
+
+
 def test_without_jem_the_module_works_in_full_and_speaks_calmly(cabinet, db_path):
     """Нет подписки Джем: этапов четыре, и ни одного пугающего слова.
 
@@ -660,6 +742,84 @@ async def test_a_refusal_without_jem_is_a_normal_state_and_not_a_failure(
     assert "Этапов четыре" in text
     # Про категорию токена речи нет: с ней всё в порядке.
     assert "Аналитика" not in text
+
+
+@pytest.mark.asyncio
+async def test_without_the_analytics_category_the_funnel_does_not_promise_to_wait(
+    db_path, monkeypatch
+):
+    """Истории нет и не будет: сбор невозможен без категории «Аналитика».
+
+    Раньше такой клиент получал «через пару дней сравнение появится» столько
+    раз, сколько набирал команду, хотя не появилось бы никогда. Отчёт платный,
+    и обещание вместо причины это прямая неправда.
+    """
+    monkeypatch.setenv("ENCRYPTION_KEY", crypto.generate_key())
+    wbapi.reset_limits()
+    queue.reset()
+    client_id = db.admin_repo(db_path).ensure_client(9595)
+    db.repo(client_id, db_path).insert(
+        "wb_tokens",
+        ciphertext=crypto.encrypt(make_token(MASK_NO_ANALYTICS)),
+        exp=str(EXP),
+        scopes="",
+    )
+
+    assert funnel.history_trouble(client_id, path=db_path) == funnel.NO_CATEGORY
+
+    sent: list = []
+    funnel.set_sender(lambda cid, report, data: sent.append(report))
+    try:
+        report = await funnel.report_task(
+            SimpleNamespace(
+                client_id=client_id,
+                payload={"period": "week", "date": TODAY.isoformat()},
+            ),
+            path=db_path,
+        )
+    finally:
+        funnel.set_sender(None)
+
+    assert report.span == 0
+    assert report.trouble == funnel.NO_CATEGORY
+    text = handler.summary_text(report)
+    assert "Аналитика" in text and "/connect" in text
+    assert "Через пару дней" not in text, "бот снова обещает то, чего не будет"
+    assert sent, "отчёт клиенту не ушёл"
+
+
+@pytest.mark.asyncio
+async def test_without_a_connected_cabinet_the_funnel_says_exactly_that(
+    db_path, monkeypatch
+):
+    """Кабинета нет вовсе: это не «подождите», и не «ключ не приняли».
+
+    Токена нет, значит и отказа Wildberries не было: модули на паузу тут
+    вставать не должны, а клиент должен услышать про /connect.
+    """
+    monkeypatch.setenv("ENCRYPTION_KEY", crypto.generate_key())
+    wbapi.reset_limits()
+    queue.reset()
+    client_id = db.admin_repo(db_path).ensure_client(9696)
+
+    assert funnel.history_trouble(client_id, path=db_path) == funnel.NO_CABINET
+
+    funnel.set_sender(lambda cid, report, data: None)
+    try:
+        report = await funnel.report_task(
+            SimpleNamespace(
+                client_id=client_id,
+                payload={"period": "week", "date": TODAY.isoformat()},
+            ),
+            path=db_path,
+        )
+    finally:
+        funnel.set_sender(None)
+
+    text = handler.summary_text(report)
+    assert report.trouble == funnel.NO_CABINET
+    assert "/connect" in text and "Аналитика" in text
+    assert "Через пару дней" not in text
 
 
 @pytest.mark.asyncio

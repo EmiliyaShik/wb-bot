@@ -103,18 +103,24 @@ def weekly_check_hours() -> int:
 
 
 def register_daily(name: str, fn: Callable[..., Any]) -> None:
-    """Работа каждое утро. `fn(task)` выполнится воркером очереди."""
+    """Работа каждое утро. `fn(task)` выполнится воркером очереди.
+
+    Работа расписания по определению не заказана клиентом, поэтому в очереди
+    она стоит тихой: о её сбое узнаёт владелец, а не селлер, который в это
+    время спит и ничего не ждал.
+    """
     _daily[name] = fn
-    queue.register(name, fn)
+    queue.register(name, fn, quiet=True)
 
 
 def register_weekly(name: str, fn: Callable[..., Any]) -> None:
     """Работа при появлении нового финотчёта WB. `fn(task)` в очереди.
 
-    В `task.payload` лежит `report_id` отчёта, который это вызвал.
+    В `task.payload` лежит `report_id` отчёта, который это вызвал. Тихая по
+    той же причине, что и утренняя: её запускают данные, а не человек.
     """
     _weekly[name] = fn
-    queue.register(name, fn)
+    queue.register(name, fn, quiet=True)
 
 
 def set_report_probe(fn: Callable[[int], Any] | None) -> None:

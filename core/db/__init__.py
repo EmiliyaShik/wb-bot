@@ -333,6 +333,76 @@ class ClientRepo:
             params.append(int(limit))
         return list(self._conn.execute(sql, params))
 
+    def rows_between(
+        self,
+        table: str,
+        column: str,
+        first: Any,
+        last: Any,
+        **conditions: Any,
+    ) -> list[sqlite3.Row]:
+        """Строки клиента, у которых column лежит между first и last включительно.
+
+        Отдельный метод, а не условие в rows(): равенство здесь не годится, а
+        произвольного SQL наружу в этом проекте нет. Отчёт обязан читать только
+        свой период: индексы по дате в схеме стоят, но без границ в запросе они
+        не работают вовсе, а sqlite3 живёт в одном процессе с ботом, и лишний
+        скан это пауза у всех клиентов сразу.
+        """
+        table = self._table(table)
+        where, params = self._where(conditions)
+        sql = f"SELECT * FROM {table} WHERE {where} AND {_check_column(column)} BETWEEN ? AND ?"
+        params.extend([first, last])
+        return list(self._conn.execute(sql, params))
+
+    def first_value(
+        self, table: str, column: str, *, not_null: str | None = None, **conditions: Any
+    ) -> Any:
+        """Наименьшее значение column среди строк клиента. Нет строк - None.
+
+        Сделано через ORDER BY и LIMIT 1, а не через MIN(): с условием
+        «в колонке not_null что-то есть» база проходит по индексу и
+        останавливается на первой подходящей строке, а MIN() при том же
+        условии дочитывает всё до конца.
+        """
+        table = self._table(table)
+        where, params = self._where(conditions)
+        column = _check_column(column)
+        sql = f"SELECT {column} FROM {table} WHERE {where} AND {column} IS NOT NULL"
+        if not_null is not None:
+            sql += f" AND {_check_column(not_null)} IS NOT NULL"
+        row = self._conn.execute(f"{sql} ORDER BY {column} ASC LIMIT 1", params).fetchone()
+        return None if row is None else row[0]
+
+    def delete_before(self, table: str, column: str, value: Any, **conditions: Any) -> int:
+        """Удаляет строки клиента, у которых column строго меньше value.
+
+        Нужна сроку хранения суточной истории: без неё таблицы растут
+        бесконечно, а глубже самого длинного отчётного периода они никому не
+        нужны. Удаление идёт по тем же индексам, что и чтение периода.
+        """
+        table = self._table(table)
+        where, params = self._where(conditions)
+        cursor = self._conn.execute(
+            f"DELETE FROM {table} WHERE {where} AND {_check_column(column)} < ?",
+            params + [value],
+        )
+        return int(cursor.rowcount)
+
+    def delete_between(self, table: str, column: str, first: Any, last: Any, **conditions: Any) -> int:
+        """Удаляет строки клиента, у которых column лежит в границах включительно.
+
+        Нужна сборщику, который переписывает окно целиком: дополнять окно
+        строками нельзя там, где ключ строки бот придумывает сам.
+        """
+        table = self._table(table)
+        where, params = self._where(conditions)
+        cursor = self._conn.execute(
+            f"DELETE FROM {table} WHERE {where} AND {_check_column(column)} BETWEEN ? AND ?",
+            params + [first, last],
+        )
+        return int(cursor.rowcount)
+
     def one(self, table: str, **conditions: Any) -> sqlite3.Row | None:
         """Первая подходящая строка клиента или None."""
         found = self.rows(table, limit=1, **conditions)

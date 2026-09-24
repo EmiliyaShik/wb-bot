@@ -513,4 +513,8 @@ async def diagnostic_task(
 
 def register_jobs(*, path: str | Path | None = None) -> None:
     """Связывает вид задачи с обработчиком. Зовёт сборка бота, не импорт."""
-    queue.register(TASK_KIND, functools.partial(diagnostic_task, path=path))
+    queue.register(
+        TASK_KIND,
+        functools.partial(diagnostic_task, path=path),
+        title="бесплатный разбор",
+    )
