@@ -20,10 +20,13 @@ def test_modules_from_spec():
     assert mods["rnp"].price_month == 590
     assert mods["ads"].price_month == 1290
     assert mods["funnel"].price_month == 490
-    assert mods["all"].price_month == 2290
+    assert mods["all"].price_month == 2490
     assert mods["finance"].visible is True
-    assert mods["ads"].visible is False
-    assert mods["funnel"].visible is False
+    assert mods["ads"].visible is True
+    assert mods["funnel"].visible is True
+    # Пакет владелец открыл: скрытых модулей в конфиге не осталось ни одного.
+    assert mods["all"].visible is True
+    assert all(info.visible for info in mods.values())
     assert mods["finance"].agents == ("finance", "watchdog", "profit")
     assert mods["all"].includes == "*"
 
@@ -33,8 +36,32 @@ def test_price_applies_discounts_from_config():
     assert config.price("finance", 1) == 990
     assert config.price("finance", 3) == 2673
     assert config.price("finance", 12) == 9504
-    assert config.price("all", 12) == 21984
+    # 2490 за месяц: 3 месяца это 7470 минус 10 %, год это 29880 минус 20 %.
+    assert config.price("all", 1) == 2490
+    assert config.price("all", 3) == 6723
+    assert config.price("all", 12) == 23904
     assert config.price("rnp", 3) == 1593
+
+
+def test_the_package_costs_less_than_the_same_modules_one_by_one():
+    """Свойство, а не цифра: пакет обязан быть выгоднее набора по отдельности.
+
+    Считается по конфигу, поэтому тест переживёт и новый модуль, и новую цену:
+    он поймает ровно тот случай, когда пакет перестал иметь смысл.
+    """
+    mods = config.modules()
+    packages = {name for name, info in mods.items() if info.includes == "*"}
+    assert packages, "в конфиге нет пакета"
+    for name in packages:
+        one_by_one = sum(
+            info.price_month
+            for other, info in mods.items()
+            if info.visible and other not in packages
+        )
+        assert mods[name].price_month < one_by_one, name
+        # Скидка за период считается от цены пакета, а не от суммы модулей.
+        for months in config.periods():
+            assert config.price(name, months) < one_by_one * months
 
 
 def test_price_unknown_module_is_error():
@@ -75,8 +102,8 @@ def test_db_path_follows_data_dir(monkeypatch, tmp_path):
 def test_price_is_counted_in_decimal():
     # 990 за месяц, три месяца со скидкой 10 %: 2970 минус 297
     assert config.price_decimal("finance", 3) == Decimal("2673")
-    # 2290 за месяц, год со скидкой 20 %: 27480 минус 5496
-    assert config.price_decimal("all", 12) == Decimal("21984")
+    # 2490 за месяц, год со скидкой 20 %: 29880 минус 5976
+    assert config.price_decimal("all", 12) == Decimal("23904")
     assert isinstance(config.price_decimal("finance", 3), Decimal)
     assert isinstance(config.price("finance", 3), int)
 
@@ -125,9 +152,9 @@ def test_token_categories_follow_the_spec():
     assert "на будущее" in categories["statistics"]["note"]
     assert categories["finance"]["breaks"] == ["finance"]
     assert categories["finance"]["breaks_diagnostic"] is True
-    assert categories["analytics"]["breaks"] == ["rnp"]
-    # без продвижения и без контента модули живут, теряются отдельные числа
-    assert categories["promotion"]["breaks"] == []
+    assert categories["analytics"]["breaks"] == ["rnp", "funnel"]
+    # без продвижения не работает реклама, без контента теряются отдельные числа
+    assert categories["promotion"]["breaks"] == ["ads"]
     assert categories["content"]["breaks"] == []
     assert "реклам" in categories["promotion"]["note"].lower()
     assert "себестоимост" in categories["content"]["note"].lower()
@@ -181,9 +208,12 @@ def test_a_module_lists_its_reports_with_a_command_and_a_use():
 
     # У «План-факта» отчёт один, и это не поломка.
     assert [report.command for report in config.modules()["rnp"].reports] == ["rnp"]
-    # Скрытые модули списка отчётов не заводили: им это на будущее.
-    assert config.modules()["ads"].reports == ()
-    assert config.modules()["funnel"].reports == ()
+    # У «Рекламы» отчёт тоже один.
+    assert [report.command for report in config.modules()["ads"].reports] == ["ads"]
+    # И у «Воронки» один.
+    assert [report.command for report in config.modules()["funnel"].reports] == ["funnel"]
+    # Пакет своих отчётов не заводит: он открывает чужие.
+    assert config.modules()["all"].reports == ()
 
 
 def test_a_module_without_a_list_of_reports_does_not_break_the_config(monkeypatch):

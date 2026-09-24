@@ -302,8 +302,15 @@ def days_left(client_id: int, *, now: datetime | None = None, path=None) -> int 
     return None if until is None else (until - _now(now)).days
 
 
-def _settings(client_id: int, path: str | Path | None) -> dict:
-    """Настройки клиента как словарь. Испорченный JSON это пустой словарь."""
+def settings_of(client_id: int, *, path: str | Path | None = None) -> dict:
+    """Настройки клиента как словарь. Испорченный JSON это пустой словарь.
+
+    Колонка `clients.settings` одна на весь проект, и ключей в ней уже
+    несколько: напоминания о сроке токена, тумблеры рассылок, отметки
+    жизненного цикла, целевой ДРР. Разбор общий затем, чтобы правило
+    «читаем весь словарь, пишем весь словарь» не пришлось повторять каждому,
+    кто заводит свой ключ: чужие ключи иначе затрутся молча.
+    """
     row = db.admin_repo(path).client(client_id)
     if row is None:
         return {}
@@ -314,12 +321,21 @@ def _settings(client_id: int, path: str | Path | None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _save_settings(client_id: int, data: dict, path: str | Path | None) -> None:
+def save_settings(client_id: int, data: dict, *, path: str | Path | None = None) -> None:
+    """Кладёт словарь настроек целиком. Читать перед этим обязательно."""
     # Пишем весь словарь целиком, но только после чтения: в settings живут
     # и чужие ключи, затирать их нельзя.
     db.admin_repo(path).set_client_fields(
         client_id, settings=json.dumps(data, ensure_ascii=False)
     )
+
+
+def _settings(client_id: int, path: str | Path | None) -> dict:
+    return settings_of(client_id, path=path)
+
+
+def _save_settings(client_id: int, data: dict, path: str | Path | None) -> None:
+    save_settings(client_id, data, path=path)
 
 
 def reminded(client_id: int, *, path: str | Path | None = None) -> tuple[int, ...]:

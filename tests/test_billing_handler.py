@@ -5,6 +5,7 @@
 а не как python-telegram-bot доставляет сообщения.
 """
 
+import copy
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
@@ -358,15 +359,20 @@ def test_owner_contact_is_data_not_markup(wired, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_forged_callback_cannot_buy_a_hidden_module(wired, client_id):
+async def test_forged_callback_cannot_buy_a_hidden_module(wired, client_id, monkeypatch):
+    """Скрытых модулей в конфиге не осталось, поэтому модуль прячется здесь же:
+    кнопки с ним бот не рисует, а callback_data клиент пришлёт любой."""
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["funnel"]["visible"] = False
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
     context = FakeContext()
     message = FakeMessage()
-    # Модуль ads в конфиге скрыт, кнопки с ним бот не рисует.
-    await handler.start_dialog(FakeUpdate(CLIENT_TG, message), context, "ads")
+    await handler.start_dialog(FakeUpdate(CLIENT_TG, message), context, "funnel")
     assert handler.STATE not in context.user_data
 
     await handler.period_callback(
-        FakeUpdate(CLIENT_TG, message, FakeQuery("inv:p:ads:1", message)), context
+        FakeUpdate(CLIENT_TG, message, FakeQuery("inv:p:funnel:1", message)), context
     )
     assert handler.STATE not in context.user_data
     assert billing.invoices_of(client_id, path=wired) == []
@@ -399,10 +405,20 @@ async def test_garbage_callback_does_not_break_the_bot(wired, client_id):
 
 
 @pytest.mark.asyncio
-async def test_hidden_module_in_the_dialog_state_makes_no_invoice(wired, client_id):
-    """Последняя проверка перед деньгами: состояние тоже сверяется с витриной."""
+async def test_hidden_module_in_the_dialog_state_makes_no_invoice(
+    wired, client_id, monkeypatch
+):
+    """Последняя проверка перед деньгами: состояние тоже сверяется с витриной.
+
+    Модуль прячется здесь же: в конфиге скрытых не осталось, а правило должно
+    держаться и в тот день, когда владелец снова что-нибудь скроет.
+    """
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["funnel"]["visible"] = False
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
     context = FakeContext()
-    context.user_data[handler.STATE] = {"module": "ads", "months": 1, "step": "address"}
+    context.user_data[handler.STATE] = {"module": "funnel", "months": 1, "step": "address"}
     message = FakeMessage()
     try:
         await handler.text_step(

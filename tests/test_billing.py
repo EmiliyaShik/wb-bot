@@ -4,6 +4,7 @@
 Чистые расчёты (банковские дни, контрольная сумма ИНН) проверяются напрямую.
 """
 
+import copy
 import logging
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -365,9 +366,38 @@ class TestCreateInvoice:
         with pytest.raises(ValueError):
             billing.create_invoice(client_id, "finance", 7, now=FRIDAY, path=db_path)
 
-    def test_hidden_module_is_not_sold(self, db_path, client_id, seller):
+    def test_hidden_module_is_not_sold(self, db_path, client_id, seller, monkeypatch):
+        """Скрытое не продаётся, даже если имя модуля прислали руками.
+
+        Скрытых модулей в конфиге не осталось: владелец открыл и все четыре
+        модуля, и пакет. Модуль прячется здесь же, чтобы правило оставалось
+        проверенным и в тот день, когда владелец снова что-нибудь скроет.
+        """
+        patched = copy.deepcopy(config.settings())
+        patched["modules"]["funnel"]["visible"] = False
+        monkeypatch.setattr(config, "settings", lambda: patched)
+
         with pytest.raises(KeyError):
-            billing.create_invoice(client_id, "ads", 1, now=FRIDAY, path=db_path)
+            billing.create_invoice(client_id, "funnel", 1, now=FRIDAY, path=db_path)
+        assert billing.invoices_of(client_id, path=db_path) == []
+
+    def test_the_package_is_sold_at_the_price_from_the_config(
+        self, db_path, client_id, seller
+    ):
+        """Пакет владелец открыл: счёт на него выставляется по цене конфига.
+
+        Суммы считаются из конфига, а не переписываются сюда числом: владелец
+        меняет цену в config.toml, и тест остаётся верным.
+        """
+        month = billing.create_invoice(client_id, "all", 1, now=FRIDAY, path=db_path)
+        assert month.module == "all"
+        assert month.amount == config.price_decimal("all", 1)
+        assert month.amount_kop == int(config.price_decimal("all", 1)) * 100
+
+        # Скидка за год считается от цены пакета, а не от суммы модулей.
+        year = billing.create_invoice(client_id, "all", 12, now=FRIDAY, path=db_path)
+        assert year.amount == config.price_decimal("all", 12)
+        assert year.amount < config.price_decimal("all", 1) * 12
 
 
 class TestMissingSellerDetails:

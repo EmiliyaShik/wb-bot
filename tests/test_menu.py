@@ -446,7 +446,7 @@ async def test_start_and_help_come_with_buttons(owner_data_dir):
 
 # Отчёты в том порядке, в каком их обещает конфиг. Список записан руками
 # нарочно: сторож должен падать, когда отчёт тихо пропадёт из витрины.
-REPORTS = ("finance", "dynamics", "profit", "rnp")
+REPORTS = ("finance", "dynamics", "profit", "rnp", "ads", "funnel")
 
 
 def _keyboard_tokens(markup) -> list[str]:

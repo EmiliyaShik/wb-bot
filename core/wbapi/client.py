@@ -74,6 +74,12 @@ QUEUE_DEFAULTS = {
 # Ограничения самого WB на размер запроса.
 FULLSTATS_MAX_IDS = 50
 FULLSTATS_MAX_DAYS = 31
+ADVERTS_MAX_IDS = 50
+UPD_MAX_DAYS = 31
+# Воронка по дням: nmIds обязателен, от 1 до 20 значений за запрос.
+FUNNEL_HISTORY_MAX_IDS = 20
+# Поисковый отчёт: limit это число групп товаров в ответе, максимум 1000.
+SEARCH_REPORT_MAX_GROUPS = 1000
 REPORT_PAGE = 1000
 CARDS_PAGE = 100
 ANALYTICS_PAGE = 1000
@@ -161,7 +167,11 @@ ENDPOINTS: dict[str, Endpoint] = {
     "promotion_count": Endpoint(
         "GET", HOSTS["advert"], "/adv/v1/promotion/count", "adv-count"
     ),
+    "adverts_info": Endpoint(
+        "GET", HOSTS["advert"], "/api/advert/v2/adverts", "adv-adverts"
+    ),
     "fullstats": Endpoint("GET", HOSTS["advert"], "/adv/v3/fullstats", "adv-fullstats"),
+    "advert_upd": Endpoint("GET", HOSTS["advert"], "/adv/v1/upd", "adv-upd"),
     "sales_funnel_products": Endpoint(
         "POST", HOSTS["analytics"], "/api/analytics/v3/sales-funnel/products", "analytics-funnel"
     ),
@@ -170,6 +180,9 @@ ENDPOINTS: dict[str, Endpoint] = {
         HOSTS["analytics"],
         "/api/analytics/v3/sales-funnel/products/history",
         "analytics-funnel",
+    ),
+    "search_report": Endpoint(
+        "POST", HOSTS["analytics"], "/api/v2/search-report/report", "analytics-search"
     ),
     "stocks_wb_warehouses": Endpoint(
         "POST",
@@ -671,6 +684,53 @@ class WBClient:
                 collected.extend(_listify(await self.request("fullstats", params=params)))
         return collected
 
+    async def adverts_info(self, ids: Iterable[int]) -> list[dict]:
+        """Названия и настройки кампаний: settings.name, ставки, статус, даты.
+
+        В статистике кампаний названия нет вовсе, там один advertId. Это
+        единственный метод, который отвечает на вопрос «как называется
+        кампания номер такой-то», поэтому он и появился.
+
+        WB принимает максимум 50 кампаний за запрос, поэтому список режется
+        здесь: помнить это ограничение каждому вызывающему незачем. Пустой
+        список кампаний это нормальное состояние кабинета, а не ошибка,
+        и ответом на него будет пустой список, а не запрос в WB.
+        """
+        collected: list[dict] = []
+        wanted = [int(value) for value in ids]
+        if not wanted:
+            return collected
+        for part in chunks(wanted, ADVERTS_MAX_IDS):
+            if not part:
+                continue
+            params = {"ids": ",".join(str(value) for value in part)}
+            collected.extend(
+                _listify(await self.request("adverts_info", params=params), "adverts", "items")
+            )
+        return collected
+
+    async def advert_upd(
+        self,
+        date_from: date | datetime | str,
+        date_to: date | datetime | str,
+    ) -> list[dict]:
+        """История затрат на рекламу: сколько списали на самом деле.
+
+        Расход из статистики кампаний это статистическая цифра, а updSum
+        это выставленная сумма, и они расходятся: часть расхода могла уйти
+        бонусами или кэшбэком (об этом говорит paymentType). Тот же приём,
+        что и в отчёте о реализации: своя сумма плюс готовая от WB для сверки.
+
+        WB принимает максимум 31 день за запрос, поэтому период режется здесь.
+        """
+        collected: list[dict] = []
+        for window in date_windows(date_from, date_to, UPD_MAX_DAYS):
+            params = {"from": day(window[0]), "to": day(window[1])}
+            collected.extend(
+                _listify(await self.request("advert_upd", params=params), "upd", "items")
+            )
+        return collected
+
     # --- воронка продаж: замена отключённому методу из ТЗ ---
 
     async def sales_funnel_products(
@@ -680,10 +740,14 @@ class WBClient:
         *,
         past: tuple[date | datetime | str, date | datetime | str] | None = None,
         nm_ids: Sequence[int] | None = None,
-        limit: int = 100,
+        limit: int = ANALYTICS_PAGE,
         max_pages: int = MAX_PAGES,
     ) -> list[dict]:
         """Воронка за период, страницами по limit/offset.
+
+        Страница по умолчанию максимальная из разрешённых WB (1000 карточек):
+        дорожка у воронки медленная, 3 запроса в минуту, и лишняя страница
+        стоит двадцати секунд ожидания на ровном месте.
 
         past это прошлый период для сравнения. Без него WB не присылает
         statistic.past и comparison, а сравнение с прошлой неделей нужно
@@ -715,23 +779,106 @@ class WBClient:
         self,
         start: date | datetime | str,
         end: date | datetime | str,
+        nm_ids: Sequence[int],
         *,
-        nm_ids: Sequence[int] | None = None,
         aggregation_level: str = "day",
     ) -> list[dict]:
         """Воронка по дням. WB отдаёт максимум за последнюю неделю.
 
         Поэтому суточные данные копятся у нас в nm_daily: за месяц назад
         их уже не спросить.
+
+        Артикулы у этого метода обязательны: в схеме WB nmIds это required,
+        от 1 до 20 значений, и запрос без них отклоняется целиком. Пустой
+        список сюда это ошибка того, кто зовёт, а не пустой ответ
+        Wildberries, поэтому он падает здесь и сразу, а не молча уходит
+        в сеть и возвращается четырёхсоткой.
+
+        Больше двадцати артикулов режутся на пачки тут же: помнить это
+        ограничение каждому агенту незачем. Пачки идут одна за другой по
+        медленной дорожке (3 запроса в минуту), паузу держит ограничитель
+        частоты. Кабинет на 500 артикулов собирается минут восемь, и это
+        осознанно: лучше медленнее, чем блокировка токена клиента.
+
+        Поля skipDeletedNm в схеме этого метода нет (оно есть у соседнего,
+        сводного), поэтому его здесь и не отправляем.
         """
-        body: dict[str, Any] = {
-            "selectedPeriod": {"start": day(start), "end": day(end)},
-            "aggregationLevel": aggregation_level,
-            "skipDeletedNm": False,
-        }
-        if nm_ids:
-            body["nmIds"] = [int(value) for value in nm_ids]
-        return _listify(await self.request("sales_funnel_history", json=body), "products", "items")
+        wanted = [int(value) for value in (nm_ids or ())]
+        if not wanted:
+            raise ValueError(
+                "sales_funnel_history: нужен хотя бы один артикул, "
+                "у метода Wildberries поле nmIds обязательное"
+            )
+        found: list[dict] = []
+        for part in chunks(wanted, FUNNEL_HISTORY_MAX_IDS):
+            body: dict[str, Any] = {
+                "selectedPeriod": {"start": day(start), "end": day(end)},
+                "aggregationLevel": aggregation_level,
+                "nmIds": part,
+            }
+            found.extend(
+                _listify(
+                    await self.request("sales_funnel_history", json=body), "products", "items"
+                )
+            )
+        return found
+
+    # --- видимость в поиске: пятый этап воронки, только с подпиской Джем ---
+
+    async def search_report(
+        self,
+        start: date | datetime | str,
+        end: date | datetime | str,
+        *,
+        past: tuple[date | datetime | str, date | datetime | str] | None = None,
+        nm_ids: Sequence[int] | None = None,
+        limit: int = SEARCH_REPORT_MAX_GROUPS,
+        max_pages: int = MAX_PAGES,
+    ) -> list[dict]:
+        """Основная страница отчёта по поисковым запросам, группами товаров.
+
+        Нужна ровно ради одного поля: `visibility` у каждого товара. Это
+        вероятность в процентах, что покупатель увидит карточку в поиске, а
+        не количество показов; показов Wildberries не отдаёт нигде.
+
+        Весь раздел поисковых запросов работает только с подпиской Джем, и у
+        кабинета без неё этот метод отвечает отказом. Это **нормальное
+        состояние**, а не сбой: тот, кто зовёт, ловит отказ и остаётся с
+        воронкой из четырёх этапов.
+
+        Пять полей тела запроса у Wildberries обязательные: `currentPeriod`,
+        `positionCluster`, `orderBy`, `limit` и `offset`. Сортировка по
+        заходам в карточку взята не для красоты: `limit` режет ответ по
+        группам товаров, и при обрезке остаться должны те товары, к которым
+        покупатели вообще заходят.
+
+        Отдаёт плоский список товаров из всех групп: группировка по предметам
+        и брендам этому боту не нужна, а разбирать её каждому вызывающему
+        по-своему значило бы развести разбор по агентам.
+        """
+        found: list[dict] = []
+        offset = 0
+        for _ in range(max_pages):
+            body: dict[str, Any] = {
+                "currentPeriod": {"start": day(start), "end": day(end)},
+                "positionCluster": "all",
+                "orderBy": {"field": "openCard", "mode": "desc"},
+                "limit": int(limit),
+                "offset": int(offset),
+            }
+            if past:
+                body["pastPeriod"] = {"start": day(past[0]), "end": day(past[1])}
+            if nm_ids:
+                body["nmIds"] = [int(value) for value in nm_ids]
+            groups = _listify(await self.request("search_report", json=body), "groups")
+            for group in groups:
+                found.extend(
+                    item for item in (group.get("items") or []) if isinstance(item, dict)
+                )
+            if len(groups) < int(limit):
+                break
+            offset += int(limit)
+        return found
 
     # --- остатки: замена отключённому методу из ТЗ ---
 

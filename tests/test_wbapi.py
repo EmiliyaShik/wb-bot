@@ -430,6 +430,128 @@ async def test_funnel_history_asks_by_day(cabinet):
     body = json.loads(seen[0].content)
     assert body["aggregationLevel"] == "day"
     assert body["selectedPeriod"] == {"start": "2026-09-01", "end": "2026-09-07"}
+    assert body["nmIds"] == [1]
+    # Поля skipDeletedNm в схеме этого метода нет, и мы его не шлём.
+    assert "skipDeletedNm" not in body
+
+
+@pytest.mark.asyncio
+async def test_funnel_history_without_articles_never_goes_to_wb(cabinet):
+    """nmIds у метода обязателен: пустой список это ошибка в коде, а не запрос."""
+    seen: list[httpx.Request] = []
+    client = build(cabinet, [ok({"data": []})], seen)
+
+    for empty in ([], None):
+        with pytest.raises(ValueError):
+            await client.sales_funnel_history("2026-09-01", "2026-09-07", empty)
+
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_funnel_history_splits_45_articles_into_three_batches(cabinet):
+    """WB берёт максимум 20 артикулов за запрос: 45 это 20 + 20 + 5."""
+    seen: list[httpx.Request] = []
+    client = build(cabinet, [ok({"data": []})], seen)
+
+    await client.sales_funnel_history("2026-09-01", "2026-09-07", list(range(1, 46)))
+
+    assert len(seen) == 3
+    batches = [json.loads(request.content)["nmIds"] for request in seen]
+    assert [len(batch) for batch in batches] == [20, 20, 5]
+    # Ни один артикул не потерялся и ни один не спрошен дважды.
+    assert sorted(nm_id for batch in batches for nm_id in batch) == list(range(1, 46))
+
+
+@pytest.mark.asyncio
+async def test_funnel_history_waits_between_batches(cabinet):
+    """Лимит дорожки 3 запроса в минуту: пачки ждут, а не летят подряд."""
+    time = FakeTime()
+    client = build(cabinet, [ok({"data": []})], None, time=time)
+
+    # 100 артикулов это 5 пачек: три уходят всплеском, две ждут по 20 секунд.
+    await client.sales_funnel_history("2026-09-01", "2026-09-07", list(range(1, 101)))
+
+    assert time.slept == [20.0, 20.0]
+
+
+@pytest.mark.asyncio
+async def test_adverts_info_cuts_by_50_campaigns(cabinet):
+    """Названия кампаний: WB берёт максимум 50 номеров за запрос."""
+    seen: list[httpx.Request] = []
+    client = build(
+        cabinet, [ok([{"id": 777, "settings": {"name": "Осень"}}])], seen
+    )
+
+    rows = await client.adverts_info(range(1, 121))
+
+    assert len(seen) == 3  # 120 кампаний это 50 + 50 + 20
+    for request in seen:
+        assert request.method == "GET"
+        assert len(request.url.params["ids"].split(",")) <= 50
+    assert rows[0]["settings"]["name"] == "Осень"
+
+
+@pytest.mark.asyncio
+async def test_adverts_info_without_campaigns_does_not_ask_wb(cabinet):
+    """Кабинет без кампаний это нормальное состояние, а не повод для запроса."""
+    seen: list[httpx.Request] = []
+    client = build(cabinet, [ok([])], seen)
+
+    assert await client.adverts_info([]) == []
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_advert_upd_cuts_the_period_by_31_days(cabinet):
+    """История затрат: WB берёт максимум 31 день за запрос."""
+    seen: list[httpx.Request] = []
+    client = build(cabinet, [ok([{"updNum": 1, "updSum": 500, "campName": "Осень"}])], seen)
+
+    rows = await client.advert_upd("2026-06-01", "2026-07-10")
+
+    assert len(seen) == 2  # 40 дней это два окна: 31 и 9
+    for request in seen:
+        assert request.method == "GET"
+        begin = date.fromisoformat(request.url.params["from"])
+        end = date.fromisoformat(request.url.params["to"])
+        assert (end - begin).days < 31
+    assert rows[0]["campName"] == "Осень"
+
+
+def test_new_advert_lanes_match_the_documented_limits():
+    """Дорожки новых методов заведены по числам из разведки, а не на глаз."""
+    from core.wbapi import limits
+
+    assert limits.LANES["adv-adverts"] == wbapi.Limit(5, 1.0, 5)
+    assert limits.LANES["adv-upd"] == wbapi.Limit(1, 1.0, 5)
+    assert wbapi.ENDPOINTS["adverts_info"].lane == "adv-adverts"
+    assert wbapi.ENDPOINTS["advert_upd"].lane == "adv-upd"
+
+
+def test_every_endpoint_has_a_lane_of_its_own_in_the_table():
+    """Дорожка без записи в LANES получает самый осторожный лимит молча.
+
+    Один запрос в минуту это правильная страховка от опечатки, но узнать о ней
+    было бы неоткуда: отчёт просто стал бы идти в двадцать раз дольше.
+    """
+    from core.wbapi import limits
+
+    missing = sorted(
+        name for name, spot in wbapi.ENDPOINTS.items() if spot.lane not in limits.LANES
+    )
+    assert not missing, "дорожки этих методов нет в LANES: " + ", ".join(missing)
+
+
+def test_the_search_report_lane_matches_the_documented_limit():
+    """Видимость это отдельный метод, и лимит у него свой: 3 в минуту."""
+    from core.wbapi import limits
+
+    assert limits.LANES["analytics-search"] == wbapi.Limit(3, 60.0, 3)
+    assert wbapi.ENDPOINTS["search_report"].lane == "analytics-search"
+    # Дорожка не общая с воронкой: иначе необязательный пятый этап тормозил бы
+    # суточный сбор, который терять нельзя.
+    assert wbapi.ENDPOINTS["sales_funnel_history"].lane != "analytics-search"
 
 
 def test_disabled_wb_methods_are_absent_from_the_code():
@@ -456,9 +578,12 @@ def test_only_reading_methods_have_wrappers():
         "sales_report_detailed",
         "sales_reports_list",
         "promotion_count",
+        "adverts_info",
         "fullstats",
+        "advert_upd",
         "sales_funnel_products",
         "sales_funnel_history",
+        "search_report",
         "stocks_wb_warehouses",
         "cards_list",
         "seller_info",
@@ -467,6 +592,31 @@ def test_only_reading_methods_have_wrappers():
     for name, endpoint in wbapi.ENDPOINTS.items():
         assert endpoint.verb in {"GET", "POST"}, name
         assert endpoint.host.endswith(".wildberries.ru"), name
+
+    # Глаголы записи: их нет ни у одной обёртки и появиться не должно.
+    assert not {endpoint.verb for endpoint in wbapi.ENDPOINTS.values()} & {
+        "PUT",
+        "PATCH",
+        "DELETE",
+    }
+    # Пути, которые меняют кабинет, в коде тоже не встречаются. Соседи по
+    # разделу продвижения названы поимённо: рядом с рекламными обёртками
+    # живут методы назначения минус-фраз и управления кампаниями.
+    from pathlib import Path
+
+    writing = (
+        "/normquery/set-minus",
+        "/adv/v0/rename",
+        "/adv/v1/pause",
+        "/adv/v1/start",
+        "/adv/v1/stop",
+        "/adv/v1/budget/deposit",
+    )
+    root = Path(wbapi.__file__).resolve().parent.parent.parent
+    for path in list((root / "core").rglob("*.py")) + list((root / "agents").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for method in writing:
+            assert method not in text, f"{path.name}: метод на запись {method}"
 
 
 # --- проверка связи: probe_hosts и команда /diag ---

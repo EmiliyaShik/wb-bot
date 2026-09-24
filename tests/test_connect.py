@@ -215,8 +215,18 @@ async def test_disconnect_leaves_no_row_of_the_client_in_any_table(db_path, read
         period_months=1,
         amount_kop=99000,
     )
+    # Видимость из поискового отчёта: новая клиентская таблица тоже обязана
+    # уходить вместе с клиентом, а не переживать его.
+    repo.insert(
+        "funnel_visibility",
+        date_from="2026-09-18",
+        date_to="2026-09-24",
+        nm_id=101,
+        visibility=7.0,
+    )
     filled = [table for table in db.CLIENT_TABLES if repo.count(table)]
-    assert len(filled) >= 6, filled
+    assert len(filled) >= 7, filled
+    assert "funnel_visibility" in filled
 
     clients.disconnect(ready, path=db_path)
 

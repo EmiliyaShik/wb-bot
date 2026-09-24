@@ -8,8 +8,10 @@
 Решения принимает core.lifecycle, тут только слова и кнопки. Кнопка
 «Выставить счёт» ведёт в диалог покупки таска 07, своего диалога здесь нет.
 
-Целевого ДРР в настройках нет намеренно: по брифу он относится к модулю
-ads, отложенному до этапа 3.
+Целевой ДРР тоже здесь: это настройка селлера, а не число в коде. Хранит и
+проверяет её `agents.ads`, экран только показывает и переключает. Кнопки
+стоят и у того, кто модуль «Реклама» не покупал: настройка бесплатная, а
+узнать про неё человеку иначе неоткуда.
 
 Разметку в сообщениях ставит только бот. Название модуля приходит из
 конфига, а все эти сообщения уходят с `ParseMode.HTML`, поэтому подстановка
@@ -22,6 +24,7 @@ from __future__ import annotations
 import functools
 import logging
 from datetime import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
+from agents import ads as ads_agent
 from agents import lifecycle
 from bot.handlers import costs as costs_handler
 from bot.handlers import tariffs
@@ -39,9 +43,16 @@ logger = logging.getLogger(__name__)
 
 PREFIX = "set:"
 TIME_PREFIX = f"{PREFIX}at:"
+DRR_PREFIX = f"{PREFIX}drr:"
 
 # Часы на выбор. Утро и только утро: отчёт нужен до того, как начнётся день.
 TIMES = ("07:00", "08:00", "09:00", "10:00", "11:00", "12:00")
+
+# Целевой ДРР на выбор, в процентах. Кнопки, а не ввод числа: диалог с
+# текстовым шагом в проекте уже занят счётом, а вторая такая же дорожка
+# перехватывала бы у него сообщения. Шаг в пять процентов: разницу между
+# 17 и 18 процентами цели никто не заметит, а лишние кнопки заметят все.
+DRR_CHOICES = (5, 10, 15, 20, 25, 30)
 
 HEAD = "⚙️ <b>Настройки рассылок</b>"
 
@@ -63,19 +74,40 @@ BODY = (
 )
 
 
+DRR_BLOCK = (
+    "🎯 <b>Целевой ДРР: {value}%</b>\n"
+    "Это ваша граница: сколько вы готовы отдавать рекламе с каждых ста рублей "
+    "выручки. По ней отчёт <code>/ads</code> отмечает кампании, которые "
+    "тратят больше."
+)
+
+
 def _mark(flag: bool) -> str:
     return "✅" if flag else "⬜"
 
 
+def drr_text(target: Any) -> Safe:
+    """Строка про целевой ДРР. Число приходит из настроек, а не из кода."""
+    return fill(DRR_BLOCK, value=_drr_label(target))
+
+
+def _drr_label(target: Any) -> str:
+    """Цель числом, без хвостовых нулей: 15, а не 15.00."""
+    text = f"{Decimal(str(target)):f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 def settings_text(
-    prefs: lifecycle.Prefs, state: costs_handler.Coverage | None = None
+    prefs: lifecycle.Prefs,
+    state: costs_handler.Coverage | None = None,
+    target: Any = None,
 ) -> Safe:
     """Что сейчас включено. Время показывается в часовом поясе расписания.
 
     Себестоимость это тоже состояние, и показывать его больше негде: прибыль
     по артикулам без неё не считается вовсе, а узнать об этом раньше пустого
     отчёта человеку было неоткуда. `state` необязателен, потому что бывают
-    вызовы без базы под рукой.
+    вызовы без базы под рукой, и `target` тоже.
     """
     body = fill(
         BODY,
@@ -85,13 +117,17 @@ def settings_text(
         weekly=ON if prefs.weekly else OFF,
     )
     blocks = [HEAD, body, EXPLAIN]
+    if target is not None:
+        blocks.append(drr_text(target))
     if state is not None:
         blocks.append(costs_handler.state_text(state))
     return Safe("\n\n".join(blocks))
 
 
 def keyboard(
-    prefs: lifecycle.Prefs, state: costs_handler.Coverage | None = None
+    prefs: lifecycle.Prefs,
+    state: costs_handler.Coverage | None = None,
+    target: Any = None,
 ) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -118,6 +154,21 @@ def keyboard(
             row = []
     if row:
         rows.append(row)
+    if target is not None:
+        row = []
+        current = _drr_label(target)
+        for percent in DRR_CHOICES:
+            mark = "🔹" if str(percent) == current else ""
+            row.append(
+                InlineKeyboardButton(
+                    f"{mark}{percent}%".strip(), callback_data=f"{DRR_PREFIX}{percent}"
+                )
+            )
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
     if state is not None and not state.complete:
         # Кнопка ровно там, где сказано про нехватку: дорога к себестоимости
         # уже есть, показать её надо в том же сообщении, а не в памяти.
@@ -303,17 +354,18 @@ async def settings_command(
         return
     prefs = lifecycle.prefs(client_id, path=path)
     state = costs_handler.coverage(client_id, path=path)
+    target = ads_agent.target_drr(client_id, path=path)
     await message.reply_text(
-        settings_text(prefs, state),
+        settings_text(prefs, state, target),
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboard(prefs, state),
+        reply_markup=keyboard(prefs, state, target),
     )
 
 
 async def toggle_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, path: str | Path | None = None
 ) -> None:
-    """Кнопки настроек: тумблеры и выбор времени."""
+    """Кнопки настроек: тумблеры, выбор времени и целевой ДРР."""
     query = update.callback_query
     if query is None:
         return
@@ -334,13 +386,22 @@ async def toggle_callback(
         except ValueError:
             logger.warning("не разобрать время из кнопки: %s", data)
             return
+    elif data.startswith("drr:"):
+        # `callback_data` приходит от клиента и подделывается свободно:
+        # принимаем только те проценты, которые сами и нарисовали. Иначе цель
+        # в ноль или в миллион приехала бы прямо в настройки кабинета.
+        if data[4:] not in {str(value) for value in DRR_CHOICES}:
+            logger.warning("не разобрать целевой ДРР из кнопки: %s", data)
+            return
+        ads_agent.set_target_drr(client_id, data[4:], path=path)
 
     state = costs_handler.coverage(client_id, path=path)
+    target = ads_agent.target_drr(client_id, path=path)
     try:
         await query.edit_message_text(
-            settings_text(prefs, state),
+            settings_text(prefs, state, target),
             parse_mode=ParseMode.HTML,
-            reply_markup=keyboard(prefs, state),
+            reply_markup=keyboard(prefs, state, target),
         )
     except Exception:  # noqa: BLE001 - Telegram ругается на неизменённый текст
         logger.debug("сообщение настроек не обновилось", exc_info=True)

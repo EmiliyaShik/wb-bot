@@ -286,7 +286,9 @@ def test_every_visible_module_gets_a_line_from_the_config(db_path, five_weeks):
     assert shown == {
         name for name, info in config.modules().items() if info.visible and info.diagnostic_line
     }
-    assert "ads" not in shown and "funnel" not in shown
+    # Владелец открыл всё, включая пакет: строку получает каждый модуль.
+    assert shown == set(config.visible_modules())
+    assert {"ads", "funnel", "all"} <= shown
     for line in result.lines:
         assert line.line == config.modules()[line.module].diagnostic_line
 

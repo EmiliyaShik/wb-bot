@@ -455,8 +455,9 @@ async def test_settings_shows_both_toggles_and_the_time(db_path):
     ]
     assert f"{settings_handler.PREFIX}daily" in buttons
     assert f"{settings_handler.PREFIX}weekly" in buttons
-    # Целевого ДРР в настройках нет: он относится к модулю ads, этап 3.
-    assert "ДРР" not in text
+    # Целевой ДРР тоже живёт здесь: это настройка селлера, а не число в коде.
+    assert "Целевой ДРР" in text and "15%" in text
+    assert f"{settings_handler.DRR_PREFIX}15" in buttons
 
 
 @pytest.mark.asyncio

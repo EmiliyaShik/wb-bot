@@ -28,7 +28,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-from core import access, db, queue, scheduler, wbapi
+from core import access, config, db, queue, scheduler, wbapi
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,9 @@ SPEED_DAYS = 14
 STOCK_ALERT_DAYS = 14
 # Сколько артикулов показываем в блоке остатков.
 STOCK_LIMIT = 10
+# Сколько артикулов забирать суточной воронкой, если в config.toml про это
+# не сказано ничего. Число настраивает владелец, секция [funnel].
+FUNNEL_ARTICLES_DEFAULT = 200
 
 CENT = Decimal("0.01")
 
@@ -283,6 +286,117 @@ def _ad_totals(campaigns: Iterable[dict]) -> dict[tuple[str, int], dict[str, int
     return totals
 
 
+# --- какие артикулы спрашивать ---
+
+
+def funnel_articles_limit() -> int:
+    """Сколько артикулов забирать суточной воронкой. Число из `config.toml`.
+
+    Ноль и меньше значат «без предела»: у кабинета на две тысячи артикулов
+    это больше получаса машинного времени в сутки, и решает это владелец,
+    а не код.
+    """
+    try:
+        section = config.settings().get("funnel") or {}
+        return int(section.get("daily_articles", FUNNEL_ARTICLES_DEFAULT))
+    except (KeyError, TypeError, ValueError, OSError):
+        return FUNNEL_ARTICLES_DEFAULT
+
+
+def _period_revenue_kop(product: dict) -> int:
+    """Выручка артикула за период из свода воронки, в копейках."""
+    statistic = product.get("statistic")
+    selected = (statistic or {}).get("selected") if isinstance(statistic, dict) else None
+    return _kop((selected or {}).get("orderSum")) if isinstance(selected, dict) else 0
+
+
+def _ranked_articles(products: Iterable[dict]) -> list[int]:
+    """Артикулы свода воронки: сначала те, что продаются.
+
+    Порядок важен из-за предела: подряд первыми ушли бы случайные артикулы,
+    а про товар, который приносит деньги, знать нужнее. При равной выручке
+    порядок по номеру, чтобы от захода к заходу собирались одни и те же.
+    """
+    revenue: dict[int, int] = {}
+    for product in products:
+        nm_id = _nm_id(product)
+        if nm_id is None:
+            continue
+        revenue[nm_id] = max(revenue.get(nm_id, 0), _period_revenue_kop(product))
+    return [nm_id for nm_id, _ in sorted(revenue.items(), key=lambda item: (-item[1], item[0]))]
+
+
+def _articles_from_history(
+    client_id: int, last: date, *, days: int = SPEED_DAYS, path: str | Path | None = None
+) -> list[int]:
+    """Запасной источник: артикулы, которые уже встречались в собранных сутках.
+
+    Нужен, когда свод воронки не ответил. Терять из-за одного неудачного
+    запроса весь суточный сбор нельзя: WB отдаёт историю максимум за неделю,
+    и не забранное сегодня не вернуть никогда.
+    """
+    repo = db.repo(client_id, path)
+    orders: dict[int, int] = {}
+    for stamp in _days_back(last, days):
+        for row in repo.rows("nm_daily", date=stamp):
+            nm_id = int(row["nm_id"])
+            orders[nm_id] = orders.get(nm_id, 0) + int(row["orders"] or 0)
+    return [nm_id for nm_id, _ in sorted(orders.items(), key=lambda item: (-item[1], item[0]))]
+
+
+async def _funnel_articles(
+    client: Any,
+    client_id: int,
+    start: date,
+    last: date,
+    *,
+    known: Iterable[int] = (),
+    path: str | Path | None = None,
+) -> list[int]:
+    """Список артикулов для суточной воронки, в порядке отбора.
+
+    Первый источник это свод воронки за то же окно: он лежит в той же
+    категории токена «Аналитика», что и сама суточная воронка, то есть
+    новых требований к кабинету не создаёт, берёт до тысячи артикулов за
+    один запрос и заодно говорит, что у селлера продаётся.
+
+    Каталог карточек (категория «Контент») сюда не годится по той же
+    причине, по какой годится свод: категории «Контент» у клиента может не
+    быть вовсе, а без суточной воронки остаётся весь план-факт. Если свод
+    не ответил, идут запасные источники: уже собранные нами сутки, а если и
+    их нет (первый день кабинета), артикулы из остатков, за которыми мы всё
+    равно только что сходили.
+    """
+    ranked: list[int] = []
+    try:
+        ranked = _ranked_articles(await client.sales_funnel_products(start, last))
+    except (
+        wbapi.WBForbiddenError,
+        wbapi.WBUnavailable,
+        wbapi.WBRateLimited,
+        wbapi.WBApiError,
+    ) as error:
+        logger.warning(
+            "свод воронки клиента %s не получен, беру артикулы из собранного: %s",
+            client_id,
+            error,
+        )
+    if not ranked:
+        ranked = _articles_from_history(client_id, last, path=path)
+    if not ranked:
+        ranked = sorted({int(value) for value in known})
+    limit = funnel_articles_limit()
+    if limit > 0 and len(ranked) > limit:
+        logger.info(
+            "у клиента %s артикулов больше предела (%s из %s), беру самые оборотистые",
+            client_id,
+            limit,
+            len(ranked),
+        )
+        return ranked[:limit]
+    return ranked
+
+
 # --- сбор суток ---
 
 
@@ -307,13 +421,28 @@ async def collect(
     Забирается не один вчерашний день, а окно в неделю: WB больше недели всё
     равно не отдаёт, а окно само закрывает дыры, если бот сутки не работал.
     Повторный заход за тот же день ничего не портит, строка перезаписывается.
+
+    Воронка по дням спрашивается по списку артикулов (у метода WB это
+    обязательное поле) пачками по двадцать, и на большом кабинете сбор идёт
+    минутами. Предел на число артикулов живёт в `config.toml`, секция
+    `[funnel]`.
     """
     day = day or yesterday()
     start = day - timedelta(days=max(1, int(window)) - 1)
     client = wbapi.get_wb_client(client_id, http=http, path=path, clock=clock, sleep=sleep)
 
-    rows = _funnel_rows(await client.sales_funnel_history(start, day))
+    # Остатки идут первыми не случайно: этот запрос делается всё равно, а
+    # его артикулы годятся в самый последний запасной список для воронки.
     stocks = _stock_totals(await client.stocks_wb_warehouses())
+
+    # Суточную воронку Wildberries не отдаёт без артикулов: nmIds у метода
+    # обязателен. Откуда их взять и сколько взять, решает _funnel_articles.
+    nm_ids = await _funnel_articles(client, client_id, start, day, known=stocks, path=path)
+    rows: dict[tuple[str, int], dict[str, Any]] = {}
+    if nm_ids:
+        rows = _funnel_rows(await client.sales_funnel_history(start, day, nm_ids))
+    else:
+        logger.warning("у клиента %s не нашлось ни одного артикула для воронки", client_id)
 
     # Реклама это отдельная категория токена. Её может не быть, и тогда
     # пропадает только расход: терять из-за этого всю историю нельзя.

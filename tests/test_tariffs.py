@@ -25,9 +25,11 @@ def test_tariffs_shows_only_visible_modules_with_prices_from_config(db_path, cli
     assert "990" in text and "590" in text
     # Скидка 10 процентов за 3 месяца: 990 * 3 = 2970, минус 10 процентов.
     assert "2 673" in text
-    # C11: ads и funnel описаны в конфиге, но их не видно и не купить.
-    assert "Реклама" not in text and "Воронка" not in text
-    assert "1 290" not in text
+    # Реклама и воронка открыты: их цены на витрине есть.
+    assert "Реклама" in text and "1 290" in text
+    assert "Воронка" in text and "490" in text
+    # Пакет владелец открыл: он стоит на витрине со своей ценой.
+    assert "Всё сразу" in text and "2 490" in text
 
 
 def test_the_shop_window_has_a_buy_button_for_every_module_it_sells():
@@ -44,13 +46,27 @@ def test_the_shop_window_has_a_buy_button_for_every_module_it_sells():
         # Надпись называет модуль: три «Оформить» подряд неразличимы.
         assert info.title in offered[f"buy:{name}"]
 
-    hidden = [name for name, info in config.modules().items() if not info.visible]
-    assert hidden, "в конфиге не осталось скрытых модулей, тест потерял смысл"
-    for name in hidden:
-        assert f"buy:{name}" not in offered, f"скрытый модуль {name} на витрине"
-
     # Ряд на модуль: на телефоне так читается.
     assert all(len(row) == 1 for row in rows)
+
+
+def test_a_hidden_module_does_not_get_a_buy_button(monkeypatch):
+    """Скрытых модулей в конфиге не осталось: владелец открыл все четыре и
+    пакет. Модуль прячется здесь же, чтобы правило оставалось проверенным и в
+    тот день, когда владелец снова что-нибудь скроет."""
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["funnel"]["visible"] = False
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+    offered = {
+        button.callback_data
+        for row in tariffs.tariffs_keyboard().inline_keyboard
+        for button in row
+    }
+    assert "buy:funnel" not in offered
+    assert offered == {f"buy:{name}" for name in config.visible_modules()}
+    assert tariffs.for_sale("funnel") is False
+    assert "Воронка" not in tariffs.tariffs_text()
 
 
 @pytest.mark.asyncio
@@ -69,12 +85,19 @@ async def test_the_shop_window_arrives_with_those_buttons(db_path, client_id):
 
 
 @pytest.mark.asyncio
-async def test_a_button_from_the_shop_window_goes_through_the_same_check(db_path):
+async def test_a_button_from_the_shop_window_goes_through_the_same_check(
+    db_path, monkeypatch
+):
     """Дорожка к оплате одна: кнопка витрины и кнопка отказа ведут в buy_callback.
 
     Поэтому подделанный callback_data со скрытым модулем покупку не открывает,
-    хотя такой кнопки не нарисовано нигде.
+    хотя такой кнопки не нарисовано нигде. Скрытых модулей в конфиге не
+    осталось, поэтому модуль прячется здесь же.
     """
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["funnel"]["visible"] = False
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
     reached = []
 
     async def fake_dialog(update_, context_, module):
@@ -91,12 +114,12 @@ async def test_a_button_from_the_shop_window_goes_through_the_same_check(db_path
 
         # Тот же обработчик, но данные сочинил клиент.
         message = FakeMessage()
-        update = FakeUpdate(300301, message, FakeQuery("buy:all", message))
+        update = FakeUpdate(300301, message, FakeQuery("buy:funnel", message))
         await tariffs.buy_callback(update, None, path=db_path)
     finally:
         tariffs.set_buy_dialog(None)
 
-    assert reached == list(config.visible_modules()), "пакет сняли с продажи, а счёт открылся"
+    assert reached == list(config.visible_modules()), "модуль скрыт, а счёт открылся"
     assert message.sent, "отказ должен быть понятным, а не тишиной"
 
 
@@ -213,14 +236,21 @@ def test_rubles_rounds_the_decimal_instead_of_cutting_it():
     assert tariffs.rubles(Decimal("2672.49")) == "2 672 ₽"
 
 
-def test_hidden_modules_cannot_be_taken_even_for_a_trial():
+def test_hidden_modules_cannot_be_taken_even_for_a_trial(monkeypatch):
+    """Скрытых модулей в конфиге не осталось, поэтому модуль прячется здесь же:
+    на пробу скрытое не выдаётся и кнопки не имеет."""
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["funnel"]["visible"] = False
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
     offered = {
         button.callback_data
         for row in tariffs.trial_keyboard().inline_keyboard
         for button in row
     }
-    assert "trial:ads" not in offered and "trial:funnel" not in offered
+    assert "trial:funnel" not in offered
     assert "trial:finance" in offered
+    assert "trial:ads" in offered
 
 
 def test_handler_registers_itself():
@@ -287,9 +317,9 @@ def test_a_module_with_a_single_report_keeps_its_old_short_description():
     assert tariffs.what_it_gives("rnp") in text
     assert "<b>План-факт</b>, команда" not in text
 
-    # И модуль без списка отчётов вовсе тоже жив: у скрытых его нет.
-    assert tariffs.reports_of("ads") == ()
-    assert tariffs.report_lines("ads") == []
+    # И модуль без списка отчётов вовсе тоже жив: у пакета его нет.
+    assert tariffs.reports_of("all") == ()
+    assert tariffs.report_lines("all") == []
 
 
 def test_a_report_text_from_config_does_not_become_markup(monkeypatch):
@@ -305,10 +335,16 @@ def test_a_report_text_from_config_does_not_become_markup(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_buy_button_refuses_a_module_that_is_not_for_sale():
-    """Кнопки ads нет ни на одной клавиатуре, но callback_data можно прислать руками."""
+async def test_buy_button_refuses_a_module_that_is_not_for_sale(monkeypatch):
+    """Кнопки скрытого модуля нет ни на одной клавиатуре, но callback_data
+    шлётся руками. Скрытых в конфиге не осталось, поэтому модуль прячется здесь.
+    """
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["funnel"]["visible"] = False
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
     message = FakeMessage()
-    update = FakeUpdate(400400, message, FakeQuery("buy:ads", message))
+    update = FakeUpdate(400400, message, FakeQuery("buy:funnel", message))
     reached = []
 
     async def fake_dialog(update_, context_, module):
@@ -322,7 +358,7 @@ async def test_buy_button_refuses_a_module_that_is_not_for_sale():
 
     assert reached == [], "счёт не должен выставляться на скрытый модуль"
     assert message.sent, "отказ должен быть понятным, а не тишиной"
-    assert tariffs.for_sale("ads") is False
+    assert tariffs.for_sale("funnel") is False
     assert tariffs.for_sale("finance") is True
 
 
@@ -391,37 +427,79 @@ def test_a_description_that_ends_with_a_question_keeps_its_sign(monkeypatch):
     assert "?." not in text
 
 
-# --- пакет «Всё сразу» снят с продажи ---
+# --- пакет «Всё сразу» открыт ---
 #
-# Два открытых модуля из четырёх стоят 990 + 590, а пакет 2290: обещание
-# «дешевле, чем по отдельности» перестало быть правдой. Вернётся вместе с ads и
-# funnel. Скрыт он тем же способом, что и они: visible = false в конфиге.
+# Владелец открыл пакет и назначил цену. По отдельности четыре модуля это
+# 990 + 590 + 1290 + 490 = 3360, пакет стоит 2490: дешевле на 870, то есть на
+# 26 процентов. Продаётся он как обычный модуль, но пробно не выдаётся
+# никогда: пробуют по одному модулю, а не всё сразу.
 
 
-def test_the_package_is_not_sold_while_only_two_modules_are_open():
-    assert config.modules()["all"].visible is False
-    assert tariffs.for_sale("all") is False
-    assert "all" not in config.visible_modules()
+def test_the_package_is_sold_but_never_given_for_a_trial(db_path):
+    assert config.modules()["all"].visible is True
+    assert tariffs.for_sale("all") is True
+    assert "all" in config.visible_modules()
 
     text = tariffs.tariffs_text()
-    assert "Всё сразу" not in text
-    assert "2 290" not in text
+    assert "Всё сразу" in text
+    assert "2 490" in text
 
     offered = {
         button.callback_data
         for row in tariffs.tariffs_keyboard().inline_keyboard
         for button in row
     }
-    assert "buy:all" not in offered
-    # А два оставшихся модуля продаются как раньше.
-    assert offered == {"buy:finance", "buy:rnp"}
-    assert "Финансы" in text and "План-факт" in text
+    assert offered == {"buy:finance", "buy:rnp", "buy:ads", "buy:funnel", "buy:all"}
+    assert "Финансы" in text and "План-факт" in text and "Реклама" in text
+    assert "Воронка" in text
+
+    # Кнопки пробного периода у пакета нет, и держится это не клавиатурой:
+    # правило живёт в start_trial, поэтому и подделанный trial:all пуст.
+    trial_offered = {
+        button.callback_data
+        for row in tariffs.trial_keyboard().inline_keyboard
+        for button in row
+    }
+    assert "trial:all" not in trial_offered
+
+    admin = db.admin_repo(db_path)
+    client = admin.ensure_client(300302)
+    admin.set_client_fields(client, seller_id="WB-302")
+    with pytest.raises(access.TrialDenied) as denied:
+        access.start_trial(client, "all", path=db_path)
+    assert denied.value.reason == "package"
+    assert access.has_access(client, "all", path=db_path) is False
+    assert admin.trials("WB-302") == []
 
 
-def test_the_package_is_gone_from_the_trial_and_the_two_modules_are_not():
+@pytest.mark.asyncio
+async def test_a_forged_trial_callback_does_not_hand_out_the_package(db_path):
+    """Кнопки trial:all нет ни на одной клавиатуре, но callback_data сочиняется.
+
+    Правило «пакеты пробно не отдаём» жило в клавиатуре, и подделанный trial:all
+    отдавал пакет бесплатно на неделю. Теперь оно живёт в start_trial, и дорожка
+    от кнопки до выдачи проверяется целиком: отказ доказан состоянием.
+    """
+    admin = db.admin_repo(db_path)
+    client = admin.ensure_client(300303)
+    admin.set_client_fields(client, seller_id="WB-303")
+
+    message = FakeMessage()
+    update = FakeUpdate(300303, message, FakeQuery("trial:all", message))
+    await tariffs.trial_callback(update, None, path=db_path)
+
+    assert access.has_access(client, "all", path=db_path) is False
+    assert access.access_of(client, "all", path=db_path).state == "off"
+    # Попытка не потрачена: пробный период на модуль клиенту ещё доступен.
+    assert admin.trials("WB-303") == []
+    assert access.start_trial(client, "finance", path=db_path).state == "active"
+    assert message.sent, "отказ должен быть понятным, а не тишиной"
+
+
+def test_the_package_is_gone_from_the_trial_and_the_open_modules_are_not():
     offered = {
         button.callback_data
         for row in tariffs.trial_keyboard().inline_keyboard
         for button in row
     }
-    assert offered == {"trial:finance", "trial:rnp"}
+    assert offered == {"trial:finance", "trial:rnp", "trial:ads", "trial:funnel"}

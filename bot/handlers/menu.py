@@ -50,16 +50,20 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
+from agents import ads as ads_agent
 from agents import finance as finance_agent
+from agents import funnel as funnel_agent
 from agents import rnp as rnp_agent
 from agents import watchdog as watchdog_agent
 from bot import texts
 from bot.handlers import (
+    ads,
     connect,
     costs,
     diagnostic,
     dynamics,
     finance,
+    funnel,
     profit,
     rnp,
     settings,
@@ -201,6 +205,8 @@ FINANCE = "finance"
 DYNAMICS = "dynamics"
 PROFIT = "profit"
 RNP = "rnp"
+ADS = "ads"
+FUNNEL = "funnel"
 REPORTS = "reports"
 TARIFFS = "tariffs"
 SETTINGS = "settings"
@@ -233,6 +239,10 @@ ACTIONS: dict[str, Action] = {
         needs=finance_agent.MODULE,
     ),
     RNP: Action("📈 План-факт", rnp, "rnp_command", needs=rnp_agent.MODULE),
+    ADS: Action("📣 Реклама", ads, "ads_command", needs=ads_agent.MODULE),
+    FUNNEL: Action(
+        "🔻 Воронка", funnel, "funnel_command", needs=funnel_agent.MODULE
+    ),
     # Экран отчётов это единственная кнопка, за которой нет команды: полного
     # списка отчётов в меню Telegram не собрать, там команды идут вперемешку
     # с подключением и оплатой. Своей команды он не заводит нарочно, иначе

@@ -61,14 +61,37 @@ def test_after_the_term_comes_grace_then_off(db_path, client_id):
     assert access.has_access(client_id, "rnp", now=after, path=db_path) is False
 
 
-def test_all_opens_every_visible_module_and_no_hidden_one(db_path, client_id):
+def test_all_opens_every_visible_module_and_no_hidden_one(
+    db_path, client_id, monkeypatch
+):
+    """Пакет открывает всё видимое и ничего скрытого.
+
+    Скрытых модулей в конфиге сейчас не осталось: открылись все четыре, скрыт
+    только сам пакет. Поэтому один модуль прячется здесь, прямо в тесте:
+    правило про скрытые должно держаться и в тот день, когда владелец снова
+    что-нибудь скроет.
+    """
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["funnel"]["visible"] = False
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
     access.grant_access(
         client_id, "all", 30, "WBR-2026-0003", "invoice", "system",
         now=T0, path=db_path,
     )
-    for name in ("finance", "rnp"):
+    for name in ("finance", "rnp", "ads"):
         assert access.has_access(client_id, name, now=T0, path=db_path) is True
-    assert access.has_access(client_id, "ads", now=T0, path=db_path) is False
+    assert access.has_access(client_id, "funnel", now=T0, path=db_path) is False
+
+
+def test_all_opens_the_funnel_too_now_that_it_is_on_sale(db_path, client_id):
+    """Модуль открылся и вошёл в пакет сам: список считается из конфига."""
+    access.grant_access(
+        client_id, "all", 30, "WBR-2026-0033", "invoice", "system",
+        now=T0, path=db_path,
+    )
+    for name in config.visible_modules():
+        assert access.has_access(client_id, name, now=T0, path=db_path) is True
 
 
 def test_pause_does_not_burn_paid_days(db_path, client_id):
@@ -117,12 +140,47 @@ def test_status_lists_visible_modules_with_state_and_date(db_path, client_id):
     assert table["finance"].state == "active"
     assert table["finance"].until == T0 + timedelta(days=30)
     assert table["rnp"].state == "off"
+    # Пакет открыт и стоит в таблице наравне с модулями: купленного пакета у
+    # этого клиента нет, значит он выключен, а не скрыт.
+    assert table["all"].state == "off"
+
+
+def test_status_shows_a_hidden_module_only_when_asked(db_path, client_id, monkeypatch):
+    """Скрытый модуль не купить, поэтому в обычной таблице его нет вовсе.
+
+    Скрытых модулей в конфиге не осталось: владелец открыл и все четыре модуля,
+    и пакет. Модуль прячется здесь, прямо в тесте, чтобы правило оставалось
+    проверенным и в тот день, когда владелец снова что-нибудь скроет.
+    """
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["funnel"]["visible"] = False
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+    table = {row.module: row for row in access.status(client_id, now=T0, path=db_path)}
+    assert "funnel" not in table
+    assert set(table) == set(config.visible_modules())
 
     with_hidden = {
         row.module: row
         for row in access.status(client_id, now=T0, path=db_path, include_hidden=True)
     }
-    assert with_hidden["ads"].state == "hidden"
+    assert with_hidden["funnel"].state == "hidden"
+    assert set(with_hidden) == set(config.modules())
+
+
+def test_a_client_with_the_package_sees_every_module_covered_by_it(db_path, client_id):
+    """Куплен пакет: в таблице работают все модули, и видно, чем они открыты."""
+    access.grant_access(
+        client_id, "all", 30, "WBR-2026-0055", "invoice", "system",
+        now=T0, path=db_path,
+    )
+    table = {row.module: row for row in access.status(client_id, now=T0, path=db_path)}
+    assert set(table) == set(config.visible_modules())
+    for name, row in table.items():
+        assert row.works is True, name
+        assert row.until == T0 + timedelta(days=30), name
+        # У модулей источник называет пакет, у самого пакета - способ оплаты.
+        assert row.source == ("invoice" if name == "all" else "all"), name
 
 
 def test_days_left_is_counted_from_the_moment_the_status_was_built(db_path, client_id):
@@ -164,39 +222,41 @@ def test_revoke_switches_off_logs_once_and_is_safe_to_repeat(db_path, client_id)
     assert rows[-1]["days"] == 20
 
 
-@pytest.mark.parametrize(
-    "module, reason",
-    # Пакет «all» снят с продажи (visible = false), пока открыты два модуля из
-    # четырёх, поэтому причина отказа у него теперь общая со скрытыми: не
-    # продаётся. Правило «пакет пробно не даём» от этого не исчезло, оно
-    # проверяется следующим тестом на видимом пакете.
-    [("all", "not_sold"), ("ads", "not_sold"), ("funnel", "not_sold")],
-)
-def test_trial_is_refused_for_packages_and_hidden_modules(db_path, module, reason):
-    """callback_data не доверенный канал: запрет живёт в функции, не в клавиатуре."""
+def test_trial_is_refused_for_a_hidden_module(db_path, monkeypatch):
+    """callback_data не доверенный канал: запрет живёт в функции, не в клавиатуре.
+
+    Скрытых модулей в конфиге не осталось, владелец открыл все четыре и пакет,
+    поэтому модуль прячется здесь же: правило должно держаться и в тот день,
+    когда владелец снова что-нибудь скроет.
+    """
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["funnel"]["visible"] = False
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
     admin = db.admin_repo(db_path)
     client = admin.ensure_client(777777)
     admin.set_client_fields(client, seller_id="WB-555")
 
     with pytest.raises(access.TrialDenied) as denied:
-        access.start_trial(client, module, now=T0, path=db_path)
-    assert denied.value.reason == reason
+        access.start_trial(client, "funnel", now=T0, path=db_path)
+    assert denied.value.reason == "not_sold"
 
     # Отказ доказан состоянием: доступа нет и попытка не потрачена.
-    assert access.has_access(client, module, now=T0, path=db_path) is False
+    assert access.has_access(client, "funnel", now=T0, path=db_path) is False
     assert admin.trials("WB-555") == []
     assert access.start_trial(client, "finance", now=T0, path=db_path).state == "active"
 
 
-def test_a_package_back_on_sale_is_still_not_given_for_a_trial(db_path, monkeypatch):
-    """Пакет пробно не даём и когда он продаётся: пробуют по одному модулю.
+def test_a_package_on_sale_is_never_given_for_a_trial(db_path):
+    """Пакет продаётся, но пробно не выдаётся: пробуют по одному модулю.
 
-    Сейчас пакет скрыт, и до этой проверки очередь не доходит. Тест держит
-    правило до того дня, когда пакет вернётся вместе с ads и funnel.
+    Отказ обязан идти по своей причине. Пока пакет был скрыт, до этой проверки
+    очередь не доходила: раньше срабатывала видимость, и правило «пакеты пробно
+    не даём» держалось случайно. Поэтому первой строкой проверяется, что пакет
+    именно продаётся, - иначе тест снова доказывал бы не то.
     """
-    patched = copy.deepcopy(config.settings())
-    patched["modules"]["all"]["visible"] = True
-    monkeypatch.setattr(config, "settings", lambda: patched)
+    assert config.modules()["all"].visible is True
+    assert "all" in access.packages()
 
     admin = db.admin_repo(db_path)
     client = admin.ensure_client(777778)
@@ -205,7 +265,12 @@ def test_a_package_back_on_sale_is_still_not_given_for_a_trial(db_path, monkeypa
     with pytest.raises(access.TrialDenied) as denied:
         access.start_trial(client, "all", now=T0, path=db_path)
     assert denied.value.reason == "package"
+
+    # Отказ доказан состоянием: пакета нет, попытка не потрачена, и она
+    # по-прежнему доступна для обычного модуля.
+    assert access.has_access(client, "all", now=T0, path=db_path) is False
     assert admin.trials("WB-556") == []
+    assert access.start_trial(client, "finance", now=T0, path=db_path).state == "active"
 
 
 def test_the_one_trial_taken_by_another_process_leaves_nothing_to_take(db_path):

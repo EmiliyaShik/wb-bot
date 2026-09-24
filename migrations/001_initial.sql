@@ -218,6 +218,108 @@ CREATE TABLE IF NOT EXISTS nm_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_nm_daily_date ON nm_daily(client_id, date);
 
+-- Реклама. Копится у нас по той же причине, что и суточная воронка, но
+-- граница другая: Wildberries отдаёт статистику только по кампаниям в
+-- статусах 7, 9 и 11 (завершена, активна, на паузе). Кампания, которую
+-- селлер удалил или отменил, уносит свою историю с собой, и выгрузить её
+-- задним числом уже нельзя.
+CREATE TABLE IF NOT EXISTS ad_campaigns (
+    client_id   INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    advert_id   INTEGER NOT NULL,
+    -- Название кампании пишет сам селлер. Это чужой текст: в книгу Excel он
+    -- едет как есть, а в сообщение бота только через bot.texts.fill.
+    name        TEXT NOT NULL DEFAULT '',
+    advert_type INTEGER,
+    status      INTEGER,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (client_id, advert_id)
+);
+
+-- Кампания за сутки. Разрез готовый, складывать его не приходится:
+-- spend_kop это поле sum, ad_revenue_kop это поле sum_price, и оба лежат в
+-- одной строке ответа. Именно поэтому ДРР рекламы считается внутри одного
+-- источника, без сшивки с финансовым отчётом.
+CREATE TABLE IF NOT EXISTS ad_daily (
+    client_id      INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    date           TEXT NOT NULL,
+    advert_id      INTEGER NOT NULL,
+    views          INTEGER NOT NULL DEFAULT 0,
+    clicks         INTEGER NOT NULL DEFAULT 0,
+    atbs           INTEGER NOT NULL DEFAULT 0,
+    orders         INTEGER NOT NULL DEFAULT 0,
+    shks           INTEGER NOT NULL DEFAULT 0,
+    canceled       INTEGER NOT NULL DEFAULT 0,
+    spend_kop      INTEGER NOT NULL DEFAULT 0,
+    ad_revenue_kop INTEGER NOT NULL DEFAULT 0,
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (client_id, date, advert_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ad_daily_date ON ad_daily(client_id, date);
+
+-- Кампания, сутки и артикул. Нужна второй цифре ДРР: без неё неизвестно,
+-- какие товары кампания рекламировала, а значит и с какой выручкой её
+-- расход сравнивать. Расход по артикулу размазан по площадкам, и здесь он
+-- уже сложен.
+CREATE TABLE IF NOT EXISTS ad_nm_daily (
+    client_id      INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    date           TEXT NOT NULL,
+    advert_id      INTEGER NOT NULL,
+    nm_id          INTEGER NOT NULL,
+    views          INTEGER NOT NULL DEFAULT 0,
+    clicks         INTEGER NOT NULL DEFAULT 0,
+    atbs           INTEGER NOT NULL DEFAULT 0,
+    orders         INTEGER NOT NULL DEFAULT 0,
+    shks           INTEGER NOT NULL DEFAULT 0,
+    spend_kop      INTEGER NOT NULL DEFAULT 0,
+    ad_revenue_kop INTEGER NOT NULL DEFAULT 0,
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (client_id, date, advert_id, nm_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ad_nm_daily_date ON ad_nm_daily(client_id, date);
+
+-- Фактически списанные суммы. Статистический расход (sum) и выставленная
+-- сумма (updSum) расходятся: часть расхода могла уйти бонусами или кэшбэком,
+-- и об этом говорит payment_type. Показываются обе цифры, расхождение не
+-- прячется - тот же приём, что и в сверке финансового отчёта.
+CREATE TABLE IF NOT EXISTS ad_upd (
+    client_id    INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    date         TEXT NOT NULL,
+    advert_id    INTEGER NOT NULL,
+    upd_num      INTEGER NOT NULL DEFAULT 0,
+    sum_kop      INTEGER NOT NULL DEFAULT 0,
+    payment_type TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (client_id, date, advert_id, upd_num)
+);
+CREATE INDEX IF NOT EXISTS idx_ad_upd_date ON ad_upd(client_id, date);
+
+-- Пятый этап воронки: видимость товара в поиске. Это НЕ показы и не штуки, а
+-- вероятность в процентах, что покупатель увидит карточку; Wildberries считает
+-- её по средней позиции. Раздел поисковых запросов доступен только с подпиской
+-- Джем, поэтому у большинства кабинетов эта таблица останется пустой, и это
+-- нормальное состояние, а не сбой: без неё воронка живёт четырьмя этапами.
+--
+-- Ключ включает границы периода, а не одну дату: видимость приходит средней
+-- за запрошенный период и одному дню не принадлежит. Отчёт спрашивает ровно
+-- те границы, за которые сам и собран, поэтому промаха тут быть не может.
+CREATE TABLE IF NOT EXISTS funnel_visibility (
+    client_id  INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    date_from  TEXT NOT NULL,
+    date_to    TEXT NOT NULL,
+    nm_id      INTEGER NOT NULL,
+    -- Проценты и доли в этом проекте остаются REAL: деньгами они не являются.
+    visibility REAL,
+    -- Динамика против прошлого периода в процентах, готовое поле Wildberries.
+    -- Видимость прошлого периода он не отдаёт, а вычислять её из динамики
+    -- нельзя: сама видимость приходит целым процентом, и деление на такой
+    -- округлённой цифре наврало бы больше, чем показало.
+    dynamics   REAL,
+    open_card  INTEGER,
+    avg_position REAL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (client_id, date_from, date_to, nm_id)
+);
+
 CREATE TABLE IF NOT EXISTS plans (
     client_id          INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
     year_month         TEXT NOT NULL,

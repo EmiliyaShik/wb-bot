@@ -105,9 +105,37 @@ FULLSTATS = [
 ]
 
 
-def wb_http(**overrides) -> httpx.AsyncClient:
+# Свод воронки за то же окно: из него берётся список артикулов кабинета.
+# Суточную воронку Wildberries без артикулов не отдаёт вовсе.
+SUMMARY = {
+    "data": {
+        "products": [
+            {"nmID": 111, "statistic": {"selected": {"orderSum": 10000}}},
+        ]
+    }
+}
+
+
+def summary_for(nm_ids, revenue=None) -> dict:
+    """Свод воронки по списку артикулов. revenue задаёт выручку каждого."""
+    revenue = revenue or {}
+    return {
+        "data": {
+            "products": [
+                {
+                    "nmID": nm_id,
+                    "statistic": {"selected": {"orderSum": revenue.get(nm_id, 0)}},
+                }
+                for nm_id in nm_ids
+            ]
+        }
+    }
+
+
+def wb_http(record=None, **overrides) -> httpx.AsyncClient:
     """Записанные ответы WB, разложенные по путям. Сети в тестах нет."""
     answers = {
+        "/api/analytics/v3/sales-funnel/products": SUMMARY,
         "/api/analytics/v3/sales-funnel/products/history": FUNNEL,
         "/api/analytics/v1/stocks-report/wb-warehouses": STOCKS,
         "/adv/v1/promotion/count": CAMPAIGNS,
@@ -116,12 +144,23 @@ def wb_http(**overrides) -> httpx.AsyncClient:
     answers.update(overrides)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if record is not None:
+            record.append(request)
         found = answers.get(request.url.path)
         if isinstance(found, int):
             return httpx.Response(found, json={"title": "нет"})
         return httpx.Response(200, json=found if found is not None else {})
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def asked_articles(seen) -> list[int]:
+    """Какие артикулы ушли в суточную воронку, по всем пачкам подряд."""
+    found: list[int] = []
+    for request in seen:
+        if request.url.path.endswith("/sales-funnel/products/history"):
+            found.extend(json.loads(request.content)["nmIds"])
+    return found
 
 
 @pytest.fixture
@@ -211,6 +250,134 @@ async def test_collect_stores_a_day_per_article_from_three_sources(db_path, cabi
     assert row["views"] == 1100
     assert row["clicks"] == 55
     assert row["raw"]
+
+
+def test_articles_limit_lives_in_the_config_not_in_the_code():
+    """Число в config.toml, а не в коде: его меняет владелец."""
+    from core import config
+
+    assert rnp.funnel_articles_limit() == int(config.settings()["funnel"]["daily_articles"])
+    # Значение по умолчанию из кода сработает только если секцию потеряли.
+    assert rnp.funnel_articles_limit() > 0
+
+
+@pytest.mark.asyncio
+async def test_collect_asks_the_funnel_by_articles_from_the_summary(db_path, cabinet):
+    """Суточная воронка без артикулов невозможна: список берётся из свода."""
+    seen: list[httpx.Request] = []
+    await collect(cabinet, db_path, http=wb_http(record=seen))
+
+    paths = [request.url.path for request in seen]
+    assert "/api/analytics/v3/sales-funnel/products" in paths
+    assert asked_articles(seen) == [111]
+
+
+@pytest.mark.asyncio
+async def test_collect_finishes_without_the_content_category(db_path, cabinet):
+    """За списком артикулов бот в каталог карточек не ходит вовсе.
+
+    Категории «Контент» у клиента может не быть, а суточная история живёт
+    у Wildberries одну неделю: потерять её из-за чужой категории нельзя.
+    """
+    seen: list[httpx.Request] = []
+    await collect(
+        cabinet,
+        db_path,
+        http=wb_http(record=seen, **{"/content/v2/get/cards/list": 403}),
+    )
+
+    assert "/content/v2/get/cards/list" not in [request.url.path for request in seen]
+    row = db.repo(cabinet, db_path).one("nm_daily", date=DAY, nm_id=111)
+    assert row is not None and row["orders"] == 5
+
+
+@pytest.mark.asyncio
+async def test_collect_falls_back_to_the_days_it_has_already_collected(db_path, cabinet):
+    """Свод не ответил: артикулы берутся из собранного, а сбор идёт дальше."""
+    db.repo(cabinet, db_path).upsert(
+        "nm_daily", {"date": "2026-09-14", "nm_id": 222}, orders=3
+    )
+    seen: list[httpx.Request] = []
+
+    await collect(
+        cabinet,
+        db_path,
+        http=wb_http(record=seen, **{"/api/analytics/v3/sales-funnel/products": 500}),
+    )
+
+    assert asked_articles(seen) == [222]
+    # День всё равно собран: остатки и реклама на месте.
+    row = db.repo(cabinet, db_path).one("nm_daily", date=DAY, nm_id=111)
+    assert row is not None and row["stocks_wb"] == 90
+
+
+@pytest.mark.asyncio
+async def test_collect_asks_articles_from_stocks_on_the_very_first_day(db_path, cabinet):
+    """Ни свода, ни собранных суток: остаются артикулы из остатков."""
+    seen: list[httpx.Request] = []
+
+    await collect(
+        cabinet,
+        db_path,
+        http=wb_http(record=seen, **{"/api/analytics/v3/sales-funnel/products": 403}),
+    )
+
+    assert asked_articles(seen) == [111]
+
+
+@pytest.mark.asyncio
+async def test_collect_keeps_the_limit_from_the_config(db_path, cabinet, monkeypatch):
+    """Предел на число артикулов задаёт владелец в config.toml, а не код."""
+    from core import config
+
+    patched = dict(config.settings())
+    patched["funnel"] = {"daily_articles": 5}
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+    # 45 артикулов, выручка растёт вместе с номером: первым должен идти 45-й.
+    articles = list(range(1, 46))
+    seen: list[httpx.Request] = []
+    await collect(
+        cabinet,
+        db_path,
+        http=wb_http(
+            record=seen,
+            **{
+                "/api/analytics/v3/sales-funnel/products": summary_for(
+                    articles, {nm_id: nm_id * 100 for nm_id in articles}
+                )
+            },
+        ),
+    )
+
+    # Пять артикулов это одна пачка: WB берёт по двадцать за запрос.
+    assert asked_articles(seen) == [45, 44, 43, 42, 41]
+    assert len([r for r in seen if r.url.path.endswith("/products/history")]) == 1
+
+
+@pytest.mark.asyncio
+async def test_collect_splits_a_big_cabinet_into_batches_of_twenty(db_path, cabinet, monkeypatch):
+    """45 артикулов уходят тремя пачками: у метода WB предел двадцать."""
+    from core import config
+
+    patched = dict(config.settings())
+    patched["funnel"] = {"daily_articles": 0}  # ноль значит «без предела»
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+    articles = list(range(1, 46))
+    seen: list[httpx.Request] = []
+    await collect(
+        cabinet,
+        db_path,
+        http=wb_http(
+            record=seen,
+            **{"/api/analytics/v3/sales-funnel/products": summary_for(articles)},
+        ),
+    )
+
+    history = [r for r in seen if r.url.path.endswith("/products/history")]
+    assert [len(json.loads(r.content)["nmIds"]) for r in history] == [20, 20, 5]
+    assert sorted(asked_articles(seen)) == articles
 
 
 @pytest.mark.asyncio
