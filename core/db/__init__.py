@@ -33,6 +33,7 @@ CLIENT_TABLES: frozenset[str] = frozenset(
         "access_log",
         "invoices",
         "costs",
+        "card_names",
         "fin_weeks",
         "fin_rows",
         "nm_daily",

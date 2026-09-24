@@ -4,6 +4,7 @@
 пользуются финансовые отчёты, прибыльность артикулов и реестр актов.
 """
 
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -250,3 +251,124 @@ def test_unreadable_workbook_tells_the_owner_the_real_reason(monkeypatch):
         xlsx.read_book(data)
 
     assert any("внутренняя беда разбора" in message for message in written)
+
+
+# --- колонка, которой нечем заполниться --------------------------------------
+#
+# Правило одно на обе книги проекта: и финансовую раскладку, и прибыльность
+# артикулов. Живёт оно здесь, потому что здесь живут книги: `core.excel` про
+# состав финансовых листов, `agents.profit` про прибыль, и ни один из них не
+# годится в общее место для второго. Копия такого правила в двух файлах
+# разошлась бы молча, и за одну и ту же неделю две книги показали бы разные
+# колонки.
+
+
+def test_a_statement_that_never_reached_a_row_is_hidden_and_a_true_zero_is_not():
+    # Хранение есть, но всё пришло строками без артикула: колонке нечем
+    # заполниться. Приёмки не было вовсе: там ноль настоящий.
+    assert xlsx.only_faceless(Decimal("0"), Decimal("600")) is True
+    assert xlsx.only_faceless(Decimal("0"), Decimal("0")) is False
+    assert xlsx.only_faceless(Decimal("5"), Decimal("600")) is False
+    # Число может приехать и строкой из базы, и None из пустой клетки.
+    assert xlsx.only_faceless(None, "600") is True
+    assert xlsx.only_faceless("0.00", None) is False
+
+
+def test_hidden_keys_and_the_columns_that_go_with_them():
+    hidden = xlsx.faceless_keys(
+        {
+            "storage": (Decimal("0"), Decimal("600")),
+            "logistics": (Decimal("75"), Decimal("0")),
+            "acceptance": (Decimal("0"), Decimal("0")),
+        }
+    )
+    columns = (
+        ("Артикул WB", None),
+        ("Логистика, ₽", "logistics"),
+        ("Хранение, ₽", "storage"),
+        ("Приёмка, ₽", "acceptance"),
+    )
+
+    assert hidden == frozenset({"storage"})
+    assert xlsx.visible_headers(columns, hidden) == (
+        "Артикул WB",
+        "Логистика, ₽",
+        "Приёмка, ₽",
+    )
+    # Значения уходят из строки ровно те же и в том же порядке.
+    assert xlsx.visible_row([111, 75, 600, 0], columns, hidden) == [111, 75, 0]
+
+
+def finance_report():
+    """Финансовый отчёт в памяти: хранение пришло строкой без артикула."""
+    from agents.finance import Amounts, Article, FinanceReport, Week
+
+    sold = Amounts(revenue=Decimal("1000"), logistics=Decimal("50"), sales_count=1)
+    faceless = Amounts(storage=Decimal("600"))
+    return FinanceReport(
+        client_id=1,
+        period="week",
+        date_from=date(2026, 9, 7),
+        date_to=date(2026, 9, 13),
+        weeks=(
+            Week(
+                report_id=1,
+                date_from="2026-09-07",
+                date_to="2026-09-13",
+                amounts=sold + faceless,
+            ),
+        ),
+        months=(),
+        articles=(
+            Article(nm_id=111, vendor_code="ART-1", quantity=1, amounts=sold),
+            Article(nm_id=None, amounts=faceless),
+        ),
+    )
+
+
+def profit_report():
+    """Отчёт о прибыльности в памяти: та же неделя, та же дыра."""
+    from agents.profit import ArticleProfit, CostItem, ProfitReport
+
+    return ProfitReport(
+        client_id=1,
+        period="week",
+        date_from=date(2026, 9, 7),
+        date_to=date(2026, 9, 13),
+        articles=(
+            ArticleProfit(nm_id=111, vendor_code="ART-1", logistics=Decimal("50")),
+        ),
+        unallocated=Decimal("600"),
+        costs_breakdown=(
+            CostItem(key="logistics", title="Логистика", by_article=Decimal("50")),
+            CostItem(key="storage", title="Хранение", faceless=Decimal("600")),
+        ),
+    )
+
+
+def book_headers():
+    """Заголовки листа артикулов в обеих книгах проекта."""
+    from agents import profit
+    from core import excel
+
+    return (
+        xlsx.read_book(excel.finance_book(finance_report()))["По артикулам"].headers,
+        profit.article_headers(profit_report()),
+    )
+
+
+def test_both_books_hide_the_column_by_one_and_the_same_rule(monkeypatch):
+    """Сломайте правило здесь, и изменятся сразу обе книги.
+
+    Это и есть доказательство, что копии у него нет: финансовая раскладка и
+    прибыльность спрашивают одну функцию, а не помнят каждая своё.
+    """
+    for headers in book_headers():
+        assert "Хранение, ₽" not in headers
+        assert "Логистика, ₽" in headers
+
+    # Правило сломано ровно в одном месте.
+    monkeypatch.setattr(xlsx, "only_faceless", lambda by_row, faceless: False)
+
+    for headers in book_headers():
+        assert "Хранение, ₽" in headers

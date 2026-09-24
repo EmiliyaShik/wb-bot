@@ -1,5 +1,6 @@
 """Доступ к модулям. Шов один: путь к базе."""
 
+import copy
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -165,7 +166,11 @@ def test_revoke_switches_off_logs_once_and_is_safe_to_repeat(db_path, client_id)
 
 @pytest.mark.parametrize(
     "module, reason",
-    [("all", "package"), ("ads", "not_sold"), ("funnel", "not_sold")],
+    # Пакет «all» снят с продажи (visible = false), пока открыты два модуля из
+    # четырёх, поэтому причина отказа у него теперь общая со скрытыми: не
+    # продаётся. Правило «пакет пробно не даём» от этого не исчезло, оно
+    # проверяется следующим тестом на видимом пакете.
+    [("all", "not_sold"), ("ads", "not_sold"), ("funnel", "not_sold")],
 )
 def test_trial_is_refused_for_packages_and_hidden_modules(db_path, module, reason):
     """callback_data не доверенный канал: запрет живёт в функции, не в клавиатуре."""
@@ -181,6 +186,26 @@ def test_trial_is_refused_for_packages_and_hidden_modules(db_path, module, reaso
     assert access.has_access(client, module, now=T0, path=db_path) is False
     assert admin.trials("WB-555") == []
     assert access.start_trial(client, "finance", now=T0, path=db_path).state == "active"
+
+
+def test_a_package_back_on_sale_is_still_not_given_for_a_trial(db_path, monkeypatch):
+    """Пакет пробно не даём и когда он продаётся: пробуют по одному модулю.
+
+    Сейчас пакет скрыт, и до этой проверки очередь не доходит. Тест держит
+    правило до того дня, когда пакет вернётся вместе с ads и funnel.
+    """
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["all"]["visible"] = True
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+    admin = db.admin_repo(db_path)
+    client = admin.ensure_client(777778)
+    admin.set_client_fields(client, seller_id="WB-556")
+
+    with pytest.raises(access.TrialDenied) as denied:
+        access.start_trial(client, "all", now=T0, path=db_path)
+    assert denied.value.reason == "package"
+    assert admin.trials("WB-556") == []
 
 
 def test_the_one_trial_taken_by_another_process_leaves_nothing_to_take(db_path):

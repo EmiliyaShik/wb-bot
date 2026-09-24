@@ -20,14 +20,84 @@ def client_id(db_path):
 
 def test_tariffs_shows_only_visible_modules_with_prices_from_config(db_path, client_id):
     text = tariffs.tariffs_text(client_id, now=T0, path=db_path)
-    # Цены из спецификации, история C1: finance 990, rnp 590, all 2 290.
+    # Цены из спецификации, история C1: finance 990, rnp 590.
     # Разряды в тексте бота разделяются неразрывным пробелом.
-    assert "990" in text and "590" in text and "2 290" in text
+    assert "990" in text and "590" in text
     # Скидка 10 процентов за 3 месяца: 990 * 3 = 2970, минус 10 процентов.
     assert "2 673" in text
     # C11: ads и funnel описаны в конфиге, но их не видно и не купить.
     assert "Реклама" not in text and "Воронка" not in text
     assert "1 290" not in text
+
+
+def test_the_shop_window_has_a_buy_button_for_every_module_it_sells():
+    """Витрина обещает кнопку у нужного модуля, и кнопка там есть.
+
+    Проверяется по конфигу, а не списком имён: откроется ads - кнопка появится
+    сама, и тест об этом узнает.
+    """
+    rows = tariffs.tariffs_keyboard().inline_keyboard
+    offered = {button.callback_data: button.text for row in rows for button in row}
+
+    for name, info in config.visible_modules().items():
+        assert f"buy:{name}" in offered, f"на витрине нет кнопки модуля {name}"
+        # Надпись называет модуль: три «Оформить» подряд неразличимы.
+        assert info.title in offered[f"buy:{name}"]
+
+    hidden = [name for name, info in config.modules().items() if not info.visible]
+    assert hidden, "в конфиге не осталось скрытых модулей, тест потерял смысл"
+    for name in hidden:
+        assert f"buy:{name}" not in offered, f"скрытый модуль {name} на витрине"
+
+    # Ряд на модуль: на телефоне так читается.
+    assert all(len(row) == 1 for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_the_shop_window_arrives_with_those_buttons(db_path, client_id):
+    message = FakeMessage()
+    await tariffs.tariffs_command(FakeUpdate(300300, message), None, path=db_path)
+
+    text, kwargs = message.sent[-1]
+    assert "Оформить" in text, "витрина обещает кнопку словами"
+    offered = {
+        button.callback_data
+        for row in kwargs["reply_markup"].inline_keyboard
+        for button in row
+    }
+    assert offered == {f"buy:{name}" for name in config.visible_modules()}
+
+
+@pytest.mark.asyncio
+async def test_a_button_from_the_shop_window_goes_through_the_same_check(db_path):
+    """Дорожка к оплате одна: кнопка витрины и кнопка отказа ведут в buy_callback.
+
+    Поэтому подделанный callback_data со скрытым модулем покупку не открывает,
+    хотя такой кнопки не нарисовано нигде.
+    """
+    reached = []
+
+    async def fake_dialog(update_, context_, module):
+        reached.append(module)
+
+    tariffs.set_buy_dialog(fake_dialog)
+    try:
+        for row in tariffs.tariffs_keyboard().inline_keyboard:
+            for button in row:
+                message = FakeMessage()
+                update = FakeUpdate(300301, message, FakeQuery(button.callback_data, message))
+                await tariffs.buy_callback(update, None, path=db_path)
+        assert reached == list(config.visible_modules())
+
+        # Тот же обработчик, но данные сочинил клиент.
+        message = FakeMessage()
+        update = FakeUpdate(300301, message, FakeQuery("buy:all", message))
+        await tariffs.buy_callback(update, None, path=db_path)
+    finally:
+        tariffs.set_buy_dialog(None)
+
+    assert reached == list(config.visible_modules()), "пакет сняли с продажи, а счёт открылся"
+    assert message.sent, "отказ должен быть понятным, а не тишиной"
 
 
 def test_offer_names_price_and_gives_a_buy_button():
@@ -179,6 +249,61 @@ def test_descriptions_of_visible_modules_are_filled_in_config():
         assert tariffs.what_it_gives(name), f"в конфиге нет gives у модуля {name}"
 
 
+# --- одна цена, несколько разных отчётов ---
+#
+# Модуль «Финансы» за 990 это три отчёта, и так было задумано с самого начала.
+# Одним слипшимся предложением это читается как одна функция, и цена выглядит
+# дорого. Витрина обязана называть каждый отчёт отдельно.
+
+
+def test_the_shop_window_names_every_report_of_the_finance_module():
+    reports = config.modules()["finance"].reports
+    assert len(reports) == 3, "модуль «Финансы» это три отчёта"
+
+    text = tariffs.tariffs_text()
+    for report in reports:
+        assert report.title in text, report.command
+        assert f"/{report.command}" in text, report.command
+        assert report.gives in text, report.command
+
+
+def test_the_offer_instead_of_a_refusal_names_them_too():
+    """Человек видит цену впервые здесь, и здесь же он должен видеть, за что."""
+    text = tariffs.offer_text("finance")
+    for report in config.modules()["finance"].reports:
+        assert report.title in text, report.command
+        assert f"/{report.command}" in text, report.command
+    assert "990" in text
+
+
+def test_a_module_with_a_single_report_keeps_its_old_short_description():
+    """У «План-факта» отчёт один: список повторил бы «что входит» слово в слово."""
+    rnp = config.modules()["rnp"]
+    assert len(rnp.reports) == 1
+    assert tariffs.report_lines("rnp") == []
+
+    text = tariffs.tariffs_text()
+    assert rnp.title in text
+    assert tariffs.what_it_gives("rnp") in text
+    assert "<b>План-факт</b>, команда" not in text
+
+    # И модуль без списка отчётов вовсе тоже жив: у скрытых его нет.
+    assert tariffs.reports_of("ads") == ()
+    assert tariffs.report_lines("ads") == []
+
+
+def test_a_report_text_from_config_does_not_become_markup(monkeypatch):
+    """Список отчётов пишет владелец, и он уходит в сообщение с разметкой."""
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["finance"]["reports"][0]["title"] = TRAP
+    patched["modules"]["finance"]["reports"][1]["gives"] = TRAP
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+    for text in (tariffs.tariffs_text(), tariffs.offer_text("finance")):
+        assert "<a href" not in text
+        assert "&lt;a href=&quot;" in text
+
+
 @pytest.mark.asyncio
 async def test_buy_button_refuses_a_module_that_is_not_for_sale():
     """Кнопки ads нет ни на одной клавиатуре, но callback_data можно прислать руками."""
@@ -235,3 +360,68 @@ def test_the_same_holds_for_the_offer_shown_instead_of_a_refusal(monkeypatch):
 
     assert "<a href" not in text
     assert "&lt;a href=&quot;" in text
+
+
+# --- знаки препинания ---
+#
+# Строка «что даёт модуль» живёт в config.toml, и это законченная фраза. Шаблон
+# дописывал свою точку сверху, и клиент видел две точки подряд. Правило «в
+# конфиге без точки» продержалось бы до первой правки настроек, поэтому знать
+# про точку обязан код.
+
+
+@pytest.mark.parametrize("gives", ["дешевле, чем по отдельности.", "дешевле, чем по отдельности"])
+def test_a_description_reads_the_same_with_a_final_dot_and_without_it(monkeypatch, gives):
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["finance"]["gives"] = gives
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+    for text in (tariffs.tariffs_text(), tariffs.offer_text("finance")):
+        assert "дешевле, чем по отдельности." in text
+        assert ".." not in text
+
+
+def test_a_description_that_ends_with_a_question_keeps_its_sign(monkeypatch):
+    patched = copy.deepcopy(config.settings())
+    patched["modules"]["finance"]["gives"] = "Куда утекают деньги?"
+    monkeypatch.setattr(config, "settings", lambda: patched)
+
+    text = tariffs.offer_text("finance")
+    assert "Куда утекают деньги?" in text
+    assert "?." not in text
+
+
+# --- пакет «Всё сразу» снят с продажи ---
+#
+# Два открытых модуля из четырёх стоят 990 + 590, а пакет 2290: обещание
+# «дешевле, чем по отдельности» перестало быть правдой. Вернётся вместе с ads и
+# funnel. Скрыт он тем же способом, что и они: visible = false в конфиге.
+
+
+def test_the_package_is_not_sold_while_only_two_modules_are_open():
+    assert config.modules()["all"].visible is False
+    assert tariffs.for_sale("all") is False
+    assert "all" not in config.visible_modules()
+
+    text = tariffs.tariffs_text()
+    assert "Всё сразу" not in text
+    assert "2 290" not in text
+
+    offered = {
+        button.callback_data
+        for row in tariffs.tariffs_keyboard().inline_keyboard
+        for button in row
+    }
+    assert "buy:all" not in offered
+    # А два оставшихся модуля продаются как раньше.
+    assert offered == {"buy:finance", "buy:rnp"}
+    assert "Финансы" in text and "План-факт" in text
+
+
+def test_the_package_is_gone_from_the_trial_and_the_two_modules_are_not():
+    offered = {
+        button.callback_data
+        for row in tariffs.trial_keyboard().inline_keyboard
+        for button in row
+    }
+    assert offered == {"trial:finance", "trial:rnp"}

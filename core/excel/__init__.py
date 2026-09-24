@@ -11,13 +11,17 @@ from core.excel.finance import (
     METHOD_SHEET,
     MONTHS_SHEET,
     WEEKS_SHEET,
+    article_headers,
     finance_book,
     finance_sheets,
+    method_rows,
 )
 
 __all__ = [
     "finance_book",
     "finance_sheets",
+    "article_headers",
+    "method_rows",
     "WEEKS_SHEET",
     "MONTHS_SHEET",
     "ARTICLES_SHEET",

@@ -93,9 +93,25 @@ NO_COMMISSION = (
     "период заново, и строки перезапишутся."
 )
 
-FACELESS = (
-    "\n\n🧾 Расходы без артикула (обезличка): {amount}. Я разнёс их по артикулам "
-    "пропорционально выручке, правило записано на листе «Методология»."
+FACELESS = "\n\n🧾 Расходы без артикула (обезличка): {amount}."
+
+# Из чего эти деньги. «Расходы без артикула: 900 ₽» без состава читается как
+# отговорка, а селлеру важно знать, что там хранение, а не штрафы.
+FACELESS_PARTS = " Из чего они складываются: {parts}."
+
+FACELESS_ALL_UNSHARED = (
+    " Эти статьи Wildberries по товарам не разносит вовсе, поэтому отдельных "
+    "колонок под них в файле нет."
+)
+
+FACELESS_UNSHARED = (
+    " Часть из них Wildberries по товарам не разносит вовсе, поэтому отдельных "
+    "колонок под них в файле нет: {names}."
+)
+
+FACELESS_SPREAD = (
+    " По артикулам я разнёс их сам, пропорционально выручке: правило записано "
+    "на листе «Методология»."
 )
 
 FACELESS_LEFT = (
@@ -139,6 +155,17 @@ FILE_NOTE = (
 
 CENT = Decimal("0.01")
 
+# Сколько знаков названия помещается в строку топа. Название карточки пишет
+# сам продавец, и на Wildberries оно бывает в сотню знаков («Наматрасник на
+# резинке 160х200 непромокаемый с бортами»), а в той же строке стоят ещё
+# прибыль, маржа и доля: без предела строка разъезжается на телефоне на три
+# строки, и топ перестаёт читаться. Это факт про ширину экрана, а не
+# настройка владельца, поэтому число стоит здесь, а не в config.toml.
+NAME_LIMIT = 24
+
+# Знак среза. Не тире: длинных тире в текстах бота нет.
+CUT = "…"
+
 
 def _money(value: Decimal | int | float | None) -> str:
     """Рубли с разделителем тысяч. Копейки показываем, только если они есть."""
@@ -173,15 +200,44 @@ def _week_days(week: Any) -> str:
     return f"{_day(week.date_from)} - {_day(week.date_to)}"
 
 
-def _line(number: int, item: Any) -> Safe:
-    """Одна строка топа: артикул, прибыль, маржинальность, доля.
+def _short(text: str) -> str:
+    """Название в ширину строки: режем по слову, на месте среза знак.
 
-    Артикул продавца селлер пишет сам в кабинете Wildberries, поэтому имя
-    уходит в сообщение через ту же подстановку, что и всё остальное.
+    Обрывок в одно слово оставляем как есть: половина слова читается хуже
+    целого, но лучше пустого места.
     """
-    name = f"{item.nm_id}"
-    if item.vendor_code:
-        name += f" ({item.vendor_code})"
+    name = " ".join(str(text or "").split())
+    if len(name) <= NAME_LIMIT:
+        return name
+    cut = name[:NAME_LIMIT].rstrip()
+    head, space, _ = cut.rpartition(" ")
+    if space and len(head) >= NAME_LIMIT // 2:
+        cut = head
+    return cut.rstrip(" ,.;:") + CUT
+
+
+def _name(item: Any) -> str:
+    """Чем товар назван в строке топа: название и артикулы рядом.
+
+    Артикул из строки не исчезает никогда: по нему селлер ищет товар в
+    кабинете и в файле, а названия у десятка карточек бывают почти
+    одинаковые. Названия нет вовсе (карточку удалили или за ней ещё не
+    ходили) - остаются одни артикулы, как было раньше.
+    """
+    marks = [str(part) for part in (item.nm_id, item.vendor_code) if part]
+    if not item.title:
+        return f"{marks[0]} ({marks[1]})" if len(marks) > 1 else (marks[0] if marks else "")
+    return f"{_short(item.title)} ({', '.join(marks)})"
+
+
+def _line(number: int, item: Any) -> Safe:
+    """Одна строка топа: товар, прибыль, маржинальность, доля.
+
+    И название карточки, и артикул продавца селлер пишет сам в кабинете
+    Wildberries, поэтому имя уходит в сообщение через ту же подстановку, что
+    и всё остальное.
+    """
+    name = _name(item)
     parts = [
         fill(
             "{number}. {name}: {profit}",
@@ -195,6 +251,31 @@ def _line(number: int, item: Any) -> Safe:
     if item.share is not None:
         parts.append(fill("доля {percent}", percent=_percent(item.share)))
     return Safe(", ".join(parts))
+
+
+def _faceless_parts(report: Any) -> Safe:
+    """Состав обезлички словами: что именно Wildberries отдал без артикула.
+
+    Раньше отчёт говорил только «расходы без артикула такие-то», и селлеру
+    оставалось гадать, штрафы это или хранение. Состав считает агент, здесь
+    он превращается в строку.
+    """
+    items = report.faceless_parts
+    if not items:
+        return Safe("")
+    parts = ", ".join(
+        fill("{title} {amount}", title=item.title.lower(), amount=_money(item.faceless))
+        for item in items
+    )
+    text = fill(FACELESS_PARTS, parts=Safe(parts))
+    unshared = report.unshared_items
+    if unshared and len(unshared) == len(items):
+        # Перечислять те же статьи второй раз незачем: они и есть весь состав.
+        text = Safe(text + FACELESS_ALL_UNSHARED)
+    elif unshared:
+        names = ", ".join(item.title.lower() for item in unshared)
+        text = Safe(text + fill(FACELESS_UNSHARED, names=names))
+    return Safe(text)
 
 
 def keyboard() -> InlineKeyboardMarkup:
@@ -243,6 +324,7 @@ def summary_text(report: Any) -> Safe:
         text = Safe(text + fill(NO_COMMISSION, count=len(report.without_commission)))
     if report.unallocated > 0:
         text = Safe(text + fill(FACELESS, amount=_money(report.unallocated)))
+        text = Safe(text + _faceless_parts(report) + FACELESS_SPREAD)
         if report.unallocated_left:
             text = Safe(
                 text + fill(FACELESS_LEFT, amount=_money(report.unallocated_left))

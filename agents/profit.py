@@ -11,6 +11,15 @@
    `days[] -> apps[] -> nms[].sum`. Это единственный поход в WB, и он идёт
    через очередь: повтор при недоступности живёт только там.
 
+Четвёртый источник не обязателен и на цифры не влияет: названия карточек
+(`POST /content/v2/get/cards/list`, категория токена «Контент»). В отчёте о
+реализации названия нет вовсе, там только артикулы, бренд и предмет, а
+предмет это категория («Наматрасник»), а не название товара. Названия лежат
+в `card_names` и обновляются в двух случаях: в периоде появился артикул, о
+котором мы ещё не спрашивали, или известное название протухло по сроку из
+`config.toml` (секция `[cards]`). Без срока переименование карточки в
+кабинете не доехало бы до отчёта никогда.
+
 Два случая нехватки данных штатные, а не ошибки, и оба видны в отчёте.
 
 **Нет себестоимости** по артикулу: прибыль по нему не считается, он уходит в
@@ -31,14 +40,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from agents import finance
 from core import costs as costs_module
-from core import db, queue, wbapi
+from core import config, db, queue, wbapi
 
 logger = logging.getLogger(__name__)
 
@@ -54,15 +63,29 @@ __all__ = [
     "ADS_NO_CATEGORY",
     "ADS_UNAVAILABLE",
     "ADS_NOT_REQUESTED",
+    "CARDS_TABLE",
+    "COST_ITEMS",
+    "NOT_SUMMABLE",
+    "TOTAL_LABEL",
     "AdSpend",
     "ArticleProfit",
+    "CostItem",
     "ProfitReport",
+    "Totals",
     "margin",
     "share",
     "spread",
     "ad_totals",
     "collect_ads",
+    "card_titles",
+    "names_of",
+    "names_ttl_days",
+    "remember_names",
+    "collect_names",
+    "with_names",
     "build",
+    "article_headers",
+    "method_rows",
     "excel_sheets",
     "excel_bytes",
     "file_name",
@@ -252,6 +275,183 @@ async def collect_ads(
         return AdSpend({}, available=False, reason=ADS_UNAVAILABLE)
 
 
+# --- названия карточек -------------------------------------------------------
+
+# Где лежат названия. Отдельная таблица, а не колонка в `fin_rows`: строк
+# отчёта у одного артикула десятки, а название у него одно.
+CARDS_TABLE = "card_names"
+
+
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _now() -> str:
+    """Отметка времени в UTC: в базе время хранится только так."""
+    return datetime.now(timezone.utc).strftime(TIME_FORMAT)
+
+
+def names_ttl_days() -> int:
+    """Сколько дней хранимое название карточки считается свежим.
+
+    Число живёт в `config.toml`, секция `[cards]`: сроки в этом проекте
+    настраивает владелец, а не правка кода. Ноль значит «не обновлять»:
+    спросили один раз и запомнили навсегда.
+    """
+    return int((config.settings().get("cards") or {}).get("name_ttl_days", 0))
+
+
+def _stamped(value: Any) -> datetime | None:
+    """Отметка времени из базы. Непонятная отметка это «неизвестно когда»."""
+    try:
+        return datetime.strptime(str(value or "")[:19], TIME_FORMAT).replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _fresh_names(
+    client_id: int, *, ttl_days: int, path: str | Path | None = None
+) -> set[int]:
+    """Артикулы, чьё название спрашивали недавно и переспрашивать рано.
+
+    Просроченное название не выбрасывается: в отчёт оно всё равно пойдёт, а
+    вот сходить за каталогом в следующий раз уже стоит. Иначе переименование
+    карточки в кабинете не доехало бы до отчёта никогда: за названиями бот
+    шёл только ради артикула, о котором ещё не спрашивал.
+    """
+    now = datetime.now(timezone.utc)
+    found: set[int] = set()
+    for row in db.repo(client_id, path).rows(CARDS_TABLE):
+        if ttl_days <= 0:
+            found.add(int(row["nm_id"]))
+            continue
+        seen = _stamped(row["updated_at"])
+        if seen is not None and now - seen < timedelta(days=ttl_days):
+            found.add(int(row["nm_id"]))
+    return found
+
+
+def names_of(
+    client_id: int,
+    nm_ids: Iterable[int] | None = None,
+    *,
+    path: str | Path | None = None,
+) -> dict[int, str]:
+    """Известные названия карточек. Это чтение базы, в WB отсюда не ходят.
+
+    Пустая строка в ответе значит «спрашивали, а карточки у Wildberries нет»:
+    товар удалили из кабинета. Отсутствие ключа значит «ещё не спрашивали», и
+    только оно отправляет за названиями в WB.
+    """
+    wanted = (
+        None
+        if nm_ids is None
+        else {int(value) for value in nm_ids if value is not None}
+    )
+    found: dict[int, str] = {}
+    for row in db.repo(client_id, path).rows(CARDS_TABLE):
+        nm_id = int(row["nm_id"])
+        if wanted is None or nm_id in wanted:
+            found[nm_id] = str(row["title"] or "")
+    return found
+
+
+def card_titles(cards: Iterable[Mapping[str, Any]]) -> dict[int, str]:
+    """Название по артикулу из ответа метода карточек.
+
+    Название карточки пишет сам продавец, то есть это чужой текст: в книгу
+    Excel он едет как есть, а в сообщение бота попадёт только через
+    `bot.texts.fill`.
+    """
+    found: dict[int, str] = {}
+    for item in cards or []:
+        row = item or {}
+        raw = row.get("nmID", row.get("nmId"))
+        try:
+            nm_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        title = str(row.get("title") or "").strip()
+        if title:
+            found[nm_id] = title
+    return found
+
+
+def remember_names(
+    client_id: int,
+    cards: Iterable[Mapping[str, Any]],
+    *,
+    asked: Iterable[int] = (),
+    path: str | Path | None = None,
+) -> dict[int, str]:
+    """Кладёт названия в базу и помечает артикулы, которых у WB не нашлось.
+
+    Пометка нужна затем, чтобы один удалённый товар не гонял отчёт в
+    Wildberries снова и снова: спросили один раз и запомнили ответ. Уже
+    известное имя пометка не затирает - карточки больше нет, а как товар
+    назывался, мы знаем, и это не повод забыть.
+    """
+    titles = card_titles(cards)
+    repo = db.repo(client_id, path)
+    now = _now()
+    for nm_id, title in titles.items():
+        repo.upsert(CARDS_TABLE, {"nm_id": nm_id}, title=title, updated_at=now)
+    for value in asked:
+        nm_id = int(value)
+        if nm_id in titles:
+            continue
+        if repo.insert_once(CARDS_TABLE, nm_id=nm_id, title="") is None:
+            # Строка уже была, а карточки у Wildberries по-прежнему нет. Имя
+            # не трогаем, а отметку освежаем: без неё срок жизни названий
+            # гонял бы бот в WB на каждом отчёте из-за одного удалённого
+            # товара.
+            repo.update(CARDS_TABLE, {"nm_id": nm_id}, updated_at=now)
+    return titles
+
+
+async def collect_names(
+    client_id: int,
+    nm_ids: Iterable[int],
+    *,
+    http: Any = None,
+    path: str | Path | None = None,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], Any] | None = None,
+) -> dict[int, str]:
+    """Названия карточек для артикулов периода. Зовётся из обработчика очереди.
+
+    В Wildberries идём в двух случаях: в периоде есть артикул, о котором мы
+    ещё не спрашивали, или известное название успело протухнуть (срок жизни
+    в `config.toml`, секция `[cards]`). Метод карточек самый мягкий по лимиту
+    в проекте (100 запросов в минуту), но тянуть весь каталог на каждый отчёт
+    незачем: имя товара меняется куда реже, чем считается прибыль, а платит
+    за лишний запрос токен клиента.
+
+    Отсутствие названий отчёт не роняет. Нет категории «Контент», WB не
+    отвечает - в книге останется артикул, и это честнее выдуманного имени.
+    Наружу летит только 401: его разбирает `core.clients`.
+    """
+    wanted = sorted({int(value) for value in nm_ids if value is not None})
+    known = names_of(client_id, path=path)
+    fresh = _fresh_names(client_id, ttl_days=names_ttl_days(), path=path)
+    if not wanted or all(nm_id in fresh for nm_id in wanted):
+        return {nm_id: known[nm_id] for nm_id in wanted if nm_id in known}
+    client = wbapi.get_wb_client(client_id, http=http, path=path, clock=clock, sleep=sleep)
+    try:
+        cards = await client.cards_list()
+    except wbapi.WBForbiddenError:
+        logger.info(
+            "у клиента %s нет категории «Контент», названия товаров пропущены", client_id
+        )
+        return {nm_id: known[nm_id] for nm_id in wanted if nm_id in known}
+    except (wbapi.WBUnavailable, wbapi.WBRateLimited, wbapi.WBApiError) as error:
+        logger.warning("названия товаров клиента %s не получены: %s", client_id, error)
+        return {nm_id: known[nm_id] for nm_id in wanted if nm_id in known}
+    remember_names(client_id, cards, asked=wanted, path=path)
+    return names_of(client_id, wanted, path=path)
+
+
 # --- строки отчёта -----------------------------------------------------------
 
 
@@ -262,6 +462,10 @@ class ArticleProfit:
     nm_id: int | None
     vendor_code: str = ""
     subject: str = ""
+    # Название карточки. Пустое значит «названия нет»: карточку удалили или за
+    # ней ещё не ходили. Пустая клетка в отчёте читается как потеря данных,
+    # поэтому в книгу идёт `display_name`, а не это поле.
+    title: str = ""
     units: int = 0
     returns_count: int = 0
     revenue: Decimal = ZERO
@@ -283,6 +487,18 @@ class ArticleProfit:
     profit: Decimal | None = None
     margin: float | None = None
     share: float | None = None
+
+    @property
+    def display_name(self) -> str:
+        """Чем товар назван в отчёте: название карточки, а иначе артикул WB.
+
+        Товар могли удалить из кабинета, и тогда названия у Wildberries не
+        спросить. Выдумывать имя нельзя, а пустая клетка прочиталась бы как
+        потерянные данные, поэтому остаётся артикул: он же ключ строки.
+        """
+        if self.title:
+            return self.title
+        return "" if self.nm_id is None else str(self.nm_id)
 
     @property
     def net_revenue(self) -> Decimal:
@@ -317,6 +533,85 @@ class ArticleProfit:
         return self.profit is not None and self.profit < ZERO
 
 
+# Статьи расходов Wildberries. Ключ это поле `finance.Amounts`, название то
+# же, что в заголовке колонки. Порядок тот же, что в книге.
+COST_ITEMS: tuple[tuple[str, str], ...] = (
+    ("commission", "Комиссия WB"),
+    ("acquiring", "Эквайринг"),
+    ("logistics", "Логистика"),
+    ("storage", "Хранение"),
+    ("acceptance", "Приёмка"),
+    ("penalties", "Штрафы"),
+    ("deductions", "Прочие удержания"),
+)
+
+
+@dataclass(frozen=True)
+class CostItem:
+    """Статья расходов: сколько пришло по товарам, а сколько без них."""
+
+    key: str
+    title: str
+    by_article: Decimal = ZERO
+    faceless: Decimal = ZERO
+
+    @property
+    def only_faceless(self) -> bool:
+        """Статья есть, а разреза по товарам у неё нет вовсе.
+
+        Само правило живёт в `core.xlsx`: им же пользуется финансовая книга,
+        а две копии одного правила разошлись бы молча и показали бы в двух
+        книгах разные колонки за один и тот же период.
+        """
+        from core import xlsx
+
+        return xlsx.only_faceless(self.by_article, self.faceless)
+
+
+@dataclass(frozen=True)
+class Totals:
+    """Итог по кабинету. Складывается только то, что складывается.
+
+    Проценты в итог не переносятся: маржинальность по кабинету это отношение
+    суммарной прибыли к суммарной выручке, а доля в прибыли в итоге всегда сто
+    процентов и смысла не несёт.
+
+    Деньги и штуки складываются по всем артикулам, прибыль - только по тем, у
+    которых она посчитана. Разница между `articles` и `priced` говорит, что в
+    итог прибыли вошли не все: молчаливый ноль вместо неизвестного числа врёт.
+
+    Счётчики `priced`, `costed` и `no_commission` нужны не для красоты: по ним
+    книга решает, показать сумму или «нет данных». Сумма, сложенная из пустого
+    множества, это ноль, а ноль в отчёте читается как «не заработали».
+    """
+
+    articles: int = 0
+    priced: int = 0
+    costed: int = 0
+    no_commission: int = 0
+    units: int = 0
+    returns_count: int = 0
+    revenue: Decimal = ZERO
+    returns_amount: Decimal = ZERO
+    cost: Decimal = ZERO
+    commission: Decimal = ZERO
+    acquiring: Decimal = ZERO
+    logistics: Decimal = ZERO
+    storage: Decimal = ZERO
+    acceptance: Decimal = ZERO
+    penalties: Decimal = ZERO
+    deductions: Decimal = ZERO
+    ad_spend: Decimal | None = None
+    unallocated: Decimal = ZERO
+    profit: Decimal = ZERO
+    margin: float | None = None
+
+    @property
+    def complete(self) -> bool:
+        """Прибыль посчитана по всем артикулам: итогу нечего оговаривать."""
+        return self.priced == self.articles
+
+
 def _halves(count: int) -> tuple[int, int]:
     """Сколько строк уходит в топ и сколько в антитоп. Пересечения не бывает.
 
@@ -340,6 +635,9 @@ class ProfitReport:
     articles: tuple[ArticleProfit, ...] = ()
     unallocated: Decimal = ZERO
     unallocated_left: Decimal = ZERO
+    # Из чего состоят расходы периода: по каждой статье отдельно то, что
+    # Wildberries разнёс по товарам, и то, что отдал общей строкой.
+    costs_breakdown: tuple[CostItem, ...] = ()
     ads: AdSpend = None  # type: ignore[assignment]
     weeks: tuple[Any, ...] = ()
 
@@ -381,6 +679,56 @@ class ProfitReport:
         priced = self.priced
         _, count = _halves(len(priced))
         return tuple(reversed(priced[len(priced) - count :])) if count else ()
+
+    @property
+    def faceless_parts(self) -> tuple[CostItem, ...]:
+        """Расшифровка обезлички: её сумма сходится с `unallocated`."""
+        return tuple(item for item in self.costs_breakdown if item.faceless != ZERO)
+
+    @property
+    def unshared_items(self) -> tuple[CostItem, ...]:
+        """Статьи, которых в разрезе по товарам нет вовсе."""
+        return tuple(item for item in self.costs_breakdown if item.only_faceless)
+
+    @property
+    def totals(self) -> Totals:
+        """Итог по кабинету. Проценты не складываются, см. `Totals`."""
+        priced = self.priced
+        counted_revenue = sum((item.net_revenue for item in priced), ZERO)
+        profit_total = self.total_profit
+
+        def money(name: str) -> Decimal:
+            return sum(
+                (
+                    value
+                    for value in (getattr(item, name) for item in self.articles)
+                    if value is not None
+                ),
+                ZERO,
+            )
+
+        return Totals(
+            articles=len(self.articles),
+            priced=len(priced),
+            costed=sum(1 for item in self.articles if item.cost is not None),
+            no_commission=len(self.without_commission),
+            units=sum(item.units for item in self.articles),
+            returns_count=sum(item.returns_count for item in self.articles),
+            revenue=money("revenue"),
+            returns_amount=money("returns_amount"),
+            cost=money("cost"),
+            commission=money("commission"),
+            acquiring=money("acquiring"),
+            logistics=money("logistics"),
+            storage=money("storage"),
+            acceptance=money("acceptance"),
+            penalties=money("penalties"),
+            deductions=money("deductions"),
+            ad_spend=self.total_ad_spend,
+            unallocated=money("unallocated"),
+            profit=profit_total,
+            margin=margin(profit_total, counted_revenue),
+        )
 
     @property
     def total_profit(self) -> Decimal:
@@ -492,6 +840,9 @@ def build(
     left = unallocated.quantize(CENT, rounding=ROUND_HALF_UP) - sum(parts.values(), ZERO)
 
     known = costs_module.costs_for(client_id, nm_ids=list(weights), path=path)
+    # Названия читаются из базы: за ними ходит обработчик очереди, а расчёт в
+    # WB не ходит вовсе. Нет названия - в книге останется артикул.
+    titles = names_of(client_id, list(weights), path=path)
 
     rows: list[ArticleProfit] = []
     for item in named:
@@ -518,6 +869,7 @@ def build(
                 nm_id=item.nm_id,
                 vendor_code=item.vendor_code,
                 subject=item.subject,
+                title=titles.get(item.nm_id, ""),
                 units=amounts.sales_count,
                 returns_count=amounts.returns_count,
                 revenue=amounts.revenue,
@@ -547,6 +899,19 @@ def build(
         row if row.profit is None else replace(row, share=share(row.profit, total))
         for row in rows
     )
+    # Расшифровка расходов. Считается по тем же строкам, что и всё остальное,
+    # и отвечает на вопрос «где мои деньги за хранение»: сумма по статьям,
+    # пришедшим без артикула, сходится с обезличкой копейка в копейку, потому
+    # что обезличка и есть сумма этих же статей.
+    breakdown = tuple(
+        CostItem(
+            key=key,
+            title=title,
+            by_article=sum((getattr(item.amounts, key) for item in named), ZERO),
+            faceless=sum((getattr(item.amounts, key) for item in faceless), ZERO),
+        )
+        for key, title in COST_ITEMS
+    )
     return ProfitReport(
         client_id=client_id,
         period=period,
@@ -555,8 +920,27 @@ def build(
         articles=articles,
         unallocated=unallocated,
         unallocated_left=left,
+        costs_breakdown=breakdown,
         ads=ads,
         weeks=tuple(weeks),
+    )
+
+
+def with_names(report: ProfitReport, names: Mapping[int, str]) -> ProfitReport:
+    """Подставляет названия карточек в готовый отчёт.
+
+    Названия приезжают после расчёта, потому что за ними ходят в WB, а в WB
+    ходит только обработчик очереди. На цифры они не влияют, поэтому и
+    подставляются последними. Пустое имя ничего не затирает.
+    """
+    if not names:
+        return report
+    return replace(
+        report,
+        articles=tuple(
+            replace(item, title=names.get(item.nm_id or 0) or item.title)
+            for item in report.articles
+        ),
     )
 
 
@@ -568,29 +952,39 @@ METHOD_SHEET = "Методология"
 
 NO_DATA = "нет данных"
 
-ARTICLE_HEADERS = (
-    "Артикул WB",
-    "Артикул продавца",
-    "Предмет",
-    "Продано, шт",
-    "Возвращено, шт",
-    "Выручка, ₽",
-    "Возвраты, ₽",
-    "Себестоимость за штуку, ₽",
-    "Себестоимость, ₽",
-    "Комиссия WB, ₽",
-    "Эквайринг, ₽",
-    "Логистика, ₽",
-    "Хранение, ₽",
-    "Приёмка, ₽",
-    "Штрафы, ₽",
-    "Прочие удержания, ₽",
-    "Реклама, ₽",
-    "Расходы без артикула, ₽",
-    "Чистая прибыль, ₽",
-    "Маржинальность, %",
-    "Доля в прибыли, %",
+# Подпись итоговой строки и ответ в клетках, где сложение бессмысленно.
+TOTAL_LABEL = "Итого по кабинету"
+NOT_SUMMABLE = "не складывается"
+
+# Колонки листа артикулов: заголовок и ключ статьи расходов, если колонка
+# показывает именно её. Ключ нужен ровно для одного: убрать из книги колонку,
+# в которой у Wildberries нечему появиться (см. `CostItem.only_faceless`).
+ARTICLE_COLUMNS: tuple[tuple[str, str | None], ...] = (
+    ("Артикул WB", None),
+    ("Артикул продавца", None),
+    ("Название товара", None),
+    ("Предмет", None),
+    ("Продано, шт", None),
+    ("Возвращено, шт", None),
+    ("Выручка, ₽", None),
+    ("Возвраты, ₽", None),
+    ("Себестоимость за штуку, ₽", None),
+    ("Себестоимость, ₽", None),
+    ("Комиссия WB, ₽", "commission"),
+    ("Эквайринг, ₽", "acquiring"),
+    ("Логистика, ₽", "logistics"),
+    ("Хранение, ₽", "storage"),
+    ("Приёмка, ₽", "acceptance"),
+    ("Штрафы, ₽", "penalties"),
+    ("Прочие удержания, ₽", "deductions"),
+    ("Реклама, ₽", None),
+    ("Расходы без артикула, ₽", None),
+    ("Чистая прибыль, ₽", None),
+    ("Маржинальность, %", None),
+    ("Доля в прибыли, %", None),
 )
+
+ARTICLE_HEADERS = tuple(header for header, _ in ARTICLE_COLUMNS)
 
 PROBLEM_HEADERS = ("Блок", "Артикул WB", "Артикул продавца", "Сумма, ₽", "Что это значит")
 
@@ -617,6 +1011,40 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
         "поверенного) это другие деньги, и подставлять его вместо vw нельзя. "
         "Если строка сохранена без исходных полей WB, комиссия считается "
         "неизвестной и прибыль по артикулу не считается.",
+    ),
+    (
+        "Название товара",
+        "карточки товаров, категория токена «Контент»",
+        "-",
+        "В отчёте о реализации Wildberries названия нет вовсе: там артикул WB, "
+        "артикул продавца, бренд и предмет, а предмет это категория "
+        "(«Наматрасник»), а не название карточки. Название берётся из карточек "
+        "товаров и хранится у нас, чтобы не дёргать Wildberries на каждый "
+        "отчёт. Если товар удалён из кабинета, названия взять негде, и в "
+        "колонке остаётся артикул WB.",
+    ),
+    (
+        "Статьи без разреза по товарам",
+        "строки отчёта о реализации без nmId",
+        "-",
+        "Часть расходов Wildberries отдаёт общей суммой по кабинету и по "
+        "товарам не разносит: чаще всего это хранение, приёмка и прочие "
+        "удержания. Колонки под такую статью в листе «Прибыль по артикулам» "
+        "нет: ноль в каждой строке читался бы как «не платили». Эти деньги "
+        "расшифрованы в листе «Убыточные и без данных» и разнесены по товарам "
+        "в колонке «Расходы без артикула, ₽».",
+    ),
+    (
+        "Итого по кабинету",
+        "строки этого же листа",
+        "суммы колонок; маржинальность считается заново",
+        "Складываются штуки, выручка, возвраты, себестоимость и расходы. "
+        "Маржинальность не складывается: по кабинету это прибыль, делённая на "
+        "выручку за вычетом возвратов, и считается она по тем артикулам, у "
+        "которых прибыль посчитана. Доля в прибыли в итоге всегда сто "
+        "процентов, поэтому её там нет. Артикулы без себестоимости и с "
+        "неизвестной комиссией в итог прибыли не входят, и рядом с итогом "
+        "написано, сколько их.",
     ),
     (
         "Себестоимость, ₽",
@@ -685,36 +1113,164 @@ def _cell(value: Any) -> Any:
     return value
 
 
+def _hidden_columns(report: ProfitReport) -> frozenset[str]:
+    """Статьи, под которые колонки в книге не будет."""
+    return frozenset(item.key for item in report.unshared_items)
+
+
+def article_headers(report: ProfitReport) -> tuple[str, ...]:
+    """Заголовки листа артикулов для этого отчёта.
+
+    Список не постоянный, и это решение: колонка, в которой у Wildberries
+    нечему появиться, из книги убирается. Ноль в каждой строке читается как
+    «расхода не было», а расход был, просто Wildberries не разнёс его по
+    товарам. Деньги при этом не теряются: они в расшифровке обезлички.
+    """
+    from core import xlsx
+
+    return xlsx.visible_headers(ARTICLE_COLUMNS, _hidden_columns(report))
+
+
+def _visible(values: Sequence[Any], hidden: frozenset[str]) -> list[Any]:
+    from core import xlsx
+
+    return xlsx.visible_row(values, ARTICLE_COLUMNS, hidden)
+
+
+def _totals_note(report: ProfitReport) -> str:
+    """Оговорка рядом с итогом: что именно в него не вошло.
+
+    Итог, который молча считает неизвестную прибыль нулём, врёт. Поэтому
+    складывается только посчитанное, а сколько артикулов осталось за бортом,
+    написано прямо в строке.
+    """
+    totals = report.totals
+    if totals.complete and not totals.no_commission:
+        return f"сложено по всем артикулам, их {totals.articles}"
+    note = (
+        f"прибыль сложена по {totals.priced} артикулам из {totals.articles}: "
+        f"остальные в листе «{PROBLEMS_SHEET}» и в итог не вошли"
+    )
+    if totals.no_commission:
+        note += f"; комиссия неизвестна по {totals.no_commission} артикулам"
+    return note
+
+
+def _totals_values(report: ProfitReport) -> list[Any]:
+    """Итоговая строка в порядке колонок листа."""
+    totals = report.totals
+    return [
+        TOTAL_LABEL,
+        _totals_note(report),
+        "",
+        "",
+        totals.units,
+        totals.returns_count,
+        _cell(totals.revenue),
+        _cell(totals.returns_amount),
+        # Цена за штуку это не сумма: складывать её значит получить число,
+        # которого нет ни у одного товара.
+        NOT_SUMMABLE,
+        # Пустая сумма это не ноль. Себестоимости нет ни у одного артикула -
+        # в итоге «нет данных», иначе селлер прочитает «товар достался даром».
+        _cell(totals.cost if totals.costed else None),
+        _cell(totals.commission if totals.no_commission < totals.articles else None),
+        _cell(totals.acquiring),
+        _cell(totals.logistics),
+        _cell(totals.storage),
+        _cell(totals.acceptance),
+        _cell(totals.penalties),
+        _cell(totals.deductions),
+        _cell(totals.ad_spend),
+        _cell(totals.unallocated),
+        _cell(totals.profit if totals.priced else None),
+        _cell(totals.margin),
+        # Доля в прибыли в итоге всегда сто процентов и не значит ничего.
+        NOT_SUMMABLE,
+    ]
+
+
+def _faceless_note(item: CostItem) -> str:
+    """Что означает строка расшифровки. Читает это селлер, а не программист."""
+    if item.only_faceless:
+        return (
+            f"{item.title}: Wildberries отдаёт эту статью общей суммой по "
+            "кабинету и по товарам не разносит, поэтому отдельной колонки под "
+            "неё в листе «Прибыль по артикулам» нет. Деньги не потеряны: они "
+            "разнесены по товарам пропорционально выручке и сидят в колонке "
+            "«Расходы без артикула, ₽»."
+        )
+    return (
+        f"{item.title}: часть этой статьи Wildberries отдал строками без "
+        "артикула. В колонке товара стоит только то, что он разнёс сам, "
+        "остальное разнесено пропорционально выручке."
+    )
+
+
+def method_rows(report: ProfitReport) -> list[list[Any]]:
+    """Лист «Методология» для этого отчёта.
+
+    К общим правилам добавляется строка про этот период: какие именно статьи
+    Wildberries не разнёс по товарам. Общее правило селлер прочитает и так, а
+    «где мои деньги за хранение» это вопрос про его отчёт, а не про правило.
+    """
+    rows = [list(row) for row in METHODOLOGY]
+    hidden = report.unshared_items
+    if hidden:
+        names = ", ".join(item.title.lower() for item in hidden)
+        amount = _cell(sum((item.faceless for item in hidden), ZERO))
+        rows.append(
+            [
+                "Чего нет в этом отчёте",
+                "строки отчёта о реализации за период",
+                "-",
+                f"За этот период Wildberries не разнёс по товарам: {names}. "
+                f"Всего {amount} ₽. Колонок под эти статьи в листе «Прибыль по "
+                "артикулам» нет, а деньги учтены в колонке «Расходы без "
+                "артикула, ₽» и расшифрованы в листе "
+                f"«{PROBLEMS_SHEET}».",
+            ]
+        )
+    return rows
+
+
 def excel_sheets(report: ProfitReport) -> list:
     """Три листа книги: полная таблица, проблемный блок и методология."""
     from core.xlsx import Sheet
 
+    hidden = _hidden_columns(report)
     articles = [
-        [
-            item.nm_id,
-            item.vendor_code,
-            item.subject,
-            item.units,
-            item.returns_count,
-            _cell(item.revenue),
-            _cell(item.returns_amount),
-            _cell(item.cost_per_unit),
-            _cell(item.cost),
-            _cell(item.commission),
-            _cell(item.acquiring),
-            _cell(item.logistics),
-            _cell(item.storage),
-            _cell(item.acceptance),
-            _cell(item.penalties),
-            _cell(item.deductions),
-            _cell(item.ad_spend),
-            _cell(item.unallocated),
-            _cell(item.profit),
-            _cell(item.margin),
-            _cell(item.share),
-        ]
+        _visible(
+            [
+                item.nm_id,
+                item.vendor_code,
+                item.display_name,
+                item.subject,
+                item.units,
+                item.returns_count,
+                _cell(item.revenue),
+                _cell(item.returns_amount),
+                _cell(item.cost_per_unit),
+                _cell(item.cost),
+                _cell(item.commission),
+                _cell(item.acquiring),
+                _cell(item.logistics),
+                _cell(item.storage),
+                _cell(item.acceptance),
+                _cell(item.penalties),
+                _cell(item.deductions),
+                _cell(item.ad_spend),
+                _cell(item.unallocated),
+                _cell(item.profit),
+                _cell(item.margin),
+                _cell(item.share),
+            ],
+            hidden,
+        )
         for item in report.articles
     ]
+    if report.articles:
+        articles.append(_visible(_totals_values(report), hidden))
 
     problems = [
         [
@@ -750,7 +1306,7 @@ def excel_sheets(report: ProfitReport) -> list:
         ]
         for item in report.without_cost
     ]
-    if report.unallocated > ZERO:
+    if report.unallocated != ZERO:
         problems.append(
             [
                 "обезличка",
@@ -759,14 +1315,27 @@ def excel_sheets(report: ProfitReport) -> list:
                 _cell(report.unallocated),
                 "Расходы из строк отчёта без артикула. Разнесены по артикулам "
                 "пропорционально выручке; не разнесённый остаток "
-                f"{_cell(report.unallocated_left)} ₽ в прибыль не вошёл.",
+                f"{_cell(report.unallocated_left)} ₽ в прибыль не вошёл. "
+                "Из чего она складывается, написано в строках ниже.",
             ]
         )
+        # Расшифровка. Сумма этих строк равна самой обезличке: селлер видит,
+        # что хранение посчитано, а не забыто.
+        problems += [
+            [
+                f"обезличка: {item.title.lower()}",
+                None,
+                "",
+                _cell(item.faceless),
+                _faceless_note(item),
+            ]
+            for item in report.faceless_parts
+        ]
 
     return [
-        Sheet(ARTICLES_SHEET, ARTICLE_HEADERS, articles),
+        Sheet(ARTICLES_SHEET, article_headers(report), articles),
         Sheet(PROBLEMS_SHEET, PROBLEM_HEADERS, problems),
-        Sheet(METHOD_SHEET, METHOD_HEADERS, [list(row) for row in METHODOLOGY]),
+        Sheet(METHOD_SHEET, METHOD_HEADERS, method_rows(report)),
     ]
 
 
@@ -812,6 +1381,12 @@ async def report_task(task: Any, *, path: str | Path | None = None) -> ProfitRep
     date_from, date_to = finance.period_bounds(period)
     ads = await collect_ads(client_id, date_from, date_to, path=path)
     report = build(client_id, period, ads=ads, path=path)
+    # За названиями идём уже зная, какие артикулы в отчёте: спрашивать WB о
+    # каталоге до расчёта незачем, а на цифры названия не влияют.
+    names = await collect_names(
+        client_id, [item.nm_id for item in report.articles], path=path
+    )
+    report = with_names(report, names)
     if _sender is None:
         raise RuntimeError("некому отправить отчёт о прибыли: доставка не подключена")
     result = _sender(client_id, report, excel_bytes(report))

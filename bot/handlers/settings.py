@@ -30,6 +30,7 @@ from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from agents import lifecycle
+from bot.handlers import costs as costs_handler
 from bot.handlers import tariffs
 from bot.texts import Safe, fill
 from core import config, db, scheduler
@@ -66,8 +67,16 @@ def _mark(flag: bool) -> str:
     return "✅" if flag else "⬜"
 
 
-def settings_text(prefs: lifecycle.Prefs) -> Safe:
-    """Что сейчас включено. Время показывается в часовом поясе расписания."""
+def settings_text(
+    prefs: lifecycle.Prefs, state: costs_handler.Coverage | None = None
+) -> Safe:
+    """Что сейчас включено. Время показывается в часовом поясе расписания.
+
+    Себестоимость это тоже состояние, и показывать его больше негде: прибыль
+    по артикулам без неё не считается вовсе, а узнать об этом раньше пустого
+    отчёта человеку было неоткуда. `state` необязателен, потому что бывают
+    вызовы без базы под рукой.
+    """
     body = fill(
         BODY,
         daily=ON if prefs.daily else OFF,
@@ -75,10 +84,15 @@ def settings_text(prefs: lifecycle.Prefs) -> Safe:
         zone=scheduler.timezone_name(),
         weekly=ON if prefs.weekly else OFF,
     )
-    return Safe(HEAD + "\n\n" + body + "\n\n" + EXPLAIN)
+    blocks = [HEAD, body, EXPLAIN]
+    if state is not None:
+        blocks.append(costs_handler.state_text(state))
+    return Safe("\n\n".join(blocks))
 
 
-def keyboard(prefs: lifecycle.Prefs) -> InlineKeyboardMarkup:
+def keyboard(
+    prefs: lifecycle.Prefs, state: costs_handler.Coverage | None = None
+) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(
@@ -104,7 +118,23 @@ def keyboard(prefs: lifecycle.Prefs) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    if state is not None and not state.complete:
+        # Кнопка ровно там, где сказано про нехватку: дорога к себестоимости
+        # уже есть, показать её надо в том же сообщении, а не в памяти.
+        rows += list(_costs_keyboard().inline_keyboard)
     return InlineKeyboardMarkup(rows)
+
+
+def _costs_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка «Внести себестоимость» из меню.
+
+    Импорт ленивый: `bot/handlers/menu.py` импортирует этот файл, чтобы кнопка
+    настроек попадала в ту же функцию, что и команда. Обратный импорт на
+    верхнем уровне замкнул бы круг.
+    """
+    from bot.handlers import menu
+
+    return menu.costs_keyboard()
 
 
 # --- тексты жизненного цикла --------------------------------------------------
@@ -272,8 +302,11 @@ async def settings_command(
     if message is None or client_id is None:
         return
     prefs = lifecycle.prefs(client_id, path=path)
+    state = costs_handler.coverage(client_id, path=path)
     await message.reply_text(
-        settings_text(prefs), parse_mode=ParseMode.HTML, reply_markup=keyboard(prefs)
+        settings_text(prefs, state),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard(prefs, state),
     )
 
 
@@ -302,9 +335,12 @@ async def toggle_callback(
             logger.warning("не разобрать время из кнопки: %s", data)
             return
 
+    state = costs_handler.coverage(client_id, path=path)
     try:
         await query.edit_message_text(
-            settings_text(prefs), parse_mode=ParseMode.HTML, reply_markup=keyboard(prefs)
+            settings_text(prefs, state),
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard(prefs, state),
         )
     except Exception:  # noqa: BLE001 - Telegram ругается на неизменённый текст
         logger.debug("сообщение настроек не обновилось", exc_info=True)

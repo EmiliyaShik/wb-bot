@@ -26,6 +26,21 @@ LOCAL_DATA_DIR = ROOT / "data"
 
 
 @dataclass(frozen=True)
+class ReportInfo:
+    """Один отчёт модуля из [[modules.*.reports]]: команда, имя и польза.
+
+    Отдельный список, а не всё та же строка gives: одна подписка открывает
+    несколько разных отчётов, и селлеру важно видеть, за что именно он платит.
+    Команда здесь та же, что он наберёт руками, поэтому кнопку к отчёту можно
+    собрать по конфигу, не заводя второго списка отчётов в коде.
+    """
+
+    command: str
+    title: str = ""
+    gives: str = ""
+
+
+@dataclass(frozen=True)
 class ModuleInfo:
     """Один модуль из секции [modules.*] конфига.
 
@@ -43,6 +58,26 @@ class ModuleInfo:
     includes: str | None = None
     gives: str = ""
     diagnostic_line: str = ""
+    reports: tuple[ReportInfo, ...] = field(default_factory=tuple)
+
+
+def _reports(raw: Any) -> tuple[ReportInfo, ...]:
+    """Отчёты модуля. Запись без команды пропускается: кнопке некуда вести."""
+    found: list[ReportInfo] = []
+    for item in raw or ():
+        if not isinstance(item, dict):
+            continue
+        command = str(item.get("command", "")).strip().lstrip("/")
+        if not command:
+            continue
+        found.append(
+            ReportInfo(
+                command=command,
+                title=str(item.get("title", "") or command).strip(),
+                gives=str(item.get("gives", "") or "").strip(),
+            )
+        )
+    return tuple(found)
 
 
 @lru_cache(maxsize=1)
@@ -69,6 +104,7 @@ def modules() -> dict[str, ModuleInfo]:
             includes=raw.get("includes"),
             gives=str(raw.get("gives", "") or ""),
             diagnostic_line=str(raw.get("diagnostic_line", "") or ""),
+            reports=_reports(raw.get("reports")),
         )
     return result
 

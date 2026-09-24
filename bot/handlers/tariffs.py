@@ -44,7 +44,8 @@ BUY_GROUP = 50
 HEAD = "💼 <b>Тарифы WBРентген</b>"
 
 FOOT = (
-    "Оплата по счёту для ИП и ООО: нажмите «Оформить» у нужного модуля.\n"
+    "Оплата по счёту для ИП и ООО: под этим сообщением кнопка «Оформить» "
+    "у каждого модуля.\n"
     "Вопрос по оплате - команда <code>/paysupport</code>."
 )
 
@@ -144,6 +145,20 @@ def price_line(module: str) -> Safe:
     return Safe("\n".join(parts))
 
 
+def sentence(text: str) -> str:
+    """Законченная фраза: точка в конце ровно одна.
+
+    Строки «что даёт модуль» пишет владелец в config.toml, и там это законченное
+    предложение с точкой. Шаблон дописывал свою точку сверху, и клиент видел
+    «дешевле, чем по отдельности..». Правило «в конфиге без точки» продержалось
+    бы до первой правки настроек, поэтому знать про точку должен код.
+    """
+    text = str(text).strip()
+    if not text or text[-1] in ".!?…":
+        return text
+    return text + "."
+
+
 def for_sale(module: str) -> bool:
     """Можно ли купить этот модуль. Скрытые не продаются.
 
@@ -162,6 +177,32 @@ def what_it_gives(module: str) -> str:
     """
     info = config.modules().get(module)
     return (info.gives if info else "").strip()
+
+
+def reports_of(module: str) -> tuple[config.ReportInfo, ...]:
+    """Отчёты модуля из конфига. Списка нет - пустой кортеж, а не поломка."""
+    info = config.modules().get(module)
+    return info.reports if info else ()
+
+
+def report_lines(module: str) -> list[Safe]:
+    """Отчёты модуля по строке на каждый: имя, команда и польза.
+
+    Меньше двух отчётов - строк нет: список из одной записи слово в слово
+    повторил бы «что входит», и цена от этого понятнее не становится.
+    """
+    reports = reports_of(module)
+    if len(reports) < 2:
+        return []
+    return [
+        fill(
+            "• <b>{title}</b>, команда <code>/{command}</code>: {gives}",
+            title=report.title or report.command,
+            command=report.command,
+            gives=sentence(report.gives),
+        )
+        for report in reports
+    ]
 
 
 def denied_text(reason: str) -> Safe:
@@ -192,7 +233,8 @@ def tariffs_text(
         block = [fill("<b>{title}</b>", title=info.title or name), price_line(name)]
         gives = what_it_gives(name)
         if gives:
-            block.append(fill("Что входит: {gives}.", gives=gives))
+            block.append(fill("Что входит: {gives}", gives=sentence(gives)))
+        block.extend(report_lines(name))
         item = current.get(name)
         if item is not None:
             block.append(fill("Сейчас: {state}.", state=state_words(item)))
@@ -209,21 +251,46 @@ def offer_text(module: str) -> Safe:
     lines = [fill("🔒 Модуль <b>{title}</b> пока не подключён.", title=title), ""]
     gives = what_it_gives(module)
     if gives:
-        lines += [fill("Что он даёт: {gives}.", gives=gives), ""]
+        lines += [fill("Что он даёт: {gives}", gives=sentence(gives)), ""]
+    reports = report_lines(module)
+    if reports:
+        lines += reports + [""]
     lines += [price_line(module), "", TRIAL_INVITE]
     return Safe("\n".join(lines))
+
+
+def buy_button(module: str, label: str) -> InlineKeyboardButton:
+    """Единственная кнопка покупки в проекте: BUY_PREFIX и buy_callback.
+
+    Дорожка к оплате одна на всех, и витрина складывается из этих же кнопок.
+    Вторая дорожка разошлась бы с первой молча: проверку for_sale делает
+    обработчик нажатия, а не тот, кто рисует кнопку.
+    """
+    return InlineKeyboardButton(label, callback_data=f"{BUY_PREFIX}{module}")
 
 
 def offer_keyboard(module: str) -> InlineKeyboardMarkup:
     """Кнопка «Оформить» и ссылка на полную витрину."""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Оформить", callback_data=f"{BUY_PREFIX}{module}")],
-            [
-                InlineKeyboardButton(
-                    "Все тарифы", callback_data=f"{BUY_PREFIX}{LIST_TOKEN}"
-                )
-            ],
+            [buy_button(module, "Оформить")],
+            [buy_button(LIST_TOKEN, "Все тарифы")],
+        ]
+    )
+
+
+def tariffs_keyboard() -> InlineKeyboardMarkup:
+    """Витрина: своя кнопка оформления у каждого продаваемого модуля.
+
+    Ряд на модуль, и в надписи назван модуль: три кнопки «Оформить» подряд
+    клиент не различит, а текст витрины прямо обещает кнопку у нужного модуля.
+    Скрытые модули сюда не попадают, но держится запрет не здесь: callback_data
+    подделывается свободно, и решает его for_sale в buy_callback.
+    """
+    return InlineKeyboardMarkup(
+        [
+            [buy_button(name, f"Оформить «{info.title or name}»")]
+            for name, info in config.visible_modules().items()
         ]
     )
 
@@ -289,14 +356,20 @@ def require_module(module: str, *, path: str | Path | None = None):
     return decorator
 
 
-async def tariffs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def tariffs_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    path: str | Path | None = None,
+) -> None:
     message = update.effective_message
     if message is None:
         return
     await message.reply_text(
-        tariffs_text(client_id_of(update)),
+        tariffs_text(client_id_of(update, path), path=path),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+        reply_markup=tariffs_keyboard(),
     )
 
 
@@ -322,8 +395,17 @@ def granted_text(item: access.Access) -> Safe:
     )
 
 
-async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «Оформить». Пока диалога счёта нет, отвечает понятной заглушкой."""
+async def buy_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    path: str | Path | None = None,
+) -> None:
+    """Кнопка «Оформить». Пока диалога счёта нет, отвечает понятной заглушкой.
+
+    Сюда приходят обе клавиатуры: и витрина, и предложение вместо отказа.
+    Дорожка одна, поэтому и проверка for_sale одна на всех.
+    """
     query = update.callback_query
     if query is None:
         return
@@ -331,7 +413,9 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     module = (query.data or "").removeprefix(BUY_PREFIX)
     if module == LIST_TOKEN:
         await query.message.reply_text(
-            tariffs_text(client_id_of(update)), parse_mode=ParseMode.HTML
+            tariffs_text(client_id_of(update, path), path=path),
+            parse_mode=ParseMode.HTML,
+            reply_markup=tariffs_keyboard(),
         )
         return
     if not for_sale(module):
@@ -344,18 +428,23 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await query.message.reply_text(BUY_SOON, parse_mode=ParseMode.HTML)
 
 
-async def trial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def trial_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    path: str | Path | None = None,
+) -> None:
     """Выбор модуля для пробного периода."""
     query = update.callback_query
     if query is None:
         return
     await query.answer()
     module = (query.data or "").removeprefix(TRIAL_PREFIX)
-    client_id = client_id_of(update)
+    client_id = client_id_of(update, path)
     if client_id is None:
         return
     try:
-        granted = access.start_trial(client_id, module)
+        granted = access.start_trial(client_id, module, path=path)
     except access.TrialDenied as denied:
         await query.message.reply_text(
             denied_text(denied.reason), parse_mode=ParseMode.HTML
@@ -364,12 +453,20 @@ async def trial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.message.reply_text(granted_text(granted), parse_mode=ParseMode.HTML)
 
 
-def register(app) -> None:
+def register(app, *, path: str | Path | None = None) -> None:
     """Сам себя регистрирует: bot/app.py никто не трогает."""
-    app.add_handler(CommandHandler("tariffs", tariffs_command))
-    app.add_handler(CommandHandler("modules", tariffs_command))
+    shop = functools.partial(tariffs_command, path=path)
+    app.add_handler(CommandHandler("tariffs", shop))
+    app.add_handler(CommandHandler("modules", shop))
     app.add_handler(CommandHandler("trial", trial_command))
-    app.add_handler(CallbackQueryHandler(trial_callback, pattern=f"^{TRIAL_PREFIX}"))
     app.add_handler(
-        CallbackQueryHandler(buy_callback, pattern=f"^{BUY_PREFIX}"), group=BUY_GROUP
+        CallbackQueryHandler(
+            functools.partial(trial_callback, path=path), pattern=f"^{TRIAL_PREFIX}"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            functools.partial(buy_callback, path=path), pattern=f"^{BUY_PREFIX}"
+        ),
+        group=BUY_GROUP,
     )

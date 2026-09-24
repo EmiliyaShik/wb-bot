@@ -10,11 +10,20 @@
 Файл от постороннего проверяется трижды и в таком порядке, чтобы дорогая
 работа не делалась зря: расширение, размер по данным Telegram (до
 скачивания), содержимое (после). Отказ всегда объясняет причину.
+
+Здесь же живёт состояние себестоимости и приглашение её внести. Себестоимость
+это единственное, чего бот не может взять у Wildberries сам, и без неё прибыль
+по артикулам не считается вовсе. Раньше об этом не говорил никто: селлер
+подключал кабинет, открывал прибыльность и видел пустоту без объяснения.
+Поэтому состояние и приглашение лежат рядом с дорогой, которая это чинит, а
+зовут их подключение (`connect`), настройки (`settings`) и меню (`menu`).
 """
 
 from __future__ import annotations
 
+import functools
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +33,7 @@ from telegram.ext import CommandHandler, MessageHandler, filters
 
 from bot import texts
 from bot.handlers.tariffs import client_id_of
+from bot.texts import Safe, fill
 from core import costs, db, queue
 
 logger = logging.getLogger(__name__)
@@ -45,6 +55,154 @@ NOT_XLSX = (
     "Принимаю только файл xlsx. Откройте шаблон из команды <code>/costs</code>, "
     "заполните колонку с себестоимостью и сохраните в формате xlsx."
 )
+
+# Приглашение внести себестоимость. Оно намеренно говорит и то, что без неё
+# работает: «без себестоимости не работает ничего» было бы неправдой и напугало
+# бы человека на ровном месте.
+INVITE = (
+    "📦 <b>Остался один шаг: себестоимость</b>\n\n"
+    "Сколько вам обошёлся товар, знаете только вы: Wildberries эту цифру "
+    "никому не отдаёт. Поэтому прибыль по артикулам я считаю по вашим числам "
+    "и не выдумываю их за вас.\n\n"
+    "Что без неё работает, а что нет:\n"
+    "• недельная раскладка удержаний <code>/finance</code> и динамика "
+    "<code>/dynamics</code> считаются как обычно;\n"
+    "• прибыль по артикулам <code>/profit</code> не посчитается совсем, "
+    "отчёт придёт пустым.\n\n"
+    "Дорога короткая: команда <code>/costs</code> пришлёт таблицу с вашими "
+    "артикулами, впишите цену закупки в одну колонку и верните файл обратно."
+)
+
+HEAD = "📦 <b>Себестоимость</b>"
+
+# Дальше пять состояний, и каждое говорит правду про своё. Числа стоят после
+# двоеточия нарочно: «продавалось 40 артикулов» и «продавался 1 артикул»
+# требуют разного склонения, а «Артикулов с продажами: 1» читается одинаково
+# при любом числе.
+NO_COSTS_NO_SALES = (
+    "Не внесена ни по одному артикулу.\n"
+    "Пока её нет, прибыль по артикулам (<code>/profit</code>) не считается "
+    "совсем. Недельная раскладка расходов и динамика работают как обычно."
+)
+
+NO_COSTS_COUNTED = (
+    "Не внесена ни по одному артикулу.\n"
+    "Артикулов с продажами за последнюю собранную неделю: {total}. "
+    "Прибыль по артикулам (<code>/profit</code>) не посчитается ни по одному "
+    "из них. Недельная раскладка расходов и динамика работают как обычно."
+)
+
+COSTS_NO_SALES = (
+    "Внесена. Артикулов с себестоимостью: {known}.\n"
+    "Сколько артикулов у вас продаётся, скажу, когда соберётся первый "
+    "недельный отчёт Wildberries."
+)
+
+PART = (
+    "Артикулов с продажами за последнюю собранную неделю: {total}.\n"
+    "Себестоимость есть у {covered}. По остальным ({rest}) прибыль не "
+    "посчитается: они уйдут в блок «нет себестоимости»."
+)
+
+FULL = (
+    "Артикулов с продажами за последнюю собранную неделю: {total}.\n"
+    "Себестоимость есть у всех, прибыль посчитается по каждому."
+)
+
+OTHERS = (
+    "Артикулов с продажами за последнюю собранную неделю: {total}.\n"
+    "Себестоимость у вас внесена (артикулов: {known}), но ни один из "
+    "продававшихся в неё не попал, и прибыль не посчитается. Запросите "
+    "свежий шаблон командой <code>/costs</code>: в нём будут ваши нынешние "
+    "артикулы."
+)
+
+
+@dataclass(frozen=True)
+class Coverage:
+    """Состояние себестоимости: что внесено и с чем это сравнивать."""
+
+    # Сколько артикулов вообще имеют себестоимость, включая давно снятые.
+    known: int = 0
+    # Сколько артикулов продавалось за последнюю собранную неделю.
+    selling: int = 0
+    # Сколько из продававшихся имеют себестоимость.
+    covered: int = 0
+
+    @property
+    def empty(self) -> bool:
+        """Себестоимости нет вовсе: именно с этим человек упирался в пустоту."""
+        return self.known <= 0
+
+    @property
+    def counted(self) -> bool:
+        """Есть ли с чем сравнивать: собрана ли хоть одна неделя продаж."""
+        return self.selling > 0
+
+    @property
+    def complete(self) -> bool:
+        """Прибыль посчитается по всем, кто продавался."""
+        return self.counted and self.covered >= self.selling
+
+
+def has_costs(client_id: int, *, path: str | Path | None = None) -> bool:
+    """Внесена ли себестоимость хоть по одному артикулу.
+
+    Отдельно от `coverage`, потому что дёшево: этого хватает и кнопке меню, и
+    решению, показывать ли приглашение после подключения кабинета.
+    """
+    return db.repo(client_id, path).count("costs") > 0
+
+
+def coverage(client_id: int, *, path: str | Path | None = None) -> Coverage:
+    """Сколько артикулов с себестоимостью и сколько их продавалось.
+
+    Знаменатель это последняя собранная неделя, а не вся история. Причины две.
+    Первая: столько же недель берёт `/profit` по умолчанию, и число, названное
+    в настройках, совпадёт с тем, что человек увидит в отчёте. Вторая: строки
+    отчёта о реализации лежат вместе с исходным JSON Wildberries, и проход по
+    году означал бы чтение сотен мегабайт на каждую команду `/settings`.
+
+    Своего разреза по артикулам здесь нет: это перечисление nmId, а не вторая
+    трактовка выручки и возвратов, она по-прежнему одна и живёт у агента 1.
+    """
+    repo = db.repo(client_id, path)
+    known = {int(row["nm_id"]) for row in repo.rows("costs")}
+    selling: set[int] = set()
+    weeks = repo.rows("fin_weeks", order_by="date_from DESC", limit=1)
+    if weeks:
+        for row in repo.rows("fin_rows", report_id=int(weeks[0]["report_id"])):
+            if row["nm_id"] is not None:
+                selling.add(int(row["nm_id"]))
+    return Coverage(
+        known=len(known), selling=len(selling), covered=len(selling & known)
+    )
+
+
+def state_text(state: Coverage) -> Safe:
+    """Состояние себестоимости словами. Пять случаев, и все они разные."""
+    if not state.counted:
+        body = (
+            Safe(NO_COSTS_NO_SALES)
+            if state.empty
+            else fill(COSTS_NO_SALES, known=state.known)
+        )
+    elif state.empty:
+        body = fill(NO_COSTS_COUNTED, total=state.selling)
+    elif state.covered <= 0:
+        # Себестоимость есть, но от прошлого ассортимента: сказать «не внесена»
+        # было бы неправдой, а промолчать значит оставить человека без причины.
+        body = fill(OTHERS, total=state.selling, known=state.known)
+    elif state.complete:
+        body = fill(FULL, total=state.selling)
+    else:
+        body = fill(
+            PART,
+            total=state.selling,
+            covered=state.covered,
+            rest=state.selling - state.covered,
+        )
+    return Safe(HEAD + "\n" + body)
 
 
 def too_big_text(size: int, limit: int) -> str:
@@ -159,7 +317,14 @@ def register(app, *, path: str | Path | None = None) -> None:
     # по себе ничего не регистрирует.
     queue.register(costs.TASK_KIND, costs.template_task)
     costs.set_sender(make_sender(app, path))
-    app.add_handler(CommandHandler("costs", costs_command))
+    # Путь к базе передаётся так же, как у остальных хендлеров: без этого шва
+    # команда в тестах молча ушла бы в боевую базу.
     app.add_handler(
-        MessageHandler(filters.Document.ALL, costs_document), group=DOCUMENT_GROUP
+        CommandHandler("costs", functools.partial(costs_command, path=path))
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.Document.ALL, functools.partial(costs_document, path=path)
+        ),
+        group=DOCUMENT_GROUP,
     )

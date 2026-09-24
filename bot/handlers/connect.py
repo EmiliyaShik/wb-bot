@@ -7,6 +7,12 @@ core.clients, разбор токена в core.wbapi, доступ к моду�
 Читатель этих строк селлер, а не программист: где нажать в кабинете WB,
 названо по шагам, а слово «категория» объяснено тем, что перестанет работать.
 
+Подтверждение подключения заканчивается приглашением внести себестоимость,
+и это не реклама соседней команды. Себестоимость единственное, чего бот не
+может взять у Wildberries сам, а без неё прибыль по артикулам не считается
+вовсе. Слова и кнопка живут в `bot.handlers.costs`, рядом с той дорогой,
+которая это чинит; тому, кто себестоимость уже внёс, приглашение не приходит.
+
 Строка токена не попадает ни в один текст этого модуля, даже обрезанной.
 Сообщение с токеном бот удаляет из переписки сразу после ответа.
 
@@ -39,6 +45,7 @@ from telegram.ext import (
 )
 
 from bot import texts
+from bot.handlers import costs as costs_handler
 from bot.handlers import tariffs
 from bot.texts import Safe, fill
 from core import access, audit, clients, config, crypto, db, queue, scheduler, wbapi
@@ -341,7 +348,29 @@ def confirm_text(
     if problem:
         blocks.append(problem)
     blocks.append(modules_text(result.client_id, path=path, now=now))
+    if needs_costs(result.client_id, path=path):
+        # Про себестоимость говорится здесь, а не после первого пустого отчёта
+        # о прибыли: человек уже настроен что-то делать, а увидеть пустоту и
+        # не понять почему он успеет ровно один раз.
+        blocks.append(costs_handler.INVITE)
     return Safe("\n\n".join(blocks))
+
+
+def needs_costs(client_id: int, *, path=None) -> bool:
+    """Стоит ли рассказывать про себестоимость. Тому, кто её внёс, не стоит."""
+    return not costs_handler.has_costs(client_id, path=path)
+
+
+def _costs_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка «Внести себестоимость» из меню.
+
+    Импорт ленивый, и это не лень: `bot/handlers/menu.py` импортирует этот
+    файл, чтобы его кнопки попадали в те же функции, что и команды. Обратный
+    импорт на верхнем уровне замкнул бы круг, а нужна отсюда одна кнопка.
+    """
+    from bot.handlers import menu
+
+    return menu.costs_keyboard()
 
 
 def reminder_text(days: int) -> Safe:
@@ -441,7 +470,8 @@ async def token_message(
             # Обещание «проверю связь» держится задачей в очереди, а не словами:
             # там пробный запрос может спокойно дождаться своего бюджета.
             queue.enqueue(client_id, TOKEN_CHECK, notify=False, path=path)
-        await _reply(message, confirm_text(result, path=path))
+        keyboard = _costs_keyboard() if needs_costs(client_id, path=path) else None
+        await _reply(message, confirm_text(result, path=path), keyboard)
     await _forget(message)
 
 

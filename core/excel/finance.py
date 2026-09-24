@@ -8,6 +8,11 @@ openpyxl здесь нет.
 руками: для каждой строки названо поле ответа Wildberries и формула, по
 которой из него получилось число. Те же формулы продублированы в `CLAUDE.md`
 между маркерами autopilot.
+
+Состав колонок листа «По артикулам» не постоянный: статью, которую
+Wildberries по товарам не разнёс вовсе, показывать колонкой нулей нельзя.
+Решает это общее правило `core.xlsx.only_faceless`, то же самое, по которому
+живёт книга прибыльности.
 """
 
 from __future__ import annotations
@@ -15,11 +20,13 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
-from core.xlsx import Sheet, write_book
+from core.xlsx import Sheet, faceless_keys, visible_headers, visible_row, write_book
 
 __all__ = [
     "finance_book",
     "finance_sheets",
+    "article_headers",
+    "method_rows",
     "WEEKS_SHEET",
     "MONTHS_SHEET",
     "ARTICLES_SHEET",
@@ -63,13 +70,29 @@ WEEK_HEADERS = (
 
 MONTH_HEADERS = ("Месяц", "Недель", *MONEY_HEADERS, "Продано, шт", "Возвращено, шт")
 
-ARTICLE_HEADERS = (
-    "Артикул WB",
-    "Артикул продавца",
-    "Предмет",
-    "Штук",
-    *MONEY_HEADERS,
+# Колонки листа «По артикулам»: заголовок и ключ статьи `Amounts`, если
+# колонка показывает именно её. Ключ нужен ровно для одного: убрать колонку,
+# в которой у Wildberries нечему появиться (см. `core.xlsx.only_faceless`).
+# Порядок денежных колонок тот же, что в `MONEY_HEADERS` и `_money_cells`.
+ARTICLE_COLUMNS: tuple[tuple[str, str | None], ...] = (
+    ("Артикул WB", None),
+    ("Артикул продавца", None),
+    ("Предмет", None),
+    ("Штук", None),
+    ("Продажи, ₽", "revenue"),
+    ("Возвраты, ₽", "returns_amount"),
+    ("К перечислению, ₽", "for_pay"),
+    ("Комиссия WB, ₽", "commission"),
+    ("Эквайринг, ₽", "acquiring"),
+    ("Логистика, ₽", "logistics"),
+    ("Хранение, ₽", "storage"),
+    ("Приёмка, ₽", "acceptance"),
+    ("Штрафы, ₽", "penalties"),
+    ("Прочие удержания, ₽", "deductions"),
+    ("Корректировка вознаграждения, ₽", "additional_payment"),
 )
+
+ARTICLE_HEADERS = tuple(header for header, _ in ARTICLE_COLUMNS)
 
 METHOD_HEADERS = ("Показатель", "Поле ответа WB", "Формула", "Пояснение")
 
@@ -242,7 +265,21 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
         "Строки без nmId (например, общие удержания) собраны в отдельную "
         "строку «без артикула», а не выброшены и не разнесены по выручке. "
         "Поэтому итог листа сходится с листом «Недели» без остатка: разницы "
-        "на обезличку тут нет.",
+        "на обезличку тут нет. Исключение одно и названо ниже: статья, "
+        "которую Wildberries по товарам не разнёс вовсе, показана только на "
+        "листах «Недели» и «Месяцы», колонки под неё в этом листе нет.",
+    ),
+    (
+        "Статьи без разреза по товарам",
+        "строки отчёта о реализации без nmId",
+        "-",
+        "Часть расходов Wildberries отдаёт общей суммой по кабинету и по "
+        "товарам не разносит: чаще всего это хранение, приёмка и прочие "
+        "удержания. Колонки под такую статью в листе «По артикулам» нет: ноль "
+        "в каждой строке читался бы как «не платили», а платили. Деньги не "
+        "потеряны, они целиком видны на листах «Недели» и «Месяцы», а сколько "
+        "их за этот период, написано в строке «Чего нет в этом отчёте». "
+        "Статья с настоящим нулём (её просто не было) колонку не теряет.",
     ),
     (
         "Комиссия WB, ₽ по артикулу",
@@ -314,6 +351,76 @@ def _complete_cell(week: Any) -> str:
     return "неполные: выгрузка упёрлась в предел страниц, запросите период короче"
 
 
+def _article_split(report: Any) -> dict[str, tuple[Decimal, Decimal]]:
+    """По каждой статье: сколько пришло с артикулом, сколько без него.
+
+    Строка без nmId у агента 1 одна на весь период, и лежит она в том же
+    ряду артикулов: `nm_id is None`. Считать заново нечего, достаточно
+    разложить готовые суммы на две стопки.
+    """
+    named = [item for item in report.articles if item.nm_id is not None]
+    faceless = [item for item in report.articles if item.nm_id is None]
+    zero = Decimal("0")
+    return {
+        key: (
+            sum((getattr(item.amounts, key) for item in named), zero),
+            sum((getattr(item.amounts, key) for item in faceless), zero),
+        )
+        for _, key in ARTICLE_COLUMNS
+        if key is not None
+    }
+
+
+def _hidden_columns(report: Any) -> frozenset[str]:
+    """Статьи, под которые колонки в листе «По артикулам» не будет."""
+    return faceless_keys(_article_split(report))
+
+
+def article_headers(report: Any) -> tuple[str, ...]:
+    """Заголовки листа «По артикулам» для этого отчёта.
+
+    Список не постоянный, и это решение: колонка, в которой у Wildberries
+    нечему появиться, из книги убирается. Ровно то же правило, по которому
+    живёт книга прибыльности: «Хранение, ₽» в нуле у каждого товара читается
+    как забытый расход, хотя расход был, просто Wildberries не разнёс его.
+    """
+    return visible_headers(ARTICLE_COLUMNS, _hidden_columns(report))
+
+
+def _unshared_note(report: Any) -> list[Any] | None:
+    """Строка методологии про этот период: чего в листе нет и почём.
+
+    Общее правило селлер прочитает и так, а «где мои деньги за хранение» это
+    вопрос про его отчёт, а не про правило.
+    """
+    hidden = _hidden_columns(report)
+    if not hidden:
+        return None
+    named = {key: header for header, key in ARTICLE_COLUMNS if key in hidden}
+    faceless = _article_split(report)
+    titles = ", ".join(named[key].replace(", ₽", "").lower() for key in named)
+    amount = _money(sum((faceless[key][1] for key in named), Decimal("0")))
+    return [
+        "Чего нет в этом отчёте",
+        "строки отчёта о реализации за период",
+        "-",
+        f"За этот период Wildberries не разнёс по товарам: {titles}. "
+        f"Всего {amount} ₽. Колонок под эти статьи в листе «{ARTICLES_SHEET}» "
+        "нет: ноль в каждой строке читался бы как «не платили». Деньги не "
+        "потеряны, они целиком посчитаны на листах «Недели» и «Месяцы», а по "
+        "товарам их разносит отчёт о прибыльности (/profit).",
+    ]
+
+
+def method_rows(report: Any) -> list[list[Any]]:
+    """Лист «Методология» для этого отчёта: общие правила плюс этот период."""
+    rows = [list(row) for row in METHODOLOGY]
+    note = _unshared_note(report)
+    if note is not None:
+        rows.append(note)
+    return rows
+
+
 def finance_sheets(report: Any) -> list[Sheet]:
     """Четыре листа книги. Отдельно от записи, чтобы их можно было проверить."""
     weeks = [
@@ -345,22 +452,27 @@ def finance_sheets(report: Any) -> list[Sheet]:
         for month in report.months
     ]
 
+    hidden = _hidden_columns(report)
     articles = [
-        [
-            article.nm_id if article.nm_id is not None else "без артикула",
-            article.vendor_code,
-            article.subject,
-            article.quantity,
-            *_money_cells(article.amounts),
-        ]
+        visible_row(
+            [
+                article.nm_id if article.nm_id is not None else "без артикула",
+                article.vendor_code,
+                article.subject,
+                article.quantity,
+                *_money_cells(article.amounts),
+            ],
+            ARTICLE_COLUMNS,
+            hidden,
+        )
         for article in report.articles
     ]
 
     return [
         Sheet(WEEKS_SHEET, WEEK_HEADERS, weeks),
         Sheet(MONTHS_SHEET, MONTH_HEADERS, months),
-        Sheet(ARTICLES_SHEET, ARTICLE_HEADERS, articles),
-        Sheet(METHOD_SHEET, METHOD_HEADERS, [list(row) for row in METHODOLOGY]),
+        Sheet(ARTICLES_SHEET, article_headers(report), articles),
+        Sheet(METHOD_SHEET, METHOD_HEADERS, method_rows(report)),
     ]
 
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from agents import finance, profit
 from bot.handlers import profit as handlers_profit
 from core import costs as costs_module
-from core import crypto, db, queue, wbapi, xlsx
+from core import config, crypto, db, queue, wbapi, xlsx
 
 TODAY = date(2026, 9, 7)
 
@@ -475,14 +475,329 @@ def test_excel_holds_the_full_table_and_names_the_rule(seller, db_path):
 
     assert profit.ARTICLES_SHEET in book.titles
     assert profit.METHOD_SHEET in book.titles
-    # Полная таблица это все артикулы, а не только топ.
-    assert len(book[profit.ARTICLES_SHEET].rows) == 2
+    # Полная таблица это все артикулы, а не только топ, плюс итоговая строка.
+    rows = book[profit.ARTICLES_SHEET].rows
+    assert len(rows) == 3
+    assert str(rows[-1].values[0]) == profit.TOTAL_LABEL
     # Правило разнесения обезлички названо словами, а не подразумевается.
     method = "\n".join(
         " ".join(str(value) for value in row.values) for row in book[profit.METHOD_SHEET].rows
     )
     assert "Расходы без артикула" in method
     assert "пропорционально выручке" in method
+
+
+# Неделя владельца в миниатюре: хранение Wildberries отдал одной строкой по
+# кабинету, без артикула. Ровно на этом сломалось чтение отчёта: колонка
+# «Хранение» стояла в нуле у каждого товара, и хранение выглядело забытым.
+FACELESS_STORAGE = [
+    {
+        "reportId": 7,
+        "rrdId": 71,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        "nmId": 111,
+        "vendorCode": "A-1",
+        "subjectName": "Наматрасник",
+        "docTypeName": "Продажа",
+        "quantity": 2,
+        "retailAmount": 4000,
+        "retailPriceWithDisc": 2000,
+        "forPay": 3000,
+        "vw": 560,
+        "acquiringFee": 60,
+        "deliveryService": 200,
+    },
+    {
+        "reportId": 7,
+        "rrdId": 72,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        "nmId": 222,
+        "vendorCode": "B-2",
+        "subjectName": "Лежанка для животных",
+        "docTypeName": "Продажа",
+        "quantity": 1,
+        "retailAmount": 1000,
+        "retailPriceWithDisc": 1000,
+        "forPay": 700,
+        "vw": 170,
+        "acquiringFee": 20,
+        "deliveryService": 100,
+    },
+    {
+        "reportId": 7,
+        "rrdId": 73,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        "docTypeName": "Хранение",
+        "quantity": 0,
+        "paidStorage": 600,
+    },
+    {
+        "reportId": 7,
+        "rrdId": 74,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        "docTypeName": "Удержание",
+        "quantity": 0,
+        "deduction": 300,
+    },
+]
+
+
+def test_faceless_expenses_are_broken_down_and_the_parts_add_up(db_path):
+    """Обезличка расшифрована, и расшифровка сходится с ней самой.
+
+    Числа руками: хранение 600 и удержание 300 приходят строками без
+    артикула, обезличка 900. Если расшифровка разойдётся с обезличкой хоть на
+    копейку, селлеру покажут две разные правды об одних и тех же деньгах.
+    """
+    client_id = seed(
+        db_path,
+        FACELESS_STORAGE,
+        {111: Decimal("500"), 222: Decimal("400")},
+        telegram_id=7171,
+    )
+    report = report_of(client_id, db_path, ads=profit.AdSpend({}))
+
+    parts = {item.key: item.faceless for item in report.faceless_parts}
+    assert parts == {"storage": Decimal("600"), "deductions": Decimal("300")}
+    assert sum(parts.values(), Decimal("0")) == report.unallocated == Decimal("900")
+    # Хранение и удержания Wildberries по товарам не разнёс вовсе, логистику
+    # разнёс: правило одно на все статьи и стоит на данных, а не на списке
+    # имён в коде.
+    assert {item.key for item in report.unshared_items} == {"storage", "deductions"}
+
+
+def test_a_column_that_can_never_fill_is_absent_and_the_money_is_named(db_path):
+    client_id = seed(
+        db_path,
+        FACELESS_STORAGE,
+        {111: Decimal("500"), 222: Decimal("400")},
+        telegram_id=7272,
+    )
+    report = report_of(client_id, db_path, ads=profit.AdSpend({}))
+    book = xlsx.read_book(profit.excel_bytes(report))
+
+    headers = book[profit.ARTICLES_SHEET].headers
+    # Колонки, которой нечем заполниться, в книге нет: ноль в каждой строке
+    # читается как «не платили», а платили.
+    assert "Хранение, ₽" not in headers
+    assert "Прочие удержания, ₽" not in headers
+    # Логистику Wildberries разнёс, её колонка на месте.
+    assert "Логистика, ₽" in headers
+
+    # Деньги названы в расшифровке, и сумма расшифровки равна обезличке.
+    problems = book[profit.PROBLEMS_SHEET].rows
+    named = {
+        str(row.values[0]): row.values[3]
+        for row in problems
+        if str(row.values[0]).startswith("обезличка")
+    }
+    assert named["обезличка"] == 900
+    assert named["обезличка: хранение"] == 600
+    assert named["обезличка: прочие удержания"] == 300
+    assert named["обезличка: хранение"] + named["обезличка: прочие удержания"] == (
+        named["обезличка"]
+    )
+
+    # И сказано словами, почему колонки нет.
+    method = "\n".join(
+        " ".join(str(value) for value in row.values)
+        for row in book[profit.METHOD_SHEET].rows
+    )
+    assert "хранение" in method
+    assert "не разнёс по товарам" in method
+
+
+# --- название товара ---
+
+CARDS_PATH = "/content/v2/get/cards/list"
+
+# Ответ метода карточек. Название пишет сам продавец, поэтому в книгу оно
+# едет как есть, а в сообщение бота только через bot.texts.fill.
+CARDS = {
+    "cards": [
+        {"nmID": 111, "title": "Наматрасник на резинке 160х200", "vendorCode": "A-1"},
+        {"nmID": 333, "title": "Чужой товар", "vendorCode": "C-3"},
+    ],
+    "cursor": {"updatedAt": "", "nmID": 333, "total": 2},
+}
+
+
+def counting_http(answers):
+    """Транспорт, который считает походы в WB. Сети в тестах нет."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        found = answers.get(request.url.path)
+        if isinstance(found, int):
+            return httpx.Response(found, json={"title": "нет"})
+        return httpx.Response(200, json=found if found is not None else {})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), seen
+
+
+async def names_for(client_id, db_path, nm_ids, http):
+    time = FakeTime()
+    return await profit.collect_names(
+        client_id, nm_ids, path=db_path, http=http, clock=time.clock, sleep=time.sleep
+    )
+
+
+def test_product_name_gets_into_the_book_and_a_missing_card_leaves_the_number(
+    seller, db_path
+):
+    """Название товара видно в отчёте, а без карточки остаётся артикул.
+
+    Второго имени у нас нет: выдумать его нельзя, а пустая клетка прочиталась
+    бы как потерянные данные.
+    """
+    profit.remember_names(seller, CARDS["cards"], asked=[111, 222], path=db_path)
+    report = report_of(seller, db_path)
+
+    assert article(report, 111).title == "Наматрасник на резинке 160х200"
+    assert article(report, 111).display_name == "Наматрасник на резинке 160х200"
+    # Карточки 222 у Wildberries нет: товар удалён из кабинета.
+    assert article(report, 222).title == ""
+    assert article(report, 222).display_name == "222"
+
+    sheet = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET]
+    names = {
+        row.get("Артикул WB"): row.get("Название товара")
+        for row in sheet.rows
+        if row.get("Артикул WB") != profit.TOTAL_LABEL
+    }
+    assert names == {111: "Наматрасник на резинке 160х200", 222: "222"}
+    # Предмет остался предметом: это категория, а не название.
+    assert sheet.rows[0].get("Предмет") == "Кружка"
+
+
+@pytest.mark.asyncio
+async def test_names_are_asked_once_and_the_answer_is_remembered(cabinet, db_path):
+    http, seen = counting_http({CARDS_PATH: CARDS})
+
+    first = await names_for(cabinet, db_path, [111, 222], http)
+    second = await names_for(cabinet, db_path, [111, 222], http)
+
+    assert first == {111: "Наматрасник на резинке 160х200", 222: ""}
+    assert second == first
+    # Второй отчёт в Wildberries не пошёл: про оба артикула уже спрашивали, а
+    # удалённый товар не повод дёргать WB на каждом отчёте.
+    assert seen == [CARDS_PATH]
+    # Новый артикул в периоде отправляет за названиями снова.
+    await names_for(cabinet, db_path, [111, 222, 444], http)
+    assert seen == [CARDS_PATH, CARDS_PATH]
+
+
+@pytest.mark.asyncio
+async def test_without_content_category_the_report_keeps_the_article_number(
+    cabinet, db_path
+):
+    http, seen = counting_http({CARDS_PATH: 403})
+
+    names = await names_for(cabinet, db_path, [111], http)
+
+    assert names == {}
+    assert seen == [CARDS_PATH]
+    # Пометки «спрашивали» не осталось: категорию токена селлер может выдать,
+    # и тогда названия приедут сами.
+    assert profit.names_of(cabinet, path=db_path) == {}
+
+
+# --- итог по кабинету ---
+
+
+def test_totals_add_up_what_adds_up_and_leave_percents_alone(seller, db_path):
+    """Итоговая строка: деньги складываются, проценты нет.
+
+    Числа руками: выручка 4000 + 1000, возвраты 800, себестоимость 500 + 900,
+    комиссия 560 + 170 - 100, прибыль 1401,43 - 401,43. Маржинальность по
+    кабинету это 1000 / (3200 + 1000) = 23,81 процента, а не сумма 43,79 и
+    минус 40,14.
+    """
+    report = report_of(seller, db_path)
+    totals = report.totals
+
+    assert totals.revenue == Decimal("5000")
+    assert totals.returns_amount == Decimal("800")
+    assert totals.units == 3
+    assert totals.returns_count == 1
+    assert totals.cost == Decimal("1400")
+    assert totals.commission == Decimal("630")
+    assert totals.ad_spend == Decimal("400")
+    assert totals.unallocated == Decimal("300")
+    assert totals.profit == Decimal("1000.00")
+    assert totals.margin == 23.81
+    assert totals.complete is True
+
+    row = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET].rows[-1]
+    assert row.get("Артикул WB") == profit.TOTAL_LABEL
+    assert row.get("Выручка, ₽") == 5000
+    assert row.get("Чистая прибыль, ₽") == 1000
+    assert row.get("Маржинальность, %") == 23.81
+    # Доля в прибыли в итоге это всегда сто процентов, а цена за штуку не
+    # сумма: обе клетки говорят это словами, а не числом.
+    assert row.get("Доля в прибыли, %") == profit.NOT_SUMMABLE
+    assert row.get("Себестоимость за штуку, ₽") == profit.NOT_SUMMABLE
+
+
+def test_articles_without_profit_do_not_become_zeros_in_the_total(db_path):
+    """Артикул без себестоимости не превращается в итоге в ноль молча.
+
+    Себестоимость есть только у 111. Его прибыль 1401,43, у 222 прибыли нет
+    вовсе. Итог обязан показать 1401,43 и сказать, что сложены не все.
+    """
+    client_id = seed(db_path, ROWS, {111: Decimal("500")}, telegram_id=7373)
+    report = report_of(client_id, db_path)
+    totals = report.totals
+
+    assert totals.articles == 2
+    assert totals.priced == 1
+    assert totals.complete is False
+    assert totals.profit == Decimal("1401.43")
+    # Себестоимость сложена по тому артикулу, у которого она есть, а выручка
+    # и расходы по обоим: выручка известна и там, где прибыль не посчитана.
+    assert totals.cost == Decimal("500")
+    assert totals.revenue == Decimal("5000")
+
+    row = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET].rows[-1]
+    note = str(row.values[1])
+    assert "1 артикулам из 2" in note
+    assert profit.PROBLEMS_SHEET in note
+
+
+def test_a_total_over_nothing_says_no_data_instead_of_zero(db_path):
+    """Себестоимости нет ни у одного артикула: в итоге не ноль, а «нет данных».
+
+    Ноль в клетке прибыли прочитался бы как «отработали в ноль», а мы просто
+    не знаем: сумма пустого множества это не результат.
+    """
+    client_id = seed(db_path, ROWS, {}, telegram_id=7575)
+    report = report_of(client_id, db_path)
+
+    assert report.totals.priced == 0
+    assert report.totals.costed == 0
+    row = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET].rows[-1]
+    assert row.get("Чистая прибыль, ₽") == profit.NO_DATA
+    assert row.get("Себестоимость, ₽") == profit.NO_DATA
+    assert row.get("Маржинальность, %") == profit.NO_DATA
+    # Выручка известна и здесь: её складывать ничто не мешает.
+    assert row.get("Выручка, ₽") == 5000
+
+
+def test_unknown_commission_is_named_next_to_the_total(db_path):
+    client_id = seed(
+        db_path, ROWS, {111: Decimal("500"), 222: Decimal("900")}, telegram_id=7474
+    )
+    db.repo(client_id, db_path).update("fin_rows", {"rrd_id": 2}, raw=None)
+    report = report_of(client_id, db_path)
+
+    assert report.totals.no_commission == 1
+    row = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET].rows[-1]
+    assert "комиссия неизвестна по 1 артикулам" in str(row.values[1])
 
 
 def test_excel_keeps_a_separate_block_for_losses_and_missing_costs(db_path):
@@ -654,3 +969,149 @@ def test_a_vendor_code_from_the_cabinet_does_not_become_markup(db_path):
     assert "&lt;a href=&quot;" in text
     assert "нажми" in text  # текст не потерян, он просто не ссылка
     assert "<b>" in text  # а разметка самого бота на месте
+
+
+def test_a_product_name_from_the_cabinet_does_not_become_markup_either(seller, db_path):
+    """Название карточки пишет продавец, и это такой же чужой текст."""
+    profit.remember_names(seller, [{"nmID": 111, "title": TRAP}], asked=[111], path=db_path)
+
+    text = handlers_profit.summary_text(report_of(seller, db_path))
+
+    assert "<a href" not in text
+    assert "&lt;a href=&quot;" in text
+    assert "<b>" in text  # разметка самого бота на месте
+
+
+# --- название товара в сообщении ---
+
+
+def top_line(text: str) -> str:
+    """Первая строка топа: та, что начинается с номера."""
+    for line in str(text).splitlines():
+        if line.startswith("1. "):
+            return line
+    raise AssertionError("в сообщении нет строки топа")
+
+
+def test_the_message_names_the_product_and_keeps_the_article(seller, db_path):
+    """В топе видно название товара, а не только номер.
+
+    Артикул из строки не исчезает: по нему селлер ищет товар в кабинете и в
+    файле, а названия у соседних карточек бывают почти одинаковые.
+    """
+    profit.remember_names(seller, CARDS["cards"], asked=[111, 222], path=db_path)
+
+    line = top_line(handlers_profit.summary_text(report_of(seller, db_path)))
+
+    assert "Наматрасник" in line
+    assert "111" in line
+    assert "A-1" in line
+
+
+def test_a_long_name_does_not_spread_the_line_over_three_screens(seller, db_path):
+    """Длинное название режется, и артикул из строки не пропадает.
+
+    Название карточки на Wildberries бывает в сотню знаков, а в строке топа
+    стоят ещё прибыль, маржа и доля: без предела она разъезжается на телефоне.
+    """
+    long_name = "Наматрасник на резинке 160х200 непромокаемый с бортами хлопок"
+    profit.remember_names(seller, [{"nmID": 111, "title": long_name}], asked=[111], path=db_path)
+
+    line = top_line(handlers_profit.summary_text(report_of(seller, db_path)))
+
+    assert len(line) < len(long_name) + 20
+    assert long_name not in line          # название обрезано
+    assert "Наматрасник" in line          # но узнаваемо
+    assert "…" in line                    # и срез виден
+    assert "111" in line and "A-1" in line
+
+
+def test_without_a_card_the_line_stays_the_way_it_was(seller, db_path):
+    """Названия нет вовсе: в строке остаются одни артикулы, как раньше."""
+    line = top_line(handlers_profit.summary_text(report_of(seller, db_path)))
+
+    assert line.startswith("1. 111 (A-1): ")
+
+
+def test_the_message_says_what_the_faceless_money_is_made_of(db_path):
+    """«Расходы без артикула: 900 ₽» без состава читается как отговорка."""
+    client_id = seed(
+        db_path,
+        FACELESS_STORAGE,
+        {111: Decimal("500"), 222: Decimal("400")},
+        telegram_id=7676,
+    )
+    text = handlers_profit.summary_text(
+        report_of(client_id, db_path, ads=profit.AdSpend({}))
+    )
+
+    assert "хранение 600 ₽" in text
+    assert "прочие удержания 300 ₽" in text
+    # И сказано, почему этих колонок нет в файле.
+    assert "колонок под них в файле нет" in text
+
+
+# --- срок жизни названий ---
+
+
+def test_the_name_lifetime_is_a_setting_and_not_a_number_in_the_code():
+    assert profit.names_ttl_days() == int(config.settings()["cards"]["name_ttl_days"])
+    assert profit.names_ttl_days() > 0
+
+
+def backdate(client_id, db_path, nm_id, days):
+    """Сдвигает отметку «спрашивали» назад: карточку переименовали давно."""
+    when = datetime.now(timezone.utc) - timedelta(days=days)
+    db.repo(client_id, db_path).update(
+        profit.CARDS_TABLE, {"nm_id": nm_id}, updated_at=when.strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+
+RENAMED = {
+    "cards": [{"nmID": 111, "title": "Наматрасник премиум 160х200", "vendorCode": "A-1"}],
+    "cursor": {"updatedAt": "", "nmID": 111, "total": 1},
+}
+
+
+@pytest.mark.asyncio
+async def test_a_renamed_card_reaches_the_report_when_the_name_goes_stale(
+    cabinet, db_path
+):
+    """Без срока жизни переименование не доехало бы до отчёта никогда."""
+    http, seen = counting_http({CARDS_PATH: CARDS})
+    first = await names_for(cabinet, db_path, [111], http)
+    assert first == {111: "Наматрасник на резинке 160х200"}
+
+    # Пока имя свежее, в Wildberries не ходим ни разу.
+    await names_for(cabinet, db_path, [111], http)
+    assert seen == [CARDS_PATH]
+
+    backdate(cabinet, db_path, 111, profit.names_ttl_days() + 1)
+    later, asked = counting_http({CARDS_PATH: RENAMED})
+    names = await names_for(cabinet, db_path, [111], later)
+
+    assert asked == [CARDS_PATH]
+    assert names == {111: "Наматрасник премиум 160х200"}
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_card_does_not_send_the_report_to_wb_every_time(
+    cabinet, db_path
+):
+    """Срок жизни не превращается в поход в WB на каждый отчёт.
+
+    Карточки 222 у Wildberries нет, и имени для неё не будет никогда. Если бы
+    отметка «спрашивали» не освежалась, один удалённый товар гонял бы бота за
+    каталогом всякий раз, а платит за это токен клиента.
+    """
+    http, seen = counting_http({CARDS_PATH: CARDS})
+    await names_for(cabinet, db_path, [111, 222], http)
+    for nm_id in (111, 222):
+        backdate(cabinet, db_path, nm_id, profit.names_ttl_days() + 1)
+
+    await names_for(cabinet, db_path, [111, 222], http)
+    await names_for(cabinet, db_path, [111, 222], http)
+
+    # Два похода: первый и тот, что случился по сроку. Третий не понадобился.
+    assert seen == [CARDS_PATH, CARDS_PATH]
+    assert profit.names_of(cabinet, path=db_path)[222] == ""

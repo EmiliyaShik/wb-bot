@@ -796,6 +796,136 @@ async def test_commission_by_article_adds_up_to_the_commission_of_the_week(
     assert "/profit" in str(line.get("Пояснение"))
 
 
+# --- колонка, которой нечем заполниться --------------------------------------
+#
+# Неделя владельца в миниатюре. Хранение Wildberries отдал одной строкой по
+# кабинету и по товарам не разнёс: колонка «Хранение, ₽» стояла в нуле у
+# каждого артикула, и расход выглядел забытым, хотя деньги ушли. Приёмку не
+# брали вовсе, и там ноль настоящий: такую колонку убирать не за что.
+
+STORAGE_WEEK = [
+    {
+        **WEEK,
+        "rrdId": 11,
+        "nmId": 111,
+        "vendorCode": "ART-1",
+        "subjectName": "Наматрасник",
+        "docTypeName": "Продажа",
+        "quantity": 1,
+        "retailAmount": "1000",
+        "retailPriceWithDisc": "1000",
+        "forPay": "700",
+        "vw": "150",
+        "acquiringFee": "20",
+        "deliveryService": "50",
+        "paidStorage": "0",
+        "paidAcceptance": "0",
+        "penalty": "0",
+        "deduction": "0",
+        "additionalPayment": "0",
+    },
+    {
+        **WEEK,
+        "rrdId": 12,
+        "nmId": 222,
+        "vendorCode": "ART-2",
+        "subjectName": "Лежанка",
+        "docTypeName": "Продажа",
+        "quantity": 1,
+        "retailAmount": "500",
+        "retailPriceWithDisc": "500",
+        "forPay": "350",
+        "vw": "75",
+        "acquiringFee": "10",
+        "deliveryService": "25",
+        "paidStorage": "0",
+        "paidAcceptance": "0",
+        "penalty": "0",
+        "deduction": "0",
+        "additionalPayment": "0",
+    },
+    {
+        **WEEK,
+        "rrdId": 13,
+        "docTypeName": "Хранение",
+        "quantity": 0,
+        "retailAmount": "0",
+        "retailPriceWithDisc": "0",
+        "forPay": "0",
+        "vw": "0",
+        "acquiringFee": "0",
+        "deliveryService": "0",
+        "paidStorage": "600",
+        "paidAcceptance": "0",
+        "penalty": "0",
+        "deduction": "0",
+        "additionalPayment": "0",
+    },
+]
+
+
+def storage_report(db_path, telegram_id=4242):
+    """Отчёт по неделе, в которой хранение пришло строкой без артикула."""
+    client_id = db.admin_repo(db_path).ensure_client(telegram_id)
+    finance.save_rows(client_id, STORAGE_WEEK, path=db_path)
+    for week in finance.aggregate(STORAGE_WEEK).values():
+        finance.save_week(client_id, week, path=db_path)
+    return finance.build(client_id, "week", today=date(2026, 9, 15), path=db_path)
+
+
+def test_an_article_column_that_can_never_fill_is_absent_from_the_book(db_path):
+    """Хранение пришло без артикула: колонки нулей в листе нет.
+
+    Ноль в каждой строке читается как «не платили», а платили 600 рублей.
+    Приёмка в этой же неделе ноль настоящий, и её колонка остаётся: правило
+    стоит на данных, а не на списке названий статей.
+    """
+    book = xlsx.read_book(finance.excel_bytes(storage_report(db_path)))
+    headers = book["По артикулам"].headers
+
+    assert "Хранение, ₽" not in headers
+    assert "Приёмка, ₽" in headers
+    assert "Логистика, ₽" in headers
+    # Деньги не потеряны: на листе недели хранение на месте, и строк в листе
+    # артикулов ровно столько же, сколько было.
+    assert book["Недели"].rows[0].get("Хранение, ₽") == 600
+    assert [row.get("Артикул WB") for row in book["По артикулам"].rows] == [
+        111,
+        222,
+        "без артикула",
+    ]
+
+
+def test_the_missing_column_is_explained_with_its_own_amount(db_path):
+    """Про эти деньги сказано словами и цифрой, а не просто убрано."""
+    book = xlsx.read_book(finance.excel_bytes(storage_report(db_path)))
+    method = {row.get("Показатель"): row for row in book["Методология"].rows}
+
+    line = str(method["Чего нет в этом отчёте"].get("Пояснение"))
+    assert "хранение" in line
+    assert "600.00 ₽" in line
+    assert "Недели" in line
+    # Общее правило названо отдельной строкой, а не только этим периодом.
+    assert "Статьи без разреза по товарам" in method
+
+
+def test_a_week_where_everything_is_spread_keeps_all_its_columns(db_path):
+    """Разнесённая статья колонку не теряет: убирается только неразнесённая."""
+    client_id = db.admin_repo(db_path).ensure_client(4343)
+    finance.save_rows(client_id, ROWS, path=db_path)
+    for week in finance.aggregate(ROWS).values():
+        finance.save_week(client_id, week, path=db_path)
+    report = finance.build(client_id, "week", today=date(2026, 9, 15), path=db_path)
+
+    book = xlsx.read_book(finance.excel_bytes(report))
+    # Хранение здесь Wildberries разнёс по товарам (5 и 3 рубля), и колонка
+    # обязана остаться на месте.
+    assert "Хранение, ₽" in book["По артикулам"].headers
+    assert "Чего нет в этом отчёте" not in {
+        row.get("Показатель") for row in book["Методология"].rows
+    }
+
+
 # --- сбор и отправка это две разные задачи -----------------------------------
 
 

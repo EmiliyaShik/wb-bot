@@ -103,6 +103,23 @@ CREATE TABLE IF NOT EXISTS costs (
     PRIMARY KEY (client_id, nm_id)
 );
 
+-- Названия карточек товаров. В отчёте о реализации названия нет вовсе: там
+-- nmId, vendorCode, brandName и subjectName, а subjectName это предмет, то
+-- есть категория («Наматрасник»), а не название карточки. Название живёт в
+-- другом методе (карточки товаров, категория токена «Контент»), и держать его
+-- здесь нужно затем, чтобы не ходить в WB на каждый отчёт.
+--
+-- Пустой title это не «не спрашивали», а «спросили, и карточки у WB нет»:
+-- товар могли удалить из кабинета. Разница важна, потому что именно по ней
+-- решается, идти ли в Wildberries ещё раз.
+CREATE TABLE IF NOT EXISTS card_names (
+    client_id  INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    nm_id      INTEGER NOT NULL,
+    title      TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (client_id, nm_id)
+);
+
 CREATE TABLE IF NOT EXISTS fin_weeks (
     client_id              INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
     report_id              INTEGER NOT NULL,

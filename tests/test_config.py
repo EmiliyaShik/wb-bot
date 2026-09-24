@@ -162,6 +162,52 @@ def test_diagnostic_line_is_shown_only_for_visible_modules():
             assert info.diagnostic_line == "", info.name
 
 
+def test_a_module_lists_its_reports_with_a_command_and_a_use():
+    """Одна подписка это несколько разных отчётов, и у каждого своё имя.
+
+    Проверяется свойство записи, а не редактура: формулировки владелец правит
+    без правки теста.
+    """
+    finance = config.modules()["finance"]
+    assert [report.command for report in finance.reports] == [
+        "finance",
+        "dynamics",
+        "profit",
+    ]
+    for report in finance.reports:
+        assert report.title.strip(), report.command
+        assert len(report.gives.strip()) > 20, report.command
+        assert str(finance.price_month) not in report.gives, report.command
+
+    # У «План-факта» отчёт один, и это не поломка.
+    assert [report.command for report in config.modules()["rnp"].reports] == ["rnp"]
+    # Скрытые модули списка отчётов не заводили: им это на будущее.
+    assert config.modules()["ads"].reports == ()
+    assert config.modules()["funnel"].reports == ()
+
+
+def test_a_module_without_a_list_of_reports_does_not_break_the_config(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "settings",
+        lambda: {
+            "modules": {
+                "bare": {"price_month": 100, "visible": True},
+                "half": {
+                    "price_month": 200,
+                    "visible": True,
+                    # Запись без команды вести некуда, её пропускают молча.
+                    "reports": [{"title": "без команды"}, {"command": "/plan"}],
+                },
+            }
+        },
+    )
+    assert config.modules()["bare"].reports == ()
+    half = config.modules()["half"].reports
+    assert [report.command for report in half] == ["plan"]
+    assert half[0].title == "plan", "имени нет - остаётся команда"
+
+
 def test_module_info_carries_the_shop_window_texts():
     finance = config.modules()["finance"]
     assert finance.gives == config.settings()["modules"]["finance"]["gives"]

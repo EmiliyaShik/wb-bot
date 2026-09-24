@@ -342,7 +342,11 @@ async def start_dialog(
     # Продаётся ли модуль, решает витрина, а не кнопка: имя модуля приехало
     # из callback_data, то есть сочинить его мог и клиент.
     if not tariffs.for_sale(module):
-        await message.reply_text(tariffs.tariffs_text(), parse_mode=ParseMode.HTML)
+        await message.reply_text(
+            tariffs.tariffs_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=tariffs.tariffs_keyboard(),
+        )
         return
     if context is not None and context.user_data is not None:
         context.user_data[STATE] = {"module": module, "step": "period"}
@@ -506,7 +510,11 @@ async def _issue(update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict
     if not tariffs.for_sale(module) or months not in config.periods():
         if context.user_data is not None:
             context.user_data.pop(STATE, None)
-        await message.reply_text(tariffs.tariffs_text(), parse_mode=ParseMode.HTML)
+        await message.reply_text(
+            tariffs.tariffs_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=tariffs.tariffs_keyboard(),
+        )
         return
 
     try:

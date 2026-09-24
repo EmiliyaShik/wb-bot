@@ -21,6 +21,12 @@
 в лист на миллионы строк. Чужая начинка, переименованная в `.xlsx`, даёт
 понятную ошибку, а не падение openpyxl, а настоящая причина беды уходит в
 журнал владельца.
+
+Здесь же два правила про сами колонки, и оба стоят на данных, а не на
+списке номеров рядом с каждой книгой: колонка с рублём в заголовке
+показывается с копейками (`is_money_header`), а колонка, вся сумма которой
+пришла строками без ключа, из листа убирается (`only_faceless`). Список
+такой автор нового листа забудет дополнить, и книга молча соврёт.
 """
 
 from __future__ import annotations
@@ -28,8 +34,9 @@ from __future__ import annotations
 import io
 import zipfile
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Collection, Iterator, Mapping, Sequence
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font
@@ -63,6 +70,10 @@ __all__ = [
     "MONEY_FORMAT",
     "MONEY_SIGN",
     "is_money_header",
+    "only_faceless",
+    "faceless_keys",
+    "visible_headers",
+    "visible_row",
 ]
 
 # Строка заголовков в листе одна и всегда первая: так книгу читает человек,
@@ -242,6 +253,60 @@ def find_column(headers: Sequence[str], aliases: Sequence[str]) -> str | None:
         if normalize(header) in wanted:
             return header
     return None
+
+
+# --- колонка, которой нечем заполниться ---
+
+# Колонка листа: заголовок и ключ статьи, если колонка показывает именно её.
+# Пара, а не отдельный список ключей: список и заголовки разъезжаются при
+# первой же вставке колонки в середину.
+Column = tuple[str, str | None]
+
+_ZERO = Decimal("0")
+
+
+def _amount(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value or 0))
+
+
+def only_faceless(by_row: Any, faceless: Any) -> bool:
+    """Вся сумма статьи пришла строками без ключа: колонки под неё не будет.
+
+    Так Wildberries отдаёт хранение: общей суммой по кабинету, без разбивки
+    по товарам. Колонка под такую статью стояла бы в нуле у каждой строки, а
+    ноль читается как «не платили», а не как «нам не разнесли». Настоящий
+    ноль (статьи не было вовсе) колонку не убирает: у него и правда ноль.
+
+    Правило стоит на данных, а не на списке названий статей: у другого
+    кабинета то же хранение может прийти разнесённым, и колонка появится
+    сама, без правки кода.
+    """
+    return _amount(faceless) != _ZERO and _amount(by_row) == _ZERO
+
+
+def faceless_keys(split: Mapping[str, tuple[Any, Any]]) -> frozenset[str]:
+    """Ключи статей, у которых разреза по строкам нет вовсе.
+
+    На входе по каждой статье пара «сколько пришло строками с ключом,
+    сколько без него».
+    """
+    return frozenset(
+        key for key, (by_row, faceless) in split.items() if only_faceless(by_row, faceless)
+    )
+
+
+def visible_headers(columns: Sequence[Column], hidden: Collection[str]) -> tuple[str, ...]:
+    """Заголовки листа без колонок, которым нечем заполниться."""
+    return tuple(header for header, key in columns if key not in hidden)
+
+
+def visible_row(
+    values: Sequence[Any], columns: Sequence[Column], hidden: Collection[str]
+) -> list[Any]:
+    """Значения строки в том же порядке и без тех же колонок."""
+    return [value for value, (_, key) in zip(values, columns) if key not in hidden]
 
 
 # --- запись ---

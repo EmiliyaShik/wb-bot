@@ -324,9 +324,13 @@ class FakeMessage:
     def __init__(self, document=None):
         self.document = document
         self.sent: list[str] = []
+        # Клавиатура запоминается отдельно: дорога к себестоимости должна
+        # ехать в том же сообщении, что и слова о ней.
+        self.markup: list = []
 
     async def reply_text(self, text, **kwargs):
         self.sent.append(text)
+        self.markup.append(kwargs.get("reply_markup"))
         return self
 
     @property
@@ -579,3 +583,150 @@ def test_an_impossible_article_number_does_not_reach_the_base(cabinet):
     assert result.saved == 1
     assert sorted(costs.costs_for(client_id, path=path)) == [2]
     assert [problem.row for problem in result.problems] == [2]
+
+
+# --- про себестоимость говорят до пустого отчёта, а не после ---------------
+#
+# Живая проверка владельцем: кабинет подключён, прибыльность запрошена, а
+# прибыль не посчитана ни по одному артикулу, и человеку об этом никто не
+# сказал. Отказываться считать прибыль без себестоимости правильно, молчать
+# об этом нет. Здесь проверяется, что молчания больше нет и что тому, кто
+# себестоимость уже внёс, никто не напоминает ни о чём.
+
+from bot.handlers import costs as costs_handler  # noqa: E402
+from bot.handlers import settings as settings_handler  # noqa: E402
+
+COSTS_BUTTON = "menu:costs"
+
+
+def sold(client_id, path, nm_ids, report_id: int = 1) -> None:
+    """Собранная неделя продаж: сами числа тут не важны, важны артикулы."""
+    repo = db.repo(client_id, path)
+    repo.insert(
+        "fin_weeks",
+        report_id=report_id,
+        date_from="2026-09-07",
+        date_to="2026-09-13",
+    )
+    for number, nm_id in enumerate(nm_ids, start=1):
+        repo.insert(
+            "fin_rows",
+            report_id=report_id,
+            rrd_id=report_id * 1000 + number,
+            nm_id=nm_id,
+            doc_type_name="Продажа",
+        )
+
+
+def buttons_of(markup) -> list[str]:
+    return [button.callback_data for row in markup.inline_keyboard for button in row]
+
+
+def test_coverage_counts_the_articles_that_sold_and_the_ones_that_are_priced(cabinet):
+    client_id, path = cabinet
+    sold(client_id, path, [101, 102, 103, 104])
+    costs.save_costs(client_id, {101: Decimal("10"), 102: Decimal("20")}, path=path)
+
+    state = costs_handler.coverage(client_id, path=path)
+
+    assert (state.selling, state.covered, state.known) == (4, 2, 2)
+    assert not state.empty and state.counted and not state.complete
+
+
+def test_coverage_does_not_count_a_cost_of_an_article_that_no_longer_sells(cabinet):
+    """Внесено два, продаётся один из них: обещать «внесено 2 из 1» нельзя."""
+    client_id, path = cabinet
+    sold(client_id, path, [101])
+    costs.save_costs(client_id, {101: Decimal("10"), 999: Decimal("20")}, path=path)
+
+    state = costs_handler.coverage(client_id, path=path)
+
+    assert (state.selling, state.covered, state.known) == (1, 1, 2)
+    assert state.complete
+
+
+@pytest.mark.asyncio
+async def test_settings_tell_how_many_articles_are_priced_out_of_how_many(cabinet):
+    """Состояние видно и оно правдиво: внесено столько-то из стольких-то."""
+    client_id, path = cabinet
+    sold(client_id, path, [101, 102, 103, 104])
+    costs.save_costs(client_id, {101: Decimal("10")}, path=path)
+    message = FakeMessage()
+
+    await settings_handler.settings_command(
+        FakeUpdate(777, message), None, path=path
+    )
+
+    text = message.last
+    assert "Себестоимость" in text
+    assert "4" in text and "1" in text
+    # «по остальным прибыль не посчитается» это главное, ради чего блок нужен.
+    assert "не посчитается" in text
+    # Настройки рассылок никуда не делись.
+    assert "Ежедневный" in text and "Недельный" in text
+
+
+@pytest.mark.asyncio
+async def test_settings_of_a_cabinet_without_any_costs_say_what_stops_working(cabinet):
+    """И заодно то, что продолжает работать: пугать неправдой нельзя."""
+    client_id, path = cabinet
+    sold(client_id, path, [101, 102])
+    message = FakeMessage()
+
+    await settings_handler.settings_command(
+        FakeUpdate(777, message), None, path=path
+    )
+
+    text = message.last
+    assert "Не внесена ни по одному артикулу" in text
+    assert "/profit" in text
+    assert "работают как обычно" in text
+
+
+@pytest.mark.asyncio
+async def test_settings_of_a_priced_cabinet_do_not_nag_and_drop_the_button(cabinet):
+    client_id, path = cabinet
+    sold(client_id, path, [101, 102])
+    costs.save_costs(client_id, {101: Decimal("10"), 102: Decimal("20")}, path=path)
+    message = FakeMessage()
+
+    await settings_handler.settings_command(
+        FakeUpdate(777, message), None, path=path
+    )
+
+    text = message.last
+    assert "прибыль посчитается по каждому" in text.lower()
+    assert "не посчитается" not in text
+    assert COSTS_BUTTON not in buttons_of(message.markup[-1])
+
+
+@pytest.mark.asyncio
+async def test_settings_offer_the_road_while_something_is_still_unpriced(cabinet):
+    client_id, path = cabinet
+    sold(client_id, path, [101, 102])
+    costs.save_costs(client_id, {101: Decimal("10")}, path=path)
+    message = FakeMessage()
+
+    await settings_handler.settings_command(
+        FakeUpdate(777, message), None, path=path
+    )
+
+    assert COSTS_BUTTON in buttons_of(message.markup[-1])
+
+
+def test_a_cabinet_without_collected_weeks_does_not_invent_a_denominator(cabinet):
+    """Продажи ещё не собраны: числа «из скольких» не выдумываются.
+
+    Пустая база это не «ноль артикулов продаётся»: сказать так значило бы
+    соврать ровно тем же способом, каким бот отказывается считать прибыль.
+    """
+    client_id, path = cabinet
+
+    empty = costs_handler.state_text(costs_handler.coverage(client_id, path=path))
+    assert "Не внесена ни по одному артикулу" in empty
+    assert "продажами" not in empty
+
+    costs.save_costs(client_id, {101: Decimal("10")}, path=path)
+    priced = costs_handler.state_text(costs_handler.coverage(client_id, path=path))
+    assert "Артикулов с себестоимостью: 1" in priced
+    assert "соберётся первый недельный отчёт" in priced

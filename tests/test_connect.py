@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 
 from types import SimpleNamespace
@@ -779,3 +780,55 @@ def test_the_offer_link_from_the_environment_does_not_become_markup(monkeypatch)
 
     assert "<a href" not in text
     assert "&lt;a href=&quot;" in text
+
+
+# --- себестоимость: про неё говорят сразу, а не после пустого отчёта -------
+#
+# Живая проверка владельцем: кабинет подключён, прибыльность запрошена, а
+# прибыль не посчитана ни по одному артикулу, потому что себестоимости нет и
+# бот отказывается её выдумывать. Отказ правильный, молчание нет. Подключение
+# это первое место, где человек уже настроен что-то делать, поэтому дорога к
+# себестоимости показывается здесь.
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_cabinet_is_told_about_the_cost_price_and_gets_the_road(
+    db_path, ready, wb
+):
+    clients.record_consent(ready, now=NOW, path=db_path)
+    message = FakeMessage(make_token())
+
+    await connect.token_message(FakeUpdate(500500, message), FakeContext(), path=db_path)
+
+    answer, kwargs = message.sent[0]
+    assert "подключён" in answer.lower()
+    assert "себестоимость" in answer.lower()
+    # Правда про то, что без неё работает: пугать «не работает ничего» нельзя.
+    assert "/finance" in answer and "/profit" in answer
+    assert "/costs" in answer
+    # Дорога под пальцем, а не в памяти: кнопка ведёт в ту же команду.
+    buttons = [
+        button.callback_data
+        for row in kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert buttons == ["menu:costs"]
+
+
+@pytest.mark.asyncio
+async def test_a_seller_who_already_gave_the_cost_price_is_not_told_about_it(
+    db_path, ready, wb
+):
+    """Напоминание останавливает сама себестоимость, и ничего больше не нужно."""
+    from core import costs as costs_core
+
+    clients.record_consent(ready, now=NOW, path=db_path)
+    costs_core.save_costs(ready, {101: Decimal("10")}, path=db_path)
+    message = FakeMessage(make_token())
+
+    await connect.token_message(FakeUpdate(500500, message), FakeContext(), path=db_path)
+
+    answer, kwargs = message.sent[0]
+    assert "подключён" in answer.lower()
+    assert "Остался один шаг" not in answer
+    assert kwargs["reply_markup"] is None

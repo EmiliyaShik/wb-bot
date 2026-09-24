@@ -21,7 +21,7 @@ from telegram.error import InvalidToken
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from bot import texts
-from bot.handlers import register_all
+from bot.handlers import menu, register_all
 from core import audit, config, crypto, db, queue, scheduler
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,12 @@ async def start_background(app) -> None:
             "Расписание: " + (", ".join(names) if names else "работ пока нет"),
         )
 
+    # Меню команд заявляется при каждом запуске, а не руками у @BotFather:
+    # список команд живёт в коде, и правка описания доезжает до клиентов сама.
+    # Это поход в сеть, и уронить запуск он не имеет права: отказ Telegram
+    # остаётся записью в журнале, бот работает дальше командами, как раньше.
+    await menu.publish(app.bot)
+
     stop = asyncio.Event()
     app.bot_data["queue_stop"] = stop
     app.bot_data["queue_worker"] = asyncio.create_task(
@@ -141,12 +147,26 @@ async def stop_background(app) -> None:
     logger.info("Воркер очереди остановлен")
 
 
+# Библиотеки, которые пишут в журнал полный адрес запроса. Токен бота это
+# часть адреса (https://api.telegram.org/bot<ТОКЕН>/getMe), а на хостинге
+# журнал хранится и бывает виден, так что утечка настоящая. Свой журнал мы
+# чистим сами (core.audit.redact), но чужая библиотека пишет мимо него.
+URL_WRITING_LOGGERS = ("httpx", "httpcore", "telegram.request")
+
+
+def hush_url_logging() -> None:
+    """Поднимает порог болтливым библиотекам: ошибки видны, адреса нет."""
+    for name in URL_WRITING_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def startup() -> dict:
     """Готовит бота к работе: папка данных, миграции, честный отчёт о ключах.
 
     Ничего не роняет: без ключа шифрования и без списка админов бот работает,
     просто часть возможностей выключена, и об этом написано в журнале.
     """
+    hush_url_logging()
     config.data_dir().mkdir(parents=True, exist_ok=True)
     version = db.migrate()
 
@@ -184,15 +204,42 @@ def startup() -> dict:
     }
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        texts.INTRO, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    path: str | None = None,
+) -> None:
+    # Кнопки рисует bot.handlers.menu: они зовут те же функции, что и команды,
+    # и набор их зависит от того, подключён ли кабинет.
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        texts.INTRO,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=menu.main_keyboard(update, path=path),
     )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        texts.HELP, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    path: str | None = None,
+) -> None:
+    # effective_message, а не message: сюда же приходит кнопка «Что я умею», а
+    # у нажатой кнопки собственного message нет.
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        texts.HELP,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        # Без кнопки «Что я умею»: она показала бы ровно это же сообщение.
+        reply_markup=menu.main_keyboard(update, path=path, without=(menu.HELP,)),
     )
 
 
