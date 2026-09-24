@@ -117,6 +117,8 @@ GRANT_USAGE = (
     "Выдать доступ вручную:\n"
     "<code>/grant id модуль месяцев способ номер_платежа</code>\n\n"
     "Например: <code>/grant 12 finance 3 счёт WBR-2026-0007</code>\n"
+    "Модуль всегда один. Пакет «Всё сразу» это тоже модуль, его имя "
+    "<code>all</code>.\n"
     "Способ: счёт, карта или другое.\n"
     "Клиент это внутренний id из /stats или Telegram ID из уведомления о счёте: "
     "понимаю оба, переводить одно в другое не нужно."
@@ -127,6 +129,14 @@ GRANT_DUPLICATE = (
     "Модуль {module} работает до {until}."
 )
 UNKNOWN_MODULE = "Нет такого модуля: {module}. Есть: {known}."
+# Отказ обязан говорить, как надо. У /revoke мимо имени модуля чаще всего
+# промахивается тот, кто хотел погасить всё, у /grant - тот, кто решил, что
+# «все» работает и на выдаче.
+REVOKE_UNKNOWN_HINT = "\nПогасить всё, что работает: вместо модуля напишите <code>все</code>."
+GRANT_EVERYTHING_HINT = (
+    "\nСлова «все» у выдачи нет: /grant включает один модуль. "
+    "Всё сразу это пакет, его имя <code>all</code>."
+)
 UNKNOWN_CLIENT = (
     "Клиента с номером {client_id} в базе нет: ни внутреннего id, ни Telegram-аккаунта."
 )
@@ -144,18 +154,34 @@ REVOKE_USAGE = (
     "Отменить доступ:\n"
     "<code>/revoke id модуль причина</code>\n\n"
     "Например: <code>/revoke 12 finance возврат по счёту WBR-2026-0007</code>\n"
-    "Вместо модуля можно написать <code>все</code>: тогда гаснет всё, что работает.\n"
+    "Вместо модуля можно написать по-русски <code>все</code>: тогда гаснет всё, "
+    "что у клиента работает.\n"
+    "<code>all</code> это не «все», а имя модуля: пакет «Всё сразу». "
+    "По нему гаснет только сам пакет.\n"
     "Клиент, как и у /grant, это внутренний id или Telegram ID: понимаю оба."
 )
 
 # Слово вместо модуля: погасить у клиента всё сразу, обходом по модулям.
-ALL_MODULES = {"все", "всё", "all"}
+# Только по-русски, и это главное. Английское all с тех пор, как пакет «Всё
+# сразу» продаётся, стало именем модуля, и одно слово значило бы сразу два
+# разных дела. Спор решается в пользу набранного имени, а не в пользу слова:
+# лишний раз погашенный модуль сжигает оплаченные дни, а вернуть их нечем -
+# новая выдача пойдёт уже по новому номеру платежа. Недогашенное, наоборот,
+# гасится второй командой, и ответ на первую прямо говорит, какой.
+EVERYTHING = {"все", "всё"}
 REVOKE_DONE = (
     "Клиент {client_id}: модуль {module} отключён, сгорело оплаченных дней {days}. "
     "Причина записана в журнал. Новая выдача пойдёт по новому номеру платежа: "
     "отмена не открывает старый платёж заново."
 )
+# Приписка к отмене пакета: владелец мог иметь в виду «погасить вообще всё».
+# Готовая команда рядом, чтобы не набирать её на телефоне заново.
+REVOKE_PACKAGE_NOTE = (
+    "\nЭто был только пакет. Если нужно погасить у клиента вообще всё: "
+    "<code>/revoke {client_id} все {reason}</code>"
+)
 REVOKE_NOTHING = "У клиента {client_id} модуль {module} и так не подключён."
+REVOKE_NOTHING_ALL = "У клиента {client_id} не работает ни один модуль, гасить нечего."
 
 TASKS_HEAD = "🧰 <b>Задачи и ошибки</b>"
 TASKS_NONE = "Упавших задач нет, в работе тоже пусто."
@@ -492,7 +518,10 @@ async def grant_command(
     if module not in config.modules():
         # Имя модуля здесь ровно то, что владелец набрал в команде, и обратно
         # в сообщение оно едет через ту же подстановку, что и всё остальное.
-        await _reply(update, UNKNOWN_MODULE, module=module, known=", ".join(config.modules()))
+        refusal = fill(UNKNOWN_MODULE, module=module, known=", ".join(config.modules()))
+        if module.strip().lower() in EVERYTHING:
+            refusal = Safe(refusal + GRANT_EVERYTHING_HINT)
+        await _reply(update, refusal)
         return
     found = await _resolved(update, asked, path)
     if found is None:
@@ -544,7 +573,11 @@ async def revoke_command(
 
     Слово «все» вместо модуля гасит всё, что у клиента работает: зернистость
     у выдачи и отмены одна, поэтому это обход `status()` с вызовом на каждый
-    модуль, а не особый случай внутри ядра.
+    модуль, а не особый случай внутри ядра. Слово только русское: английское
+    all это имя продающегося модуля, пакета «Всё сразу», и набранное имя
+    модуля всегда сильнее слова-обхода. Иначе владелец, написавший имя
+    пакета, гасил бы заодно отдельно купленные модули, а сгоревшие дни не
+    вернуть: новая выдача пойдёт только по новому номеру платежа.
 
     Важное следствие идемпотентности: отмена не открывает платёж заново.
     `grant_access` с тем же номером по-прежнему считает его дублем, так что
@@ -563,9 +596,19 @@ async def revoke_command(
         return
     module = args[1]
     reason = " ".join(args[2:]).strip()
-    everything = module.strip().lower() in ALL_MODULES
-    if not everything and module not in config.modules():
-        await _reply(update, UNKNOWN_MODULE, module=module, known=", ".join(config.modules()))
+    known = config.modules()
+    # Имя модуля проверяется раньше слова-обхода, а не позже, и это вся
+    # развязка: пока пакет продаётся под именем all, набранное имя значит
+    # модуль, а «все» пишется по-русски и ни с чем не совпадает.
+    if module in known:
+        everything = False
+    elif module.strip().lower() in EVERYTHING:
+        everything = True
+    else:
+        await _reply(
+            update,
+            Safe(fill(UNKNOWN_MODULE, module=module, known=", ".join(known)) + REVOKE_UNKNOWN_HINT),
+        )
         return
     found = await _resolved(update, asked, path)
     if found is None:
@@ -578,7 +621,10 @@ async def revoke_command(
     else:
         names = [module] if access.access_of(client_id, module, now=now, path=path).works else []
     if not names:
-        await _reply(update, REVOKE_NOTHING, client_id=client_id, module=module)
+        if everything:
+            await _reply(update, REVOKE_NOTHING_ALL, client_id=client_id)
+        else:
+            await _reply(update, REVOKE_NOTHING, client_id=client_id, module=module)
         return
 
     burned = 0
@@ -586,10 +632,15 @@ async def revoke_command(
         before = access.access_of(client_id, name, now=now, path=path)
         access.revoke_access(client_id, name, reason, actor="owner", now=now, path=path)
         burned += before.days_left
+    # Пакет гаснет один, а звучит как «всё»: разницу договаривает ответ, пока
+    # владелец ещё смотрит в экран, и сразу подаёт вторую команду готовой.
+    tail = note
+    if not everything and module in access.packages():
+        tail = Safe(fill(REVOKE_PACKAGE_NOTE, client_id=client_id, reason=reason) + note)
     await _reply(
         update,
         Safe(
-            fill(REVOKE_DONE, client_id=client_id, module=", ".join(names), days=burned) + note
+            fill(REVOKE_DONE, client_id=client_id, module=", ".join(names), days=burned) + tail
         ),
     )
 

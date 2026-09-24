@@ -520,6 +520,96 @@ async def test_revoke_all_walks_the_modules_one_by_one(db_path, business, owner)
 
 
 @pytest.fixture
+def with_package(db_path, business):
+    """У первого клиента куплен пакет «Всё сразу» и отдельно модуль finance.
+
+    Ровно тот случай, в котором имя пакета и слово «всё» значат разное:
+    погасить пакет и погасить у клиента всё это два разных дела.
+    """
+    first, _ = business
+    access.grant_access(
+        first, "all", 31, "П-ПАКЕТ", method="invoice", actor="owner",
+        now=datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc), path=db_path,
+    )
+    return first
+
+
+@pytest.mark.asyncio
+async def test_revoke_all_switches_off_the_package_and_nothing_else(db_path, with_package, owner):
+    """Имя модуля сильнее слова-обхода: набрано all - погашен пакет all.
+
+    Проверяется состоянием базы, а не текстом ответа: в access_log ровно одна
+    отмена, и отдельно купленный finance после неё продолжает работать.
+    """
+    first = with_package
+    now = datetime(2026, 9, 16, tzinfo=timezone.utc)
+    message = FakeMessage()
+
+    await admin.revoke_command(
+        FakeUpdate(OWNER, message), context(str(first), "all", "возврат"), path=db_path, now=now
+    )
+
+    revoked = {r["module"] for r in db.repo(first, db_path).rows("access_log", action="revoke")}
+    assert revoked == {"all"}
+    assert access.access_of(first, "all", now=now, path=db_path).works is False
+    assert access.access_of(first, "finance", now=now, path=db_path).works is True
+
+
+@pytest.mark.asyncio
+async def test_revoke_everything_is_the_russian_word_and_it_takes_the_package_too(
+    db_path, with_package, owner
+):
+    """«Все» по-русски гасит и пакет, и купленное отдельно."""
+    first = with_package
+    now = datetime(2026, 9, 16, tzinfo=timezone.utc)
+    message = FakeMessage()
+
+    await admin.revoke_command(
+        FakeUpdate(OWNER, message), context(str(first), "все", "возврат"), path=db_path, now=now
+    )
+
+    revoked = {r["module"] for r in db.repo(first, db_path).rows("access_log", action="revoke")}
+    assert revoked == {"all", "finance"}
+    assert access.has_access(first, "finance", now=now, path=db_path) is False
+    assert access.has_access(first, "ads", now=now, path=db_path) is False
+
+
+@pytest.mark.asyncio
+async def test_revoke_with_a_word_that_is_neither_touches_nothing_and_says_how(
+    db_path, with_package, owner
+):
+    """Отказ объясняет, как надо: ни один модуль при этом не гаснет."""
+    first = with_package
+    now = datetime(2026, 9, 16, tzinfo=timezone.utc)
+    message = FakeMessage()
+
+    await admin.revoke_command(
+        FakeUpdate(OWNER, message), context(str(first), "everything", "возврат"),
+        path=db_path, now=now,
+    )
+
+    assert db.repo(first, db_path).rows("access_log", action="revoke") == []
+    assert access.access_of(first, "all", now=now, path=db_path).works is True
+    assert "все" in message.last
+
+
+@pytest.mark.asyncio
+async def test_grant_does_not_pretend_to_understand_the_word_everything(db_path, business, owner):
+    """У выдачи слова «все» нет, и молча выдать один модуль вместо всех нельзя."""
+    _, second = business
+    message = FakeMessage()
+
+    await admin.grant_command(
+        FakeUpdate(OWNER, message),
+        context(str(second), "все", "1", "счёт", "П-ВСЁ"),
+        path=db_path,
+    )
+
+    assert db.repo(second, db_path).rows("access_log", action="grant") == []
+    assert "all" in message.last
+
+
+@pytest.fixture
 def broken(db_path, business):
     """Одна упавшая задача и одна в работе плюс запись журнала об ошибке."""
     first, _ = business
