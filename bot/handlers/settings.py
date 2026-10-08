@@ -13,6 +13,12 @@
 стоят и у того, кто модуль «Реклама» не покупал: настройка бесплатная, а
 узнать про неё человеку иначе неоткуда.
 
+Режим налогообложения и ставка устроены так же: хранит и проверяет их
+`core.tax`, экран показывает и переключает. Ставка выбирается селлером,
+потому что в регионах она льготная, а не потому, что бот не знает общей.
+Белого списка ставок здесь нет намеренно: он один и лежит в `core.tax`,
+иначе кнопка однажды предложила бы ставку, которую расчёт не принимает.
+
 Разметку в сообщениях ставит только бот. Название модуля приходит из
 конфига, а все эти сообщения уходят с `ParseMode.HTML`, поэтому подстановка
 идёт через общий `bot.texts.fill`: граница стоит на ней, а не у каждого
@@ -38,12 +44,16 @@ from bot.handlers import costs as costs_handler
 from bot.handlers import tariffs
 from bot.texts import Safe, fill
 from core import config, db, scheduler
+from core import tax as tax_module
 
 logger = logging.getLogger(__name__)
 
 PREFIX = "set:"
 TIME_PREFIX = f"{PREFIX}at:"
 DRR_PREFIX = f"{PREFIX}drr:"
+TAX_MODE_PREFIX = f"{PREFIX}tax:"
+TAX_RATE_PREFIX = f"{PREFIX}rate:"
+TAX_OFF_TOKEN = f"{PREFIX}taxoff"
 
 # Часы на выбор. Утро и только утро: отчёт нужен до того, как начнётся день.
 TIMES = ("07:00", "08:00", "09:00", "10:00", "11:00", "12:00")
@@ -82,8 +92,57 @@ DRR_BLOCK = (
 )
 
 
+TAX_OFF_BLOCK = (
+    "🧾 <b>Налог: режим не выбран</b>\n"
+    "Пока режим не выбран, прибыль в <code>/profit</code> показана до налога. "
+    "Это не ноль, а «не посчитано»: на УСН «доходы» налог это ещё несколько "
+    "процентов от выручки, и они уходят. Ставку выбираете вы: в регионах она "
+    "льготная."
+)
+
+TAX_BLOCK = (
+    "🧾 <b>Налог: {mode}, ставка {rate}%</b>\n"
+    "В отчёте <code>/profit</code> бот покажет оценку налога отдельной строкой "
+    "и вычтет её из прибыли. Это оценка, а не налог к уплате: бухгалтера бот "
+    "не заменяет."
+)
+
+# Почему это вообще стоит в настройках отдельной строкой: селлер видит
+# поступление от Wildberries и считает процент с него, а налоговая считает с
+# полной цены продажи. Сказать об этом надо там, где человек выбирает режим,
+# а не только в отчёте.
+TAX_INCOME_NOTE = (
+    "\nБаза считается с того, что заплатил покупатель, а не с того, что "
+    "перечислил Wildberries: удержанная комиссия и скидка площадки в неё "
+    "входят. Разницу бот покажет в отчёте цифрой."
+)
+
+TAX_MINUS_NOTE = (
+    "\nВ расходы бот берёт себестоимость проданного товара, удержания "
+    "Wildberries и рекламу. Штрафы не берёт: такие расходы обычно не "
+    "принимают. Взносы, зарплату и аренду бот не видит вовсе."
+)
+
+# Короткие подписи для кнопок. Полные названия режимов живут в core.tax и
+# едут в текст, а на кнопке нужна строка, которая помещается на телефоне.
+TAX_MODE_LABELS = {
+    tax_module.USN_INCOME: "УСН доходы",
+    tax_module.USN_INCOME_MINUS: "УСН доходы минус расходы",
+}
+
+TAX_OFF_LABEL = "Не считать налог"
+
+
 def _mark(flag: bool) -> str:
     return "✅" if flag else "⬜"
+
+
+def tax_text(rule: Any) -> Safe:
+    """Строка про налог. Режим и ставка приходят из настроек, а не из кода."""
+    if not rule.known:
+        return Safe(TAX_OFF_BLOCK)
+    text = fill(TAX_BLOCK, mode=rule.title, rate=rule.rate_text)
+    return Safe(text + (TAX_MINUS_NOTE if rule.with_expenses else TAX_INCOME_NOTE))
 
 
 def drr_text(target: Any) -> Safe:
@@ -101,6 +160,7 @@ def settings_text(
     prefs: lifecycle.Prefs,
     state: costs_handler.Coverage | None = None,
     target: Any = None,
+    rule: Any = None,
 ) -> Safe:
     """Что сейчас включено. Время показывается в часовом поясе расписания.
 
@@ -119,6 +179,8 @@ def settings_text(
     blocks = [HEAD, body, EXPLAIN]
     if target is not None:
         blocks.append(drr_text(target))
+    if rule is not None:
+        blocks.append(tax_text(rule))
     if state is not None:
         blocks.append(costs_handler.state_text(state))
     return Safe("\n\n".join(blocks))
@@ -128,6 +190,7 @@ def keyboard(
     prefs: lifecycle.Prefs,
     state: costs_handler.Coverage | None = None,
     target: Any = None,
+    rule: Any = None,
 ) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -169,11 +232,51 @@ def keyboard(
                 row = []
         if row:
             rows.append(row)
+    if rule is not None:
+        rows += _tax_rows(rule)
     if state is not None and not state.complete:
         # Кнопка ровно там, где сказано про нехватку: дорога к себестоимости
         # уже есть, показать её надо в том же сообщении, а не в памяти.
         rows += list(_costs_keyboard().inline_keyboard)
     return InlineKeyboardMarkup(rows)
+
+
+def _tax_rows(rule: Any) -> list[list[InlineKeyboardButton]]:
+    """Кнопки налога: режим, ставки выбранного режима и отказ считать.
+
+    Ставки рисуются из того же белого списка, по которому их принимает
+    `core.tax`: два списка разошлись бы молча, и кнопка предлагала бы ставку,
+    которую расчёт не берёт.
+    """
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{'🔹' if rule.mode == mode else ''}{TAX_MODE_LABELS[mode]}".strip(),
+                callback_data=f"{TAX_MODE_PREFIX}{mode}",
+            )
+        ]
+        for mode in tax_module.MODES
+    ]
+    if not rule.known:
+        return rows
+    row: list[InlineKeyboardButton] = []
+    for percent in tax_module.RATE_CHOICES[rule.mode]:
+        mark = "🔹" if str(percent) == rule.rate_text else ""
+        # Слово на кнопке не для красоты: рядом стоит такой же ряд процентов
+        # для целевого ДРР, и «15%» без подписи читается как он.
+        row.append(
+            InlineKeyboardButton(
+                f"{mark}Налог {percent}%".strip(),
+                callback_data=f"{TAX_RATE_PREFIX}{percent}",
+            )
+        )
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(TAX_OFF_LABEL, callback_data=TAX_OFF_TOKEN)])
+    return rows
 
 
 def _costs_keyboard() -> InlineKeyboardMarkup:
@@ -355,10 +458,11 @@ async def settings_command(
     prefs = lifecycle.prefs(client_id, path=path)
     state = costs_handler.coverage(client_id, path=path)
     target = ads_agent.target_drr(client_id, path=path)
+    rule = tax_module.rule_of(client_id, path=path)
     await message.reply_text(
-        settings_text(prefs, state, target),
+        settings_text(prefs, state, target, rule),
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboard(prefs, state, target),
+        reply_markup=keyboard(prefs, state, target, rule),
     )
 
 
@@ -394,14 +498,36 @@ async def toggle_callback(
             logger.warning("не разобрать целевой ДРР из кнопки: %s", data)
             return
         ads_agent.set_target_drr(client_id, data[4:], path=path)
+    elif data == "taxoff":
+        tax_module.clear_rule(client_id, path=path)
+    elif data.startswith("tax:") or data.startswith("rate:"):
+        # Та же граница, что и у ДРР: `callback_data` подделывается свободно,
+        # и проверять его нарисованными кнопками нельзя. Режим и ставку
+        # принимает `core.tax`, там же лежит белый список, и чужой режим или
+        # ставка в двести процентов до настроек кабинета не доходят.
+        try:
+            if data.startswith("tax:"):
+                # Режим выбран впервые: ставка встаёт по умолчанию из конфига,
+                # дальше селлер меняет её кнопками ставок.
+                current = tax_module.rule_of(client_id, path=path)
+                mode = data[4:]
+                rate = current.rate if current.mode == mode else None
+                tax_module.set_rule(client_id, mode, rate, path=path)
+            else:
+                mode = tax_module.rule_of(client_id, path=path).mode
+                tax_module.set_rule(client_id, mode, data[5:], path=path)
+        except ValueError:
+            logger.warning("не разобрать налоговую настройку из кнопки: %s", data)
+            return
 
     state = costs_handler.coverage(client_id, path=path)
     target = ads_agent.target_drr(client_id, path=path)
+    rule = tax_module.rule_of(client_id, path=path)
     try:
         await query.edit_message_text(
-            settings_text(prefs, state, target),
+            settings_text(prefs, state, target, rule),
             parse_mode=ParseMode.HTML,
-            reply_markup=keyboard(prefs, state, target),
+            reply_markup=keyboard(prefs, state, target, rule),
         )
     except Exception:  # noqa: BLE001 - Telegram ругается на неизменённый текст
         logger.debug("сообщение настроек не обновилось", exc_info=True)

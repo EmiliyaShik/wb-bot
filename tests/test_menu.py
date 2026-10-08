@@ -481,8 +481,31 @@ def test_the_reports_screen_names_each_report_and_what_it_is_for():
             assert f"/{report.command}" in text
             assert report.gives in text, report.command
     # Видно, что за одни деньги куплено несколько разных отчётов.
-    assert "три отчёта" in text
+    assert "три разных отчёта" in text
     assert "990" in text and "590" in text
+
+
+def test_the_count_of_reports_does_not_read_like_a_quota():
+    """«990 ₽: три отчёта» читалось как чек на три штуки, а не как состав.
+
+    Владелец заметил это на живом боте: за 590 ₽ строка «один отчёт» выглядела
+    платой за одну выгрузку. Поэтому число идёт со словом «разных», у модуля с
+    единственным отчётом не печатается вовсе, а про запросы сказано прямо.
+    """
+    text = menu.reports_text()
+    single = [
+        info for info in config.visible_modules().values() if len(info.reports) == 1
+    ]
+    assert single, "нужен модуль с одним отчётом, иначе тест ничего не проверяет"
+
+    assert "один отчёт" not in text
+    assert "1 отчёт" not in text
+    for info in single:
+        title = info.title
+        assert title in text
+        # У такого модуля за ценой идёт точка, а не двоеточие с числом.
+        assert f"{title}</b>," in text
+    assert "сколько угодно раз" in text
 
 
 def test_every_report_of_the_config_is_a_real_command_of_the_bot():

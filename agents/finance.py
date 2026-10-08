@@ -17,6 +17,14 @@
 а требование R165 говорит ровно обратное. По неделе показывается
 средневзвешенное готового поля, вес - `retailPriceWithDisc`.
 
+**Штуки считаются только у продаж и возвратов.** Тип документа заполнен
+у Wildberries только в этих двух видах строк; логистика, хранение, приёмка и
+удержания приходят с пустым `docTypeName`, а `quantity` в них при этом бывает
+проставлено. Служебная строка отдаёт свои деньги и не отдаёт штуки, иначе
+себестоимость в `/profit` считается по числу, которое ничего не значит.
+Продажа с нулевой выручкой тоже не продажа: так приходит возмещение за
+выбывший товар, и у него свой вид строки (`COMPENSATION`).
+
 **Неделя сверяется с агрегатом.** У `sales-reports/list` есть готовые суммы
 по отчёту (`forPaySum`, `retailAmountSum` и прочие). Считаем неделю по
 строкам и сверяем; расхождение показывается честно, а не прячется.
@@ -46,6 +54,13 @@ __all__ = [
     "COLLECT_KIND",
     "PERIODS",
     "PERIOD_TITLES",
+    "SALE",
+    "RETURN",
+    "COMPENSATION",
+    "SERVICE",
+    "UNKNOWN",
+    "doc_kind",
+    "row_kind",
     "Amounts",
     "Week",
     "Month",
@@ -216,10 +231,77 @@ def vw_of(row: Any) -> Decimal:
         return ZERO
 
 
-def is_return(row: dict) -> bool:
-    """Возврат отличается от продажи типом документа, это поле `docTypeName`."""
-    name = str(row.get("docTypeName") or row.get("sellerOperName") or "").lower()
-    return "возврат" in name
+# --- к чему относится строка отчёта ------------------------------------------
+#
+# У Wildberries тип документа заполнен только у двух видов строк: «Продажа» и
+# «Возврат». Служебные строки отчёта (логистика, хранение, приёмка, штрафы,
+# удержания, возмещения издержек) приходят с пустым `docTypeName`. Деньги в
+# них настоящие, а вот `quantity` проставлено, хотя ничего не продано: на
+# живом кабинете это 256 служебных строк на 257 «штук» при 67 настоящих
+# проданных.
+#
+# Поэтому штуки считаются только там, где Wildberries прямо сказал, что это
+# продажа или возврат. Правило «не возврат значит продажа» и было ошибкой: к
+# 67 проданным штукам прибавлялись 257 служебных, себестоимость выходила
+# впятеро больше выручки, а маржинальность - 329 процентов.
+#
+# Значение сверяется целиком, а не по вхождению слова, и `sellerOperName`
+# в сравнении не участвует. Вхождение уже подвело один раз: обоснование
+# «Добровольная компенсация при возврате» содержит слово «возврат», хотя
+# документ это продажа, и три штуки ушли бы в возвраты.
+#
+# Но одним типом документа дело не кончилось. Той же «Продажей» Wildberries
+# называет возмещение за товар, который покупатель вернул или потерял: деньги
+# приходят в `forPay`, `quantity` проставлено, а `retailAmount` ровно ноль,
+# потому что покупатель не платил ничего. Товар по такой строке выбыл, а не
+# продался, и на остатках его больше нет. Продажа без цены это не продажа
+# товара, и это видно по числу, а не по тексту обоснования, поэтому вид строки
+# решается типом документа вместе с суммой.
+SALE = "sale"
+RETURN = "return"
+COMPENSATION = "compensation"
+SERVICE = "service"
+UNKNOWN = "unknown"
+
+# Типы документов, которые бот знает в лицо. Список короткий намеренно:
+# угадывать незнакомое значение не на чем.
+DOC_TYPES: dict[str, str] = {"продажа": SALE, "возврат": RETURN}
+
+
+def doc_kind(value: Any, amount: Any) -> str:
+    """Вид строки отчёта: продажа, компенсация, возврат, услуга, незнакомое.
+
+    Сумма здесь обязательный аргумент, а не удобство. Отдельный классификатор
+    «по типу» рядом с этим завёлся бы сам и разошёлся бы с ним молча, а
+    необязательный аргумент забыли бы ровно в том месте, где он и нужен: так
+    и появилась компенсация, посчитанная продажей.
+
+    Продажа с нулевым `retailAmount` это компенсация: товар выбыл, а не
+    продался, поэтому ни выручки, ни проданных штук он не даёт. Деньги по ней
+    настоящие и лежат в `forPay`, они остаются в «к перечислению» и показаны
+    отдельной статьёй.
+
+    Возврат с нулевой суммой компенсацией не становится: правило написано про
+    продажу, и расширять его на вид строки, которого у Wildberries не видели,
+    значит угадывать.
+
+    Пустой тип это служебная строка: она отдаёт свои деньги и не отдаёт штуки.
+    Незнакомый тип продажей молча не становится - штуки с него не берутся, а
+    само значение уходит в `Week.unknown_doc_types` и в журнал, чтобы владелец
+    решил, что это, а не узнал об этом из завышенной себестоимости.
+    """
+    name = str(value or "").strip().lower()
+    if not name:
+        return SERVICE
+    kind = DOC_TYPES.get(name, UNKNOWN)
+    if kind == SALE and money(amount) == ZERO:
+        return COMPENSATION
+    return kind
+
+
+def row_kind(row: dict) -> str:
+    """То же самое для строки ответа WB."""
+    return doc_kind(row.get("docTypeName"), row.get("retailAmount"))
 
 
 # --- результат ---------------------------------------------------------------
@@ -240,6 +322,13 @@ class Amounts:
     penalties: Decimal = ZERO
     deductions: Decimal = ZERO
     additional_payment: Decimal = ZERO
+    # Возмещение за выбывший товар: сумма `forPay` по строкам-компенсациям и
+    # сколько товара по ним выбыло. В `for_pay` эти же деньги уже сидят, здесь
+    # они названы отдельно, а не прибавлены второй раз: сверка с `forPaySum`
+    # Wildberries должна сходиться, а селлеру нужно знать, откуда поступление
+    # при нулевой выручке.
+    compensation: Decimal = ZERO
+    compensation_units: int = 0
     sales_count: int = 0
     returns_count: int = 0
 
@@ -256,6 +345,8 @@ class Amounts:
             penalties=self.penalties + other.penalties,
             deductions=self.deductions + other.deductions,
             additional_payment=self.additional_payment + other.additional_payment,
+            compensation=self.compensation + other.compensation,
+            compensation_units=self.compensation_units + other.compensation_units,
             sales_count=self.sales_count + other.sales_count,
             returns_count=self.returns_count + other.returns_count,
         )
@@ -310,6 +401,10 @@ class Week:
     # Выгрузка не упёрлась в потолок страниц. Неполная неделя обязана
     # отличаться от полной: иначе половина года выглядит как год.
     complete: bool = True
+    # Типы документов, которых бот не знает. Пусто у всех обычных недель.
+    # Хранится рядом с признаком полноты, в `control_payload`: незнакомый тип
+    # это не ошибка выгрузки, но и не мелочь, о которой можно промолчать.
+    unknown_doc_types: tuple[str, ...] = ()
 
     def __getattr__(self, name: str) -> Any:
         # Статьи читаются и прямо с недели: week.revenue вместо
@@ -359,6 +454,11 @@ class Article:
     subject: str = ""
     quantity: int = 0
     amounts: Amounts = Amounts()
+    # Чем Wildberries обосновал компенсацию (`sellerOperName`), в порядке
+    # появления. Вид строки по этому тексту не решается, он свободный; селлеру
+    # он нужен затем, чтобы узнать поступление по имени, а не гадать, куда
+    # делся товар.
+    compensation_reasons: tuple[str, ...] = ()
 
     def __getattr__(self, name: str) -> Any:
         try:
@@ -406,6 +506,20 @@ class FinanceReport:
         return tuple(week for week in self.weeks if not week.complete)
 
     @property
+    def unknown_doc_types(self) -> tuple[str, ...]:
+        """Типы документов WB, которых бот не знает, за весь период.
+
+        Штуки по таким строкам не посчитаны: продажа это или нет, неизвестно,
+        а посчитать наугад один раз уже вышло боком. Деньги из этих строк
+        в раскладку вошли.
+        """
+        return tuple(
+            dict.fromkeys(
+                name for week in self.weeks for name in week.unknown_doc_types
+            )
+        )
+
+    @property
     def title(self) -> str:
         return PERIOD_TITLES.get(self.period, self.period)
 
@@ -435,17 +549,22 @@ def aggregate(rows: Iterable[dict]) -> dict[int, Week]:
     totals: dict[int, Amounts] = {}
     bounds: dict[int, tuple[str, str]] = {}
     weights: dict[int, dict[str, list[tuple[Decimal, Decimal]]]] = {}
+    unknown: dict[int, dict[str, None]] = {}
 
     for row in rows:
         report_id = _int(row.get("reportId"))
         base = money(row.get("retailPriceWithDisc")) or money(row.get("retailAmount"))
-        returned = is_return(row)
+        kind = row_kind(row)
         amount = money(row.get("retailAmount"))
         quantity = _int(row.get("quantity"))
+        if kind == UNKNOWN:
+            # Порядок появления сохраняем, повторы гасим: словарь вместо
+            # множества ради этого и взят.
+            unknown.setdefault(report_id, {})[str(row.get("docTypeName")).strip()] = None
 
         piece = Amounts(
-            revenue=ZERO if returned else amount,
-            returns_amount=amount if returned else ZERO,
+            revenue=amount if kind == SALE else ZERO,
+            returns_amount=amount if kind == RETURN else ZERO,
             for_pay=money(row.get("forPay")),
             commission=money(row.get("vw")),
             acquiring=money(row.get("acquiringFee")),
@@ -455,8 +574,16 @@ def aggregate(rows: Iterable[dict]) -> dict[int, Week]:
             penalties=money(row.get("penalty")),
             deductions=money(row.get("deduction")),
             additional_payment=money(row.get("additionalPayment")),
-            sales_count=0 if returned else quantity,
-            returns_count=quantity if returned else 0,
+            # Компенсация: деньги за выбывший товар. В `for_pay` строкой выше
+            # они уже вошли, здесь названы отдельно.
+            compensation=money(row.get("forPay")) if kind == COMPENSATION else ZERO,
+            compensation_units=quantity if kind == COMPENSATION else 0,
+            # Штуки только у продаж и возвратов. У служебной строки, у
+            # компенсации и у незнакомого типа их нет, даже если Wildberries
+            # проставил `quantity`: деньги в такой строке настоящие, а товар по
+            # ней не продавался.
+            sales_count=quantity if kind == SALE else 0,
+            returns_count=quantity if kind == RETURN else 0,
         )
         totals[report_id] = totals.get(report_id, Amounts()) + piece
         bounds.setdefault(
@@ -485,6 +612,7 @@ def aggregate(rows: Iterable[dict]) -> dict[int, Week]:
             date_from=date_from,
             date_to=date_to,
             amounts=amounts,
+            unknown_doc_types=tuple(unknown.get(report_id, {})),
             **percents,
         )
     return result
@@ -571,14 +699,24 @@ def save_week(
 ) -> None:
     """Агрегаты недели в `fin_weeks`. Деньги в копейках, ключ `report_id`.
 
-    В `control_payload` кладётся не только агрегат WB: рядом с ним живёт
-    признак полноты выгрузки. Схему базы менять нельзя, а неполная неделя
-    обязана отличаться от полной, иначе клиент получит уверенную неправильную
-    цифру.
+    В `control_payload` кладётся не только агрегат WB: рядом с ним живут
+    признак полноты выгрузки, незнакомые типы документов и компенсации. Схему
+    базы менять нельзя, а неполная неделя обязана отличаться от полной, иначе
+    клиент получит уверенную неправильную цифру. Незнакомый тип документа лежит
+    там же по той же причине: отчёт строится по базе, и без записи о нём
+    находка сборщика до отчёта не доедет. Компенсации там же и по той же: без
+    записи поступление при нулевой выручке осталось бы необъяснённым.
     """
     amounts = week.amounts
     payload = json.dumps(
-        {"aggregate": control, "complete": bool(complete)}, ensure_ascii=False
+        {
+            "aggregate": control,
+            "complete": bool(complete),
+            "unknown_doc_types": list(week.unknown_doc_types),
+            "compensation_kop": db.to_kop(amounts.compensation),
+            "compensation_units": int(amounts.compensation_units),
+        },
+        ensure_ascii=False,
     )
     db.repo(client_id, path).upsert(
         "fin_weeks",
@@ -615,6 +753,8 @@ class Collected:
     weeks: int = 0
     truncated: bool = False
     verified: bool = False
+    # Типы документов, которых бот не знает. Пусто у всех обычных выгрузок.
+    unknown_doc_types: tuple[str, ...] = ()
 
     def __int__(self) -> int:
         return self.rows
@@ -678,19 +818,33 @@ async def collect(
         logger.warning(
             "выгрузка клиента %s упёрлась в потолок страниц: данные неполные", client_id
         )
+    # Незнакомый тип документа сам по себе выгрузку не портит, но штуки с него
+    # не взяты. Молчать об этом нельзя: именно так и появляется завышенная
+    # себестоимость, о которой никто не догадывается.
+    unknown = tuple(
+        dict.fromkeys(name for week in weeks.values() for name in week.unknown_doc_types)
+    )
+    if unknown:
+        logger.warning(
+            "клиент %s: незнакомый тип документа WB %s, штуки по таким строкам "
+            "не считаются",
+            client_id,
+            ", ".join(unknown),
+        )
     return Collected(
         rows=saved,
         pages=pages,
         weeks=len(weeks),
         truncated=truncated,
         verified=bool(control),
+        unknown_doc_types=unknown,
     )
 
 
 # --- чтение из базы ----------------------------------------------------------
 
 
-def _amounts_of_week(row: Any) -> Amounts:
+def _amounts_of_week(row: Any, payload: _Payload) -> Amounts:
     return Amounts(
         revenue=db.from_kop(row["revenue_kop"]),
         returns_amount=db.from_kop(row["returns_amount_kop"]),
@@ -703,6 +857,11 @@ def _amounts_of_week(row: Any) -> Amounts:
         penalties=db.from_kop(row["penalties_kop"]),
         deductions=db.from_kop(row["deductions_kop"]),
         additional_payment=db.from_kop(row["additional_payment_kop"]),
+        # Своей колонки под компенсации в схеме нет, новых миграций мы не
+        # пишем: число приезжает из `control_payload`, где лежит рядом с
+        # полнотой выгрузки.
+        compensation=payload.compensation,
+        compensation_units=payload.compensation_units,
         sales_count=int(row["sales_count"] or 0),
         returns_count=int(row["returns_count"] or 0),
     )
@@ -743,35 +902,56 @@ def weeks_of(
     for row in rows:
         if str(row["date_to"]) < start or str(row["date_from"]) > end:
             continue
-        control, complete = _payload_of(row["control_payload"])
-        amounts = _amounts_of_week(row)
+        payload = _payload_of(row["control_payload"])
+        amounts = _amounts_of_week(row, payload)
         result.append(
             Week(
                 report_id=int(row["report_id"]),
                 date_from=str(row["date_from"]),
                 date_to=str(row["date_to"]),
                 amounts=amounts,
-                checks=_checks(amounts, control),
-                verified=bool(control),
-                complete=complete,
+                checks=_checks(amounts, payload.aggregate),
+                verified=bool(payload.aggregate),
+                complete=payload.complete,
+                unknown_doc_types=payload.unknown_doc_types,
             )
         )
     return tuple(result)
 
 
-def _payload_of(raw: Any) -> tuple[dict | None, bool]:
-    """Разбирает `control_payload`: агрегат WB и признак полноты выгрузки.
+@dataclass(frozen=True)
+class _Payload:
+    """Что лежит в `control_payload` недели, кроме агрегата WB."""
+
+    aggregate: dict | None = None
+    complete: bool = True
+    unknown_doc_types: tuple[str, ...] = ()
+    compensation: Decimal = ZERO
+    compensation_units: int = 0
+
+
+def _payload_of(raw: Any) -> _Payload:
+    """Разбирает `control_payload`: агрегат WB, полнота, типы, компенсации.
 
     Колонку заполняет только `save_week` этого же модуля, поэтому форма ровно
     одна и распознавать её не по чему. Пустая колонка значит, что неделю
     записали без агрегата: сверка не выполнена, полнота под вопросом не
-    ставится.
+    ставится. Нет ключа компенсаций - неделю записала прежняя версия бота, и
+    это «не знаем», а не «компенсаций не было»; ноль здесь честнее догадки,
+    а настоящее число приедет со следующей выгрузкой недели.
     """
     if not raw:
-        return None, True
+        return _Payload()
     stored = json.loads(raw)
-    control = stored.get("aggregate")
-    return control, bool(stored.get("complete", True))
+    return _Payload(
+        aggregate=stored.get("aggregate"),
+        complete=bool(stored.get("complete", True)),
+        unknown_doc_types=tuple(
+            str(name) for name in (stored.get("unknown_doc_types") or ())
+        ),
+        compensation=db.from_kop(int(stored.get("compensation_kop") or 0)),
+        compensation_units=int(stored.get("compensation_units") or 0),
+    )
 
 
 def _report_ids(weeks: Sequence[Week]) -> set[int]:
@@ -797,15 +977,25 @@ def articles_of(
                     "subject": row["subject_name"] or "",
                     "quantity": 0,
                     "amounts": Amounts(),
+                    # Словарь, а не множество: порядок появления сохраняется,
+                    # повторы гасятся.
+                    "reasons": {},
                 },
             )
-            returned = "возврат" in str(row["doc_type_name"] or "").lower()
             amount = db.from_kop(row["retail_amount_kop"])
+            kind = doc_kind(row["doc_type_name"], amount)
             quantity = int(row["quantity"] or 0)
-            bucket["quantity"] += quantity
+            # «Штук» в книге это проданное плюс возвращённое. Служебная строка
+            # артикула тоже касается (логистика и хранение приходят по
+            # товарам), но штук в ней нет. Компенсация тоже не даёт: товар по
+            # ней выбыл, а не продался.
+            if kind in (SALE, RETURN):
+                bucket["quantity"] += quantity
+            if kind == COMPENSATION:
+                bucket["reasons"][str(row["supplier_oper_name"] or "").strip()] = None
             bucket["amounts"] = bucket["amounts"] + Amounts(
-                revenue=ZERO if returned else amount,
-                returns_amount=amount if returned else ZERO,
+                revenue=amount if kind == SALE else ZERO,
+                returns_amount=amount if kind == RETURN else ZERO,
                 for_pay=db.from_kop(row["ppvz_for_pay_kop"]),
                 commission=vw_of(row),
                 acquiring=db.from_kop(row["acquiring_fee_kop"]),
@@ -815,8 +1005,12 @@ def articles_of(
                 penalties=db.from_kop(row["penalty_kop"]),
                 deductions=db.from_kop(row["deduction_kop"]),
                 additional_payment=db.from_kop(row["additional_payment_kop"]),
-                sales_count=0 if returned else quantity,
-                returns_count=quantity if returned else 0,
+                compensation=(
+                    db.from_kop(row["ppvz_for_pay_kop"]) if kind == COMPENSATION else ZERO
+                ),
+                compensation_units=quantity if kind == COMPENSATION else 0,
+                sales_count=quantity if kind == SALE else 0,
+                returns_count=quantity if kind == RETURN else 0,
             )
     articles = [
         Article(
@@ -825,6 +1019,7 @@ def articles_of(
             subject=bucket["subject"],
             quantity=bucket["quantity"],
             amounts=bucket["amounts"],
+            compensation_reasons=tuple(name for name in bucket["reasons"] if name),
         )
         for nm_id, bucket in buckets.items()
     ]

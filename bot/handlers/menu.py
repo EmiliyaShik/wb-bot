@@ -330,13 +330,22 @@ REPORTS_HEAD = "📊 <b>Ваши отчёты</b>"
 
 # Модуль это не одна функция, и здесь это видно сразу: цена, число отчётов,
 # и дальше у каждого отчёта своё имя и своя польза.
-REPORTS_MODULE = "<b>{title}</b>, {price} в месяц: {count}."
+#
+# «990 ₽ в месяц: три отчёта» читалось как чек на три штуки, а «590 ₽: один
+# отчёт» и вовсе как плата за одну выгрузку. Поэтому слово «разных» стоит
+# обязательно, а у модуля с единственным отчётом число не печатается вовсе:
+# список из одной строки и так виден, а «один отчёт» рядом с ценой только
+# пугает.
+REPORTS_MODULE = "<b>{title}</b>, {price} в месяц. Входят {count}:"
+REPORTS_MODULE_ONE = "<b>{title}</b>, {price} в месяц."
 REPORTS_LINE = "<b>{title}</b>, команда <code>/{command}</code>\n{gives}"
 # Отчёт, названный так же, как модуль: своё имя он уже получил строкой выше,
 # и второй раз подряд оно читается как сбой, а не как заголовок.
 REPORTS_ALONE = "Команда <code>/{command}</code>\n{gives}"
 
 REPORTS_FOOT = (
+    "Каждый отчёт можно запрашивать сколько угодно раз: подписка открывает "
+    "отчёты, а не считает запросы.\n\n"
     "Кнопка открывает тот же отчёт, что и команда. Если модуль ещё не "
     "оплачен, бот покажет, что он даёт и сколько стоит."
 )
@@ -347,11 +356,16 @@ REPORTS_EMPTY = (
 
 # Отчётов у модуля единицы, и «3 отчёта» рядом с ценой читается как чек, а не
 # как обещание. Число словами избавляет и от склонения.
-COUNT_WORDS = {1: "один отчёт", 2: "два отчёта", 3: "три отчёта", 4: "четыре отчёта"}
+COUNT_WORDS = {
+    2: "два разных отчёта",
+    3: "три разных отчёта",
+    4: "четыре разных отчёта",
+}
 
 
 def count_words(count: int) -> str:
-    return COUNT_WORDS.get(int(count), f"{count} отчётов")
+    """Сколько разных отчётов открывает подписка. Для одного не зовётся."""
+    return COUNT_WORDS.get(int(count), f"{count} разных отчётов")
 
 
 def report_tokens() -> tuple[str, ...]:
@@ -385,14 +399,18 @@ def reports_text() -> Safe:
         if not info.reports:
             continue
         module_title = info.title or name
-        lines = [
-            fill(
-                REPORTS_MODULE,
-                title=module_title,
-                price=tariffs.rubles(config.price_decimal(name, 1)),
-                count=count_words(len(info.reports)),
-            )
-        ]
+        price = tariffs.rubles(config.price_decimal(name, 1))
+        if len(info.reports) == 1:
+            lines = [fill(REPORTS_MODULE_ONE, title=module_title, price=price)]
+        else:
+            lines = [
+                fill(
+                    REPORTS_MODULE,
+                    title=module_title,
+                    price=price,
+                    count=count_words(len(info.reports)),
+                )
+            ]
         for report in info.reports:
             title = report.title or report.command
             gives = tariffs.sentence(report.gives)

@@ -130,6 +130,41 @@ def article(report, nm_id):
     raise AssertionError(f"артикула {nm_id} нет в отчёте")
 
 
+# Подписи строк, которых в листе артикулов быть обязано, а артикулами они не
+# являются: итог по кабинету и строка под ним про налог.
+SERVICE_LABELS = {
+    profit.TOTAL_LABEL,
+    profit.TAX_NOTE_LABEL,
+    profit.TAX_OFF_LABEL,
+}
+
+
+def article_rows(sheet):
+    """Только строки товаров: без итога и без строк налога под ним."""
+    return [row for row in sheet.rows if str(row.get("Артикул WB")) not in SERVICE_LABELS]
+
+
+def totals_row(sheet):
+    """Итоговая строка по подписи, а не по месту в листе.
+
+    Под итогом стоят ещё строки (налог и прибыль после него), и `rows[-1]`
+    перестал быть итогом. Искать по подписи честнее: лист растёт, а подпись
+    та же.
+    """
+    for row in sheet.rows:
+        if str(row.get("Артикул WB")) == profit.TOTAL_LABEL:
+            return row
+    raise AssertionError("итоговой строки в листе нет")
+
+
+def labelled_row(sheet, label):
+    """Строка листа по подписи в первой колонке."""
+    for row in sheet.rows:
+        if str(row.get("Артикул WB")) == label:
+            return row
+    raise AssertionError(f"строки «{label}» в листе нет")
+
+
 
 # --- чистые расчёты ---
 
@@ -475,10 +510,11 @@ def test_excel_holds_the_full_table_and_names_the_rule(seller, db_path):
 
     assert profit.ARTICLES_SHEET in book.titles
     assert profit.METHOD_SHEET in book.titles
-    # Полная таблица это все артикулы, а не только топ, плюс итоговая строка.
-    rows = book[profit.ARTICLES_SHEET].rows
-    assert len(rows) == 3
-    assert str(rows[-1].values[0]) == profit.TOTAL_LABEL
+    # Полная таблица это все артикулы, а не только топ, плюс итоговая строка и
+    # строка налога под ней.
+    sheet = book[profit.ARTICLES_SHEET]
+    assert len(article_rows(sheet)) == 2
+    assert str(totals_row(sheet).values[0]) == profit.TOTAL_LABEL
     # Правило разнесения обезлички названо словами, а не подразумевается.
     method = "\n".join(
         " ".join(str(value) for value in row.values) for row in book[profit.METHOD_SHEET].rows
@@ -667,8 +703,7 @@ def test_product_name_gets_into_the_book_and_a_missing_card_leaves_the_number(
     sheet = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET]
     names = {
         row.get("Артикул WB"): row.get("Название товара")
-        for row in sheet.rows
-        if row.get("Артикул WB") != profit.TOTAL_LABEL
+        for row in article_rows(sheet)
     }
     assert names == {111: "Наматрасник на резинке 160х200", 222: "222"}
     # Предмет остался предметом: это категория, а не название.
@@ -748,6 +783,171 @@ async def test_refusal_of_wildberries_does_not_look_like_a_missing_card(
     assert 999 not in profit.names_of(cabinet, path=db_path)
 
 
+# --- компенсация Wildberries ---
+#
+# Кабинет владельца в миниатюре. Товар «Свечи новогодние» стоял в отчёте как
+# «продано 4 шт при выручке 0,00 ₽», хотя на остатках его давно нет: все четыре
+# строки это возмещение за товар, который покупатель вернул или потерял. Тип
+# документа у них «Продажа», quantity проставлено, деньги приходят в forPay, а
+# retailAmount ровно ноль. Рядом стоит настоящая продажа другого товара, чтобы
+# было видно: обычный счёт не поехал.
+#
+# Посчитано руками: компенсаций 663 + 652 + 645 + 1212 = 3172 рубля за 4 штуки.
+COMPENSATED = [
+    {
+        "reportId": 9,
+        "rrdId": 91,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        "nmId": 111,
+        "vendorCode": "A-1",
+        "subjectName": "Кружка",
+        "docTypeName": "Продажа",
+        "sellerOperName": "Продажа",
+        "quantity": 2,
+        "retailAmount": 4000,
+        "retailPriceWithDisc": 2000,
+        "forPay": 3000,
+        "vw": 560,
+        "acquiringFee": 60,
+        "deliveryService": 200,
+    },
+] + [
+    {
+        "reportId": 9,
+        "rrdId": 92 + number,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        "nmId": 999,
+        "vendorCode": "арт. 19",
+        "subjectName": "Свечи",
+        "docTypeName": "Продажа",
+        "sellerOperName": "Добровольная компенсация при возврате",
+        "quantity": 1,
+        "retailAmount": 0,
+        "retailPriceWithDisc": 0,
+        "forPay": amount,
+        "vw": 0,
+    }
+    for number, amount in enumerate((663, 652, 645, 1212))
+]
+
+COMPENSATION_COSTS = {111: Decimal("500"), 999: Decimal("454")}
+
+
+def compensated(db_path, telegram_id=8181):
+    client_id = seed(db_path, COMPENSATED, COMPENSATION_COSTS, telegram_id=telegram_id)
+    return report_of(client_id, db_path, ads=profit.AdSpend({}))
+
+
+def test_a_compensation_is_not_a_sold_piece_and_its_money_is_not_lost(db_path):
+    """Штук по компенсации нет, а 3172 рубля на месте и названы статьёй.
+
+    Это тот самый вопрос владельца: откуда «продано 4 шт» у товара, которого
+    нет на остатках. Продажи товара не было, поэтому штук нет и выручки нет.
+    Деньги настоящие, и пропасть они не имеют права.
+    """
+    report = compensated(db_path)
+    candles = article(report, 999)
+
+    assert candles.units == 0
+    assert candles.returns_count == 0
+    assert candles.revenue == Decimal("0")
+    assert candles.compensation == Decimal("3172")
+    assert candles.compensation_units == 4
+    # Себестоимость выбывшего товара посчитана, но в колонку себестоимости не
+    # попала: она считается по проданным штукам, и селлер проверяет её этим
+    # умножением.
+    assert candles.compensation_cost == Decimal("1816")
+    assert candles.cost == Decimal("0")
+
+    assert report.total_compensation == Decimal("3172")
+    assert report.total_compensation_units == 4
+    assert report.total_compensation_cost == Decimal("1816")
+    # Итог по кабинету: продано ровно две штуки настоящей продажи.
+    assert report.totals.units == 2
+    assert report.totals.compensation == Decimal("3172")
+    assert report.totals.compensation_units == 4
+    # И те же деньги видны в «к перечислению» недели: 3000 продажи и 3172
+    # компенсации.
+    assert report.period_amounts.for_pay == Decimal("6172")
+    assert report.period_amounts.compensation == Decimal("3172")
+
+
+def test_a_normal_sale_and_a_return_are_counted_the_way_they_were(seller, db_path):
+    """Обычная продажа и возврат от правки не поехали.
+
+    Выручка 4000 и возврат 800 по первому артикулу, 1000 по второму; штуки 2 и
+    1 проданных, 1 возвращённая. Числа те же, что были до разбора компенсаций:
+    правка касается только продаж без цены.
+    """
+    report = report_of(seller, db_path)
+    first, second = article(report, 111), article(report, 222)
+
+    assert (first.units, first.returns_count) == (2, 1)
+    assert first.revenue == Decimal("4000")
+    assert first.returns_amount == Decimal("800")
+    # Себестоимость по проданным минус возвращённым: 500 * (2 - 1).
+    assert first.cost == Decimal("500")
+    assert first.compensation == Decimal("0")
+    assert first.compensation_cost is None
+
+    assert (second.units, second.returns_count) == (1, 0)
+    assert second.revenue == Decimal("1000")
+    assert second.cost == Decimal("900")
+
+    assert report.totals.units == 3
+    assert report.totals.returns_count == 1
+    assert report.totals.revenue == Decimal("5000")
+    assert report.totals.returns_amount == Decimal("800")
+    assert report.total_compensation == Decimal("0")
+    # Компенсаций нет вовсе: ни блока в книге, ни строки в сообщении.
+    assert report.compensations == ()
+    assert "Компенсации Wildberries" not in handlers_profit.summary_text(report)
+
+
+def test_the_seller_sees_the_compensation_by_name_and_not_a_vanished_product(db_path):
+    """Товар не исчезает из отчёта молча: компенсация названа по имени.
+
+    Если просто убрать штуки, селлер увидит, что товар пропал, и спросит то же
+    самое второй раз. Поэтому деньги и причина стоят в блоке листа проблем, а
+    итог названы в сообщении.
+    """
+    report = compensated(db_path, telegram_id=8182)
+    book = xlsx.read_book(profit.excel_bytes(report))
+
+    rows = [
+        row
+        for row in book[profit.PROBLEMS_SHEET].rows
+        if str(row.values[0]) == profit.COMPENSATION_BLOCK
+    ]
+    assert len(rows) == 1
+    assert rows[0].get("Артикул WB") == 999
+    assert rows[0].get("Сумма, ₽") == 3172
+    note = str(rows[0].get("Что это значит"))
+    # Сказано и сколько штук выбыло, и куда ушли деньги, и чем Wildberries
+    # выплату обосновал.
+    assert "4 шт" in note
+    assert "к перечислению" in note
+    assert "Добровольная компенсация при возврате" in note
+    # Себестоимость выбывшего товара названа рядом: 454 * 4 штуки.
+    assert "1816.00 ₽" in note
+
+    # Методология объясняет и правило, и решение про себестоимость.
+    method = " ".join(
+        str(value) for row in book[profit.METHOD_SHEET].rows for value in row.values
+    )
+    assert "retailAmount" in method
+    assert "выбыл, а не продался" in method
+    assert "не списывается" in method
+
+    # И то же самое словами в сообщении: селлер читает его раньше файла.
+    text = handlers_profit.summary_text(report)
+    assert "Компенсации Wildberries: 3 172 ₽ за 4 шт" in text
+    assert "выбыл, а не продался" in text
+    assert "Себестоимость выбывшего товара 1 816 ₽" in text
+
+
 # --- итог по кабинету ---
 
 
@@ -774,11 +974,11 @@ def test_totals_add_up_what_adds_up_and_leave_percents_alone(seller, db_path):
     assert totals.margin == 23.81
     assert totals.complete is True
 
-    row = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET].rows[-1]
+    row = totals_row(xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET])
     assert row.get("Артикул WB") == profit.TOTAL_LABEL
     assert row.get("Выручка, ₽") == 5000
     assert row.get("Чистая прибыль, ₽") == 1000
-    assert row.get("Маржинальность, %") == 23.81
+    assert row.get(profit.MARGIN_COLUMN) == 23.81
     # Доля в прибыли в итоге это всегда сто процентов, а цена за штуку не
     # сумма: обе клетки говорят это словами, а не числом.
     assert row.get("Доля в прибыли, %") == profit.NOT_SUMMABLE
@@ -804,7 +1004,7 @@ def test_articles_without_profit_do_not_become_zeros_in_the_total(db_path):
     assert totals.cost == Decimal("500")
     assert totals.revenue == Decimal("5000")
 
-    row = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET].rows[-1]
+    row = totals_row(xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET])
     note = str(row.values[1])
     assert "1 артикулам из 2" in note
     assert profit.PROBLEMS_SHEET in note
@@ -821,10 +1021,10 @@ def test_a_total_over_nothing_says_no_data_instead_of_zero(db_path):
 
     assert report.totals.priced == 0
     assert report.totals.costed == 0
-    row = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET].rows[-1]
+    row = totals_row(xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET])
     assert row.get("Чистая прибыль, ₽") == profit.NO_DATA
     assert row.get("Себестоимость, ₽") == profit.NO_DATA
-    assert row.get("Маржинальность, %") == profit.NO_DATA
+    assert row.get(profit.MARGIN_COLUMN) == profit.NO_DATA
     # Выручка известна и здесь: её складывать ничто не мешает.
     assert row.get("Выручка, ₽") == 5000
 
@@ -837,7 +1037,7 @@ def test_unknown_commission_is_named_next_to_the_total(db_path):
     report = report_of(client_id, db_path)
 
     assert report.totals.no_commission == 1
-    row = xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET].rows[-1]
+    row = totals_row(xlsx.read_book(profit.excel_bytes(report))[profit.ARTICLES_SHEET])
     assert "комиссия неизвестна по 1 артикулам" in str(row.values[1])
 
 

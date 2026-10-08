@@ -663,16 +663,278 @@ async def test_second_download_updates_changed_sums(cabinet, db_path):
 # --- границы, от которых зависит знак недели ---------------------------------
 
 
-def test_is_return_recognises_how_wb_spells_it():
-    """Продажа и возврат делятся по docTypeName, регистр значения не имеет."""
-    assert finance.is_return({"docTypeName": "Возврат"})
-    assert finance.is_return({"docTypeName": "ВОЗВРАТ"})
-    assert finance.is_return({"docTypeName": "возврат брака"})
-    assert not finance.is_return({"docTypeName": "Продажа"})
-    assert not finance.is_return({})
-    # docTypeName пустой: смотрим обоснование для оплаты
-    assert finance.is_return({"docTypeName": "", "sellerOperName": "Возврат"})
-    assert not finance.is_return({"sellerOperName": "Логистика"})
+def test_doc_kind_knows_two_types_and_does_not_guess_the_rest():
+    """Продажа и возврат узнаются целиком, остальное не угадывается.
+
+    Вхождение слова здесь запрещено намеренно. Обоснование «Добровольная
+    компенсация при возврате» содержит «возврат», а документ это продажа: по
+    вхождению три штуки уехали бы в возвраты. Обратное вхождение уже стоило
+    владельцу неверного `/profit`.
+    """
+    assert finance.doc_kind("Продажа", "100") == finance.SALE
+    assert finance.doc_kind("продажа", 100) == finance.SALE
+    assert finance.doc_kind(" Возврат ", "800") == finance.RETURN
+    assert finance.doc_kind("ВОЗВРАТ", 800) == finance.RETURN
+    # служебная строка: логистика, хранение, удержание. Тип пустой
+    assert finance.doc_kind("", 0) == finance.SERVICE
+    assert finance.doc_kind(None, 0) == finance.SERVICE
+    # незнакомое значение не продажа и не услуга, а именно незнакомое
+    assert finance.doc_kind("возврат брака", "100") == finance.UNKNOWN
+    assert finance.doc_kind("Сторно продаж", 0) == finance.UNKNOWN
+    # обоснование для оплаты типом документа не подменяется
+    assert finance.row_kind({"sellerOperName": "Возврат", "retailAmount": "0"}) == (
+        finance.SERVICE
+    )
+    assert (
+        finance.row_kind(
+            {
+                "docTypeName": "Продажа",
+                "sellerOperName": "Добровольная компенсация при возврате",
+                "retailAmount": "1000",
+            }
+        )
+        == finance.SALE
+    )
+
+
+def test_a_sale_without_a_price_is_a_compensation_and_not_a_sale():
+    """Продажа с нулевым retailAmount это возмещение за выбывший товар.
+
+    Решение стоит на типе документа и на числе, а не на свободном тексте
+    обоснования: по тексту классифицировать нельзя, это уже проверено строкой
+    выше. Зато числу верить можно: покупатель не заплатил ничего, значит товар
+    не продан.
+    """
+    row = {
+        "docTypeName": "Продажа",
+        "sellerOperName": "Добровольная компенсация при возврате",
+        "retailAmount": "0",
+        "quantity": 1,
+        "forPay": "663",
+    }
+    assert finance.row_kind(row) == finance.COMPENSATION
+    # то же самое и у других обоснований: решает не текст
+    assert (
+        finance.row_kind(
+            {
+                "docTypeName": "Продажа",
+                "sellerOperName": "Компенсация скидки по программе лояльности",
+                "retailAmount": 0,
+            }
+        )
+        == finance.COMPENSATION
+    )
+    # а возврат с нулевой суммой компенсацией не становится: правило написано
+    # про продажу, и расширять его наугад мы не будем
+    assert finance.doc_kind("Возврат", 0) == finance.RETURN
+    # сумма это обязательный аргумент: забыть её нельзя, именно так и
+    # появилась компенсация, посчитанная продажей
+    with pytest.raises(TypeError):
+        finance.doc_kind("Продажа")
+
+
+# --- штуки: неделя владельца в миниатюре -------------------------------------
+#
+# Форма строк списана с живого кабинета, где ошибка и нашлась. Там на 71
+# строку продаж приходилось 256 служебных, и `quantity` в служебных было
+# проставлено: 257 «штук» при 67 настоящих проданных. Здесь те же виды строк
+# в тех же пропорциях, только числа мельче.
+#
+# Посчитано руками: продано 2 штуки, возвращено 1, ещё одна выбыла по
+# компенсации. Старое правило «не возврат значит продажа» дало бы
+# 2 + 1 + 3 + 0 + 2 = 8, а правило «продажа это любой docTypeName «Продажа»»
+# дало бы 3: компенсация считалась бы продажей товара, которого на остатках
+# уже нет. Ровно этот вопрос и задала владелец.
+MIXED_WEEK = [
+    {
+        **WEEK,
+        "rrdId": 21,
+        "nmId": 111,
+        "vendorCode": "ART-1",
+        "subjectName": "Кружка",
+        "docTypeName": "Продажа",
+        "sellerOperName": "Продажа",
+        "quantity": 2,
+        "retailAmount": "2000",
+        "retailPriceWithDisc": "2000",
+        "forPay": "1400",
+        "vw": "300",
+        "deliveryService": "50",
+    },
+    # Продажа с нулевой ценой: возмещение за товар, который покупатель вернул
+    # или потерял. Денег по «реализовал товар» нет, товар выбыл, а 663 рубля
+    # пришли в forPay и потеряться не должны.
+    {
+        **WEEK,
+        "rrdId": 22,
+        "nmId": 111,
+        "vendorCode": "ART-1",
+        "subjectName": "Кружка",
+        "docTypeName": "Продажа",
+        "sellerOperName": "Добровольная компенсация при возврате",
+        "quantity": 1,
+        "retailAmount": "0",
+        "retailPriceWithDisc": "0",
+        "forPay": "663",
+    },
+    {
+        **WEEK,
+        "rrdId": 23,
+        "nmId": 111,
+        "vendorCode": "ART-1",
+        "subjectName": "Кружка",
+        "docTypeName": "Возврат",
+        "sellerOperName": "Возврат",
+        "quantity": 1,
+        "retailAmount": "800",
+        "retailPriceWithDisc": "800",
+        "forPay": "-560",
+    },
+    # Дальше служебные строки: тип документа пустой, а quantity проставлено.
+    {
+        **WEEK,
+        "rrdId": 24,
+        "docTypeName": "",
+        "sellerOperName": "Возмещение издержек по перемещению и операционной обработке товара",
+        "quantity": 3,
+        "retailAmount": "0",
+        "deliveryService": "120",
+    },
+    {
+        **WEEK,
+        "rrdId": 25,
+        "docTypeName": "",
+        "sellerOperName": "Хранение",
+        "quantity": 0,
+        "retailAmount": "0",
+        "paidStorage": "90",
+    },
+    {
+        **WEEK,
+        "rrdId": 26,
+        "nmId": 111,
+        "vendorCode": "ART-1",
+        "subjectName": "Кружка",
+        "docTypeName": "",
+        "sellerOperName": "Возмещение издержек по перевозке",
+        "quantity": 2,
+        "retailAmount": "0",
+        "deliveryService": "60",
+    },
+]
+
+
+# Тип документа, которого бот не знает. Такого значения у Wildberries сегодня
+# нет, и в этом весь смысл: это завтрашний тип, который нельзя посчитать
+# продажей наугад.
+STRANGE = {
+    **WEEK,
+    "rrdId": 31,
+    "nmId": 111,
+    "vendorCode": "ART-1",
+    "subjectName": "Кружка",
+    "docTypeName": "Сторно продаж",
+    "sellerOperName": "Сторно продаж",
+    "quantity": 5,
+    "retailAmount": "0",
+    "deduction": "500",
+}
+
+
+def report_of(db_path, rows, telegram_id=8080):
+    """Отчёт по одной неделе: тот же путь, что у сборщика, только без WB."""
+    client_id = db.admin_repo(db_path).ensure_client(telegram_id)
+    finance.save_rows(client_id, rows, path=db_path)
+    for week in finance.aggregate(rows).values():
+        finance.save_week(client_id, week, path=db_path)
+    return finance.build(client_id, "week", today=date(2026, 9, 15), path=db_path)
+
+
+def test_pieces_are_counted_only_where_something_was_sold(db_path):
+    """Продажи, возврат и служебные строки вперемешку: штук ровно проданные.
+
+    Это та самая ошибка с кабинета владельца. Служебных строк в отчёте больше,
+    чем продаж, и Wildberries проставляет в них `quantity`. Пока «продажей»
+    считалось всё, что не возврат, себестоимость в `/profit` считалась по
+    восьми штукам вместо трёх.
+    """
+    report = report_of(db_path, MIXED_WEEK)
+
+    week = report.weeks[0]
+    assert (week.sales_count, week.returns_count) == (2, 1)
+    # и то же самое в разрезе по артикулам, откуда себестоимость и берётся
+    article = {item.nm_id: item for item in report.articles}[111]
+    assert (article.sales_count, article.returns_count) == (2, 1)
+    # «Штук» в книге это проданное плюс возвращённое, служебных штук там нет,
+    # и компенсационной тоже: товар по ней выбыл, а не продался
+    assert article.quantity == 3
+    # выручка только по строкам продаж, возврат отдельной статьёй
+    assert week.revenue == Decimal("2000")
+    assert week.returns_amount == Decimal("800")
+
+
+def test_a_compensation_loses_its_piece_but_not_its_money(db_path):
+    """Компенсация не продажа, а 663 рубля всё равно на месте.
+
+    Это и есть вопрос владельца: откуда «продано 1 шт» у товара, которого нет
+    на остатках. Штуки больше нет, деньги остались в «к перечислению» и названы
+    отдельной статьёй, чтобы поступление при нулевой выручке не выглядело
+    подарком из воздуха.
+    """
+    report = report_of(db_path, MIXED_WEEK, telegram_id=8083)
+
+    week = report.weeks[0]
+    assert week.compensation == Decimal("663")
+    assert week.compensation_units == 1
+    # деньги не прибавлены второй раз: 1400 + 663 - 560 как и было
+    assert week.for_pay == Decimal("1503")
+    # и выручка от компенсации не выросла
+    assert week.revenue == Decimal("2000")
+
+    article = {item.nm_id: item for item in report.articles}[111]
+    assert article.compensation == Decimal("663")
+    assert article.compensation_units == 1
+    # обоснование Wildberries видно селлеру, но вид строки решало не оно
+    assert article.compensation_reasons == ("Добровольная компенсация при возврате",)
+
+
+def test_a_service_row_gives_its_money_and_keeps_its_pieces(db_path):
+    """Служебная строка отдаёт логистику и хранение, а штуки не отдаёт.
+
+    Деньги в таких строках настоящие, и потерять их нельзя: логистика 120 и 60
+    приходят возмещением издержек, хранение 90 - отдельной строкой без
+    артикула. Числа руками: логистика 50 + 120 + 60 = 230, хранение 90.
+    """
+    report = report_of(db_path, MIXED_WEEK, telegram_id=8081)
+
+    week = report.weeks[0]
+    assert week.logistics == Decimal("230")
+    assert week.storage == Decimal("90")
+    assert week.for_pay == Decimal("1503")  # 1400 + 663 - 560
+    # при этом пять служебных штук в продажи не попали
+    assert week.sales_count == 2
+
+    # логистика служебной строки с артикулом осталась при артикуле
+    article = {item.nm_id: item for item in report.articles}[111]
+    assert article.logistics == Decimal("110")  # 50 своя и 60 возмещением
+    assert article.sales_count == 2
+
+
+def test_an_unknown_document_type_does_not_become_a_sale_in_silence(db_path):
+    """Незнакомый тип документа: деньги берём, штуки нет, находку называем.
+
+    Угадывать нечем: если завтра Wildberries заведёт новый тип, посчитать его
+    продажей значит повторить ту же ошибку молча. Строка отдаёт удержание, её
+    штуки не считаются ни продажей, ни возвратом, а сам тип видно в отчёте и
+    в журнале.
+    """
+    report = report_of(db_path, MIXED_WEEK + [STRANGE], telegram_id=8082)
+
+    week = report.weeks[0]
+    assert (week.sales_count, week.returns_count) == (2, 1)
+    assert week.deductions == Decimal("500")
+    assert week.unknown_doc_types == ("Сторно продаж",)
+    assert report.unknown_doc_types == ("Сторно продаж",)
 
 
 def test_tolerance_is_one_rouble_on_the_boundary():
@@ -738,11 +1000,15 @@ async def test_last_page_exactly_full_is_not_a_false_alarm(cabinet, db_path):
 
 # Строка без nmId: общее удержание недели, которое Wildberries не привязал
 # ни к одному товару. Комиссия по ней тоже есть.
+#
+# Тип документа пустой, как и приходит с живого кабинета: `docTypeName`
+# Wildberries заполняет только у продаж и возвратов, а обоснование лежит
+# в `sellerOperName`.
 FACELESS = {
     **WEEK,
     "rrdId": 4,
     "rrDate": "2026-09-11",
-    "docTypeName": "Удержание",
+    "docTypeName": "",
     "sellerOperName": "Удержание",
     "quantity": 0,
     "retailAmount": "0",
@@ -847,7 +1113,8 @@ STORAGE_WEEK = [
     {
         **WEEK,
         "rrdId": 13,
-        "docTypeName": "Хранение",
+        "docTypeName": "",
+        "sellerOperName": "Хранение",
         "quantity": 0,
         "retailAmount": "0",
         "retailPriceWithDisc": "0",
