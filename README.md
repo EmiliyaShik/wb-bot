@@ -34,6 +34,12 @@ Telegram-бот аналитики для селлеров Wildberries: [@WBRent
 pip install -r requirements.txt
 ```
 
+Для запуска тестов нужен ещё `pytest`, он вынесен отдельно, чтобы хостинг его не ставил:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
 Скопируйте `.env.example` в `.env` и заполните. Обязательны две переменные: `TELEGRAM_BOT_TOKEN` (у [@BotFather](https://t.me/BotFather)) и `ENCRYPTION_KEY` - без него бот работает, но токены кабинетов принимать не будет. Ключ генерируется командой:
 
 ```bash

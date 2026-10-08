@@ -9,7 +9,8 @@ Telegram-бот для селлеров Wildberries: селлер подключ
 
 | Команда | Что делает |
 |---|---|
-| `pip install -r requirements.txt` | Зависимости. В текущем окружении уже установлены, заново гонять не нужно |
+| `pip install -r requirements.txt` | Зависимости бота. В текущем окружении уже установлены, заново гонять не нужно |
+| `pip install -r requirements-dev.txt` | Только для тестов (`pytest`). На хостинге не ставится: боту они не нужны, а установка дольше |
 | `python bot.py` | Запуск бота (long polling). Нужен `.env` с `TELEGRAM_BOT_TOKEN`, иначе `SystemExit` с подсказкой |
 | `python -m pytest -q` | Весь набор: 1075 passed, 1 skipped, примерно за минуту |
 | `python -m pytest -q tests/test_finance.py` | Один файл |
