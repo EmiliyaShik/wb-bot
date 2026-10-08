@@ -243,6 +243,21 @@ def min_orders() -> int:
         return 5
 
 
+def min_span_days() -> int:
+    """Короче скольких суток период не сжимается вовсе.
+
+    История копится с подключения кабинета, и период укорачивается под то,
+    что успело накопиться. Но сжать его до одних суток значит сравнить вчера
+    с позавчера: конверсия одного дня против другого скачет сама по себе, и
+    порог `min_orders` тут не спасает, пять заказов в сутки набираются легко.
+    Меньше этого числа честнее сказать «истории ещё не накопилось».
+    """
+    try:
+        return max(1, int(_section().get("min_span_days", 3)))
+    except (TypeError, ValueError):
+        return 3
+
+
 def coverage() -> Decimal:
     """Какая доля дней периода должна быть собрана, чтобы сравнивать."""
     value = _decimal("coverage", "0.7")
@@ -596,6 +611,10 @@ def windows(
     last = _yesterday(today)
     have = 0 if since is None else max(0, (last - since).days + 1)
     span = min(span, have // 2)
+    # Сравнивать сутки с сутками бот не берётся: такой «отчёт» показал бы
+    # скачок одного дня и назвал бы его просадкой. Порог в конфиге.
+    if span < min_span_days():
+        span = 0
     shortened = span < PERIODS[period]
     if span <= 0:
         return last, last, last, last, 0, True

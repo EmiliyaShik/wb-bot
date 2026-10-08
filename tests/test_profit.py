@@ -81,8 +81,10 @@ ROWS = [
         "rrdId": 3,
         "dateFrom": "2026-09-01",
         "dateTo": "2026-09-07",
-        "docTypeName": "Удержание",
-        "quantity": 0,
+        # Служебная строка живого WB: тип документа пуст, а quantity
+        # при этом проставлено. Имени «Удержание» у неё не бывает.
+        "docTypeName": "",
+        "quantity": 1,
         "deduction": 300,
     },
     {
@@ -566,8 +568,9 @@ FACELESS_STORAGE = [
         "rrdId": 73,
         "dateFrom": "2026-09-01",
         "dateTo": "2026-09-07",
-        "docTypeName": "Хранение",
-        "quantity": 0,
+        # Хранение приходит служебной строкой: тип пуст, штуки есть.
+        "docTypeName": "",
+        "quantity": 3,
         "paidStorage": 600,
     },
     {
@@ -575,8 +578,10 @@ FACELESS_STORAGE = [
         "rrdId": 74,
         "dateFrom": "2026-09-01",
         "dateTo": "2026-09-07",
-        "docTypeName": "Удержание",
-        "quantity": 0,
+        # Служебная строка живого WB: тип документа пуст, а quantity
+        # при этом проставлено. Имени «Удержание» у неё не бывает.
+        "docTypeName": "",
+        "quantity": 1,
         "deduction": 300,
     },
 ]
@@ -946,6 +951,63 @@ def test_the_seller_sees_the_compensation_by_name_and_not_a_vanished_product(db_
     assert "Компенсации Wildberries: 3 172 ₽ за 4 шт" in text
     assert "выбыл, а не продался" in text
     assert "Себестоимость выбывшего товара 1 816 ₽" in text
+
+
+# --- незнакомый тип документа -------------------------------------------------
+
+
+def test_an_unknown_doc_type_is_named_in_the_message_and_in_the_book(db_path):
+    """Новый тип документа WB перестал быть делом одного журнала.
+
+    Деньги по такой строке в раскладку входят, а штуки нет. Прежде селлер
+    видел прибыль с тихо непосчитанными штуками и не знал, о чём спрашивать:
+    запись была только у владельца.
+    """
+    rows = [dict(row) for row in ROWS]
+    rows.append(
+        {
+            "reportId": 1,
+            "rrdId": 9,
+            "dateFrom": "2026-09-01",
+            "dateTo": "2026-09-07",
+            "nmId": 111,
+            "vendorCode": "A-1",
+            "subjectName": "Кружка",
+            "docTypeName": "Передача на реализацию",
+            "quantity": 5,
+            "retailAmount": 2000,
+            "forPay": 1500,
+        }
+    )
+    client_id = seed(
+        db_path, rows, {111: Decimal("500"), 222: Decimal("900")}, telegram_id=4747
+    )
+    report = report_of(client_id, db_path, ads=profit.AdSpend({}))
+
+    assert report.unknown_doc_types == ("Передача на реализацию",)
+    # Штуки по такой строке не посчитаны: было 2 проданных, 5 не прибавились.
+    assert article(report, 111).units == 2
+
+    text = handlers_profit.summary_text(report)
+    assert "Передача на реализацию" in text
+    assert "штуки нет" in text
+
+    method = " ".join(
+        str(value)
+        for row in xlsx.read_book(profit.excel_bytes(report))[
+            profit.METHOD_SHEET
+        ].rows
+        for value in row.values
+    )
+    assert "Передача на реализацию" in method
+
+
+def test_a_familiar_week_says_nothing_about_unknown_types(seller, db_path):
+    """Разговора на пустом месте нет: все типы знакомы, строки в тексте нет."""
+    report = report_of(seller, db_path)
+
+    assert report.unknown_doc_types == ()
+    assert "не знает" not in handlers_profit.summary_text(report)
 
 
 # --- итог по кабинету ---

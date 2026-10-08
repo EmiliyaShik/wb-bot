@@ -184,6 +184,31 @@ async def test_require_module_offers_instead_of_refusing_and_then_lets_through(d
 
 
 @pytest.mark.asyncio
+async def test_a_button_without_access_stops_spinning_right_away(db_path):
+    """Подписка кончилась между показом кнопки и нажатием.
+
+    Прав нажатие не даёт, это проверено отдельно. Но Телеграм ждёт ответа на
+    нажатие, и без него кнопка крутится до его собственного срока: человеку,
+    который только что перестал платить, это читается как сломанный бот.
+    """
+    message = FakeMessage()
+    query = FakeQuery("ads:quarter", message)
+    update = FakeUpdate(400401, message, query)
+    passed = []
+
+    @tariffs.require_module("ads", path=db_path)
+    async def handler(update_, context_):
+        passed.append(update_)
+
+    await handler(update, None)
+
+    assert passed == [], "доступа нет, и хендлер управления не получил"
+    assert query.answered is True, "кнопка так и крутилась бы у клиента"
+    text, _ = message.sent[0]
+    assert "Реклама" in text
+
+
+@pytest.mark.asyncio
 async def test_buy_button_answers_before_the_invoice_dialog_exists_and_yields_to_it():
     message = FakeMessage()
     query = FakeQuery("buy:finance", message)

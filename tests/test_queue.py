@@ -18,6 +18,7 @@ from core.wbapi import (
     WBAuthError,
     WBForbiddenError,
     WBRateLimited,
+    WBTokenMissing,
     WBUnavailable,
 )
 
@@ -249,6 +250,35 @@ async def test_auth_error_cancels_task_without_spending_attempts(db_path, client
     assert row["attempts"] == 0
     assert about_token == [client]
     assert await queue.run_once(path=db_path) is False
+
+
+@pytest.mark.asyncio
+async def test_a_missing_cabinet_is_not_a_rejected_key(db_path, client):
+    """Кабинет не подключён: это следующий шаг клиента, а не беда с ключом.
+
+    Прежде такая задача шла тем же путём, что отвергнутый ключ: все модули
+    клиента уходили на паузу, а человек получал письмо про непринятый ключ,
+    которого он не присылал. Исполнялось это просто: модуль выдали командой
+    /grant, а кабинет селлер подключить ещё не успел.
+    """
+    messages = []
+    paused = []
+    queue.set_notifier(lambda client_id, text: messages.append((client_id, text)))
+    queue.set_auth_handler(lambda task, error: paused.append(task.client_id))
+
+    async def handler(task):
+        raise WBTokenMissing("токена нет")
+
+    queue.register("ads_report", handler, title="разбор рекламы")
+    task_id = queue.enqueue(client, "ads_report", notify=False, path=db_path)
+
+    await queue.run_once(path=db_path)
+
+    assert db.admin_repo(db_path).task(task_id)["state"] == queue.CANCELLED
+    assert paused == [], "модули на паузу из-за неподключённого кабинета не ставим"
+    assert _client_said(messages, client) == [queue.NEED_CONNECT]
+    assert "/connect" in queue.NEED_CONNECT
+    assert _without_error_codes(queue.NEED_CONNECT)
 
 
 @pytest.mark.asyncio
@@ -576,3 +606,190 @@ def test_the_pause_between_messages_comes_from_the_config(db_path, monkeypatch):
 
     monkeypatch.setattr(config, "settings", lambda: {"queue": {"notice_gap_sec": "нет"}})
     assert queue.notice_gap_sec() == 900.0
+
+
+# --- длинная работа одного клиента не держит остальных -------------------------
+#
+# Доказательство здесь только порядком выполнения. Разбор рекламы за квартал
+# это десятки запросов по дорожке «3 запроса в минуту», около десяти минут
+# одной задачи, и прежде всё это время очередь стояла: задачи брались строго
+# по номеру и строго по одной. Длинная работа в тестах не ждёт настоящий WB,
+# её держит событие, и это честнее любой паузы: пока его не отпустят, задача
+# не кончится никогда.
+
+
+async def _worker_until(db_path, ready, *, workers=None, timeout=5):
+    """Гоняет воркер, пока `ready()` не скажет «хватит».
+
+    `ready` возвращает True, когда проверяемое уже случилось, и сам отпускает
+    длинные работы: воркер при выключении доводит начатое до конца, и без
+    этого он ждал бы их вечно.
+    """
+    stop = asyncio.Event()
+
+    async def watch():
+        while not ready():
+            await asyncio.sleep(0.005)
+        stop.set()
+
+    await asyncio.wait_for(
+        asyncio.gather(
+            queue.run_worker(path=db_path, poll_sec=0.01, stop=stop, workers=workers),
+            watch(),
+        ),
+        timeout=timeout,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_long_job_of_one_client_does_not_hold_the_others(db_path):
+    """Квартал рекламы у одного кабинета идёт, а воронка другого не ждёт его."""
+    repo = db.admin_repo(db_path)
+    one, two = repo.ensure_client(100510), repo.ensure_client(100511)
+    order = []
+    release = asyncio.Event()
+
+    async def long_report(task):
+        order.append(f"начал {task.client_id}")
+        await release.wait()
+        order.append(f"кончил {task.client_id}")
+
+    async def short_report(task):
+        order.append(f"прошёл {task.client_id}")
+
+    queue.register("ads_report", long_report, title="разбор рекламы")
+    queue.register("funnel_report", short_report, title="разбор воронки")
+    # Длинная встала в очередь первой, то есть её номер меньше: по прежнему
+    # правилу «следующая по номеру» вторая не начиналась бы до её конца.
+    queue.enqueue(one, "ads_report", {"period": "quarter"}, notify=False, path=db_path)
+    queue.enqueue(two, "funnel_report", {"period": "week"}, notify=False, path=db_path)
+
+    def ready():
+        if f"прошёл {two}" not in order:
+            return False
+        release.set()
+        return True
+
+    await _worker_until(db_path, ready)
+
+    assert order == [f"начал {one}", f"прошёл {two}", f"кончил {one}"]
+
+
+@pytest.mark.asyncio
+async def test_a_night_collector_keeps_a_place_of_its_own(db_path):
+    """Три заказанных квартала не отодвигают ночной сбор.
+
+    Это и есть смысл разделения дорожек: несобранную воронку Wildberries
+    потом не отдаст, а отчёт селлер закажет ещё раз.
+    """
+    repo = db.admin_repo(db_path)
+    sellers = [repo.ensure_client(100520 + number) for number in range(3)]
+    night = repo.ensure_client(100530)
+    started = []
+    release = asyncio.Event()
+
+    async def long_report(task):
+        started.append(("отчёт", task.client_id))
+        await release.wait()
+
+    async def collect(task):
+        started.append(("сбор", task.client_id))
+
+    queue.register("ads_report", long_report, title="разбор рекламы")
+    queue.register("ads_collect_client", collect, quiet=True)
+    for seller in sellers:
+        queue.enqueue(
+            seller, "ads_report", {"period": "quarter"}, notify=False, path=db_path
+        )
+    queue.enqueue(
+        night, "ads_collect_client", {"date": "2026-10-08"}, notify=False, path=db_path
+    )
+
+    def ready():
+        if ("сбор", night) not in started:
+            return False
+        release.set()
+        return True
+
+    await _worker_until(db_path, ready)
+
+    # Два места достались отчётам, третье осталось сбору: он прошёл, не
+    # дождавшись конца ни одного из них, а третий отчёт так и не начинался.
+    assert [whose for what, whose in started if what == "отчёт"] == sellers[:2]
+    assert ("сбор", night) in started
+
+
+@pytest.mark.asyncio
+async def test_one_client_does_not_take_two_places(db_path, client):
+    """У кабинета в работе всегда одна задача: корзина лимита WB у него одна."""
+    running = []
+    release = asyncio.Event()
+
+    async def long_report(task):
+        running.append(task.payload["period"])
+        await release.wait()
+        running.append("кончил " + task.payload["period"])
+
+    queue.register("ads_report", long_report, title="разбор рекламы")
+    queue.enqueue(client, "ads_report", {"period": "quarter"}, notify=False, path=db_path)
+    queue.enqueue(client, "ads_report", {"period": "month"}, notify=False, path=db_path)
+
+    def ready():
+        if "quarter" not in running:
+            return False
+        assert "month" not in running, "второй отчёт того же кабинета не начинается"
+        release.set()
+        return True
+
+    await _worker_until(db_path, ready)
+
+    assert running == ["quarter", "кончил quarter"]
+    states = {
+        json.loads(row["payload"])["period"]: row["state"]
+        for row in _tasks(db_path, client)
+    }
+    assert states == {"quarter": queue.DONE, "month": queue.PENDING}
+
+
+@pytest.mark.asyncio
+async def test_many_places_keep_dedup_retries_and_the_word_about_failure(db_path):
+    """Три прежних правила разом: дубля нет, повтор запланирован, о сбое сказано."""
+    repo = db.admin_repo(db_path)
+    one, two = repo.ensure_client(100540), repo.ensure_client(100541)
+    messages = []
+    queue.set_notifier(lambda client_id, text: messages.append((client_id, text)))
+
+    async def unavailable(task):
+        raise WBUnavailable("сервис не отвечает")
+
+    async def broken(task):
+        raise RuntimeError("делить на ноль нельзя")
+
+    queue.register("ads_report", unavailable, title="разбор рекламы")
+    queue.register("ads_collect_client", broken, quiet=True)
+
+    first = queue.enqueue(one, "ads_report", {"period": "quarter"}, path=db_path)
+    again = queue.enqueue(one, "ads_report", {"period": "quarter"}, path=db_path)
+    collect = queue.enqueue(
+        two, "ads_collect_client", {"date": "2026-10-08"}, notify=False, path=db_path
+    )
+    assert int(again) == int(first) and again.created is False
+
+    def ready():
+        return (
+            db.admin_repo(db_path).task(first)["attempts"] == 1
+            and db.admin_repo(db_path).task(collect)["state"] == queue.FAILED
+        )
+
+    await _worker_until(db_path, ready)
+
+    # Повтор на месте: задача снова ждёт своего часа, а не брошена.
+    retried = db.admin_repo(db_path).task(first)
+    assert retried["state"] == queue.PENDING
+    assert retried["next_run_at"] > "2026-01-01 00:00:00"
+    # Клиенту сказали «принято» и «уже считаю», и ничего лишнего: отчёт ещё
+    # не сорвался, попытки не кончились.
+    assert _client_said(messages, one) == [queue.ACCEPTED, queue.ALREADY_QUEUED]
+    # А про сбор, которого никто не заказывал, узнал владелец.
+    owner = _owner_said(messages)
+    assert len(owner) == 1 and "ads_collect_client" in owner[0]

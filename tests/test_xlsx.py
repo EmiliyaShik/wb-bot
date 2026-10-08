@@ -234,6 +234,26 @@ def test_kopecks_survive_the_trip_through_the_cell():
     ]
 
 
+def test_a_name_starting_with_an_equals_sign_stays_a_name():
+    """Название придумывает селлер, и оно не обязано быть «обычным».
+
+    Со знака равенства openpyxl записал бы его формулой: Excel показал бы
+    ошибку вычисления, а название пропало бы из книги вовсе. Бьёт это по тому
+    самому человеку, который книгу и получил.
+    """
+    data = xlsx.write_book(
+        xlsx.Sheet(
+            "Лист",
+            ["Кампания"],
+            [["=СУММ(A1:A9)"], ["Кружки осень"], ["-10% на всё"]],
+        )
+    )
+
+    got = [row.cells["Кампания"] for row in xlsx.read_sheet(data).rows]
+
+    assert got == ["=СУММ(A1:A9)", "Кружки осень", "-10% на всё"]
+
+
 def test_unreadable_workbook_tells_the_owner_the_real_reason(monkeypatch):
     """Селлер видит «это не xlsx», владелец в журнале - настоящую причину."""
     written = []

@@ -394,18 +394,49 @@ def test_a_cabinet_without_any_history_is_told_so_calmly(db_path):
 
 
 def test_a_short_history_shortens_both_periods_evenly(db_path, monkeypatch):
-    """Истории пять суток: месяц с месяцем не сравнить, а двое суток с двумя да."""
+    """Истории восемь суток: месяц с месяцем не сравнить, а четверо с четырьмя да."""
     monkeypatch.setenv("ENCRYPTION_KEY", crypto.generate_key())
     client_id = db.admin_repo(db_path).ensure_client(9292)
+    days = [LAST - timedelta(days=shift) for shift in range(8)]
+    put_days(client_id, db_path, days, 111, opens=100, carts=10, orders=6, buyouts=5)
+
+    report = report_of(client_id, db_path, period="month")
+    assert report.span == 4
+    assert report.shortened is True
+    assert report.date_from == LAST - timedelta(days=3)
+    assert report.past_to == LAST - timedelta(days=4)
+    assert "Период укорочен" in handler.summary_text(report)
+
+
+def test_two_days_against_two_days_is_not_a_comparison(db_path, monkeypatch):
+    """Истории пять суток: сжать период до двух бот не берётся.
+
+    Конверсия одного-двух дней скачет сама по себе: будний день против
+    выходного уже дал бы «просадку», которой нет. Порог `min_orders` тут не
+    спасает, пять заказов в сутки набираются легко, поэтому отказ стоит на
+    длине периода, а не на числе заказов.
+    """
+    monkeypatch.setenv("ENCRYPTION_KEY", crypto.generate_key())
+    client_id = db.admin_repo(db_path).ensure_client(9293)
     days = [LAST - timedelta(days=shift) for shift in range(5)]
     put_days(client_id, db_path, days, 111, opens=100, carts=10, orders=6, buyouts=5)
 
     report = report_of(client_id, db_path, period="month")
-    assert report.span == 2
-    assert report.shortened is True
-    assert report.date_from == LAST - timedelta(days=1)
-    assert report.past_to == LAST - timedelta(days=2)
-    assert "Период укорочен" in handler.summary_text(report)
+
+    assert report.span == 0
+    # Текст тот же, что у кабинета без истории вовсе: «ещё не накопилось».
+    # Это правда: до сравнения ему осталось день-другой.
+    assert "не накопилось" in handler.summary_text(report)
+
+
+def test_the_shortest_period_comes_from_the_config(monkeypatch):
+    monkeypatch.setattr(
+        config, "settings", lambda: {"funnel": {"min_span_days": 7}}
+    )
+    assert funnel.min_span_days() == 7
+
+    monkeypatch.setattr(config, "settings", lambda: {"funnel": {"min_span_days": "нет"}})
+    assert funnel.min_span_days() == 3
 
 
 # --- отчёт не ходит в Wildberries ---------------------------------------------

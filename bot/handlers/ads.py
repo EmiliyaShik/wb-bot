@@ -182,8 +182,13 @@ NAME_LIMIT = 24
 CUT = "…"
 
 
-def _money(value: Decimal | int | float | None) -> str:
-    """Рубли с разделителем тысяч. Копейки показываем, только если они есть."""
+def _money(value: Decimal | int | None) -> str:
+    """Рубли с разделителем тысяч. Копейки показываем, только если они есть.
+
+    `float` в подписи нет намеренно: деньги в этом проекте живут целыми
+    копейками и считаются в `Decimal`, и тип, который сюда не приходит,
+    не должен выглядеть разрешённым.
+    """
     if value is None:
         return "нет данных"
     amount = (value if isinstance(value, Decimal) else Decimal(str(value))).quantize(

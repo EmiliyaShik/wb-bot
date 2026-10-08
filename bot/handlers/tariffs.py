@@ -315,6 +315,18 @@ def client_id_of(update: Update, path: str | Path | None = None) -> int | None:
 
 async def send_offer(update: Update, module: str) -> None:
     """Показывает предложение вместо отказа."""
+    # Нажали кнопку, а доступа уже нет: подписка кончилась между показом
+    # клавиатуры и нажатием. Телеграм ждёт ответа на нажатие, и без него
+    # кнопка крутится до его собственного срока, а предложение приходит
+    # отдельным сообщением: человеку это читается как сломанный бот ровно в
+    # ту минуту, когда он перестал платить. Прав ответ не даёт, он только
+    # гасит часики.
+    query = update.callback_query
+    if query is not None:
+        try:
+            await query.answer()
+        except Exception:  # noqa: BLE001 - молчание Telegram не наша авария
+            logger.exception("не удалось погасить кнопку клиента")
     message = update.effective_message
     if message is None:
         return

@@ -672,8 +672,9 @@ def test_a_gap_too_big_for_rounding_is_not_called_rounding(rounding_seller, db_p
 
     Округление строки не ошибается больше, чем на половину копейки, поэтому
     разница в рубли это что-то другое: обычно выручка, которую Wildberries по
-    товарам не разнёс. Проверяется подменой самой базы налога, потому что
-    настоящую такую неделю на живом кабинете ещё ждать.
+    товарам не разнёс. Эта выручка нам известна числом, поэтому она и названа
+    числом, а не «чем-то кроме округления». Проверяется подменой самой базы
+    налога, потому что настоящую такую неделю на живом кабинете ещё ждать.
     """
     whole = rounding_report(rounding_seller, db_path)
     # У отчёта убран один товар, а доходы периода остались те же: ровно так
@@ -684,14 +685,22 @@ def test_a_gap_too_big_for_rounding_is_not_called_rounding(rounding_seller, db_p
     # Налог кабинета тот же 240,06, а столбец теперь 180,06.
     assert allocation.total == Decimal("180.06")
     assert allocation.gap == Decimal("60.00")
+    # И причина разницы названа точно: выручка без артикула 1000,25 и налог с
+    # неё. Копеечный остаток после неё это уже округление.
+    assert allocation.uncovered == Decimal("1000.25")
+    assert allocation.uncovered_tax == Decimal("60.02")
+    assert allocation.rounding is False
+    assert allocation.explained is True
 
     note = str(by_label(articles_sheet(report))[profit.TAX_NOTE_LABEL].values[1])
-    assert "больше, чем даёт округление строк" in note
-    assert "по товарам не разнёс" in note
+    assert "это не округление" in note
+    assert "не разнёс по товарам выручку" in note
+    assert "1000.25" in note and "60.02" in note
     assert "это округление строк до копейки" not in note
 
     # А у целого отчёта разница копеечная, и она названа округлением.
     whole_note = str(by_label(articles_sheet(whole))[profit.TAX_NOTE_LABEL].values[1])
+    assert whole.tax_by_article.rounding is True
     assert "это округление строк до копейки" in whole_note
 
 
@@ -717,6 +726,295 @@ def test_an_article_without_profit_gets_a_tax_but_no_profit_after_it(
     note = str(by_label(sheet)[profit.TOTAL_LABEL].values[1])
     assert "налог сложен по всем артикулам" in note
     assert "прибыль после налога только по тем" in note
+
+
+def test_the_seller_can_check_the_after_tax_total_by_adding(rounding_seller, db_path):
+    """Итог прибыли после налога проверяется вычитанием, и оно сходится.
+
+    Главная проверка владельца это сложение столбца, поэтому в обеих клетках
+    итога стоит сумма своего столбца, и подрезать их нельзя ни одну. Но тогда
+    «итого прибыль после налога» не равно «итого прибыль» минус «итого налог»:
+    налог сложен по всем артикулам, а прибыль после налога только по тем, у
+    кого посчитана прибыль. Разница это налог артикулов без прибыли, и она
+    названа отдельной строкой: по ней селлер проверяет строку и не теряет
+    доверия к таблице.
+
+    Числа руками: у 101, 102 и 103 прибыль 1000,25 - 100 себестоимости - 100
+    комиссии = 800,25, налог 60,02, после налога 740,23. Итог прибыли 2400,75,
+    итог налога 240,08 (с 104, у которого прибыли нет), итог после налога
+    2220,69. Вычитание в лоб даёт 2160,67, то есть на 60,02 меньше, и ровно
+    это число стоит в строке.
+    """
+    report = rounding_report(rounding_seller, db_path)
+    sheet = articles_sheet(report)
+    total = by_label(sheet)[profit.TOTAL_LABEL]
+    bridge = by_label(sheet)[profit.TAX_UNPRICED_LABEL]
+
+    profit_total = Decimal(str(total.get("Чистая прибыль, ₽")))
+    tax_total = Decimal(str(total.get(profit.TAX_COLUMN)))
+    after_total = Decimal(str(total.get(profit.AFTER_TAX_COLUMN)))
+    unpriced = Decimal(str(bridge.get(profit.TAX_COLUMN)))
+
+    assert profit_total == Decimal("2400.75")
+    assert tax_total == Decimal("240.08")
+    assert after_total == Decimal("2220.69")
+    assert unpriced == Decimal("60.02")
+    # Вычитание в лоб не сходится, и это не чинится подрезкой итогов.
+    assert profit_total - tax_total != after_total
+    # А вот эта проверка сходится копейка в копейку, и она написана в книге
+    # словами: из итога налога вычесть строку, результат вычесть из прибыли.
+    assert profit_total - (tax_total - unpriced) == after_total
+
+    # Оба итога при этом остались суммами своих столбцов: сложение работает.
+    rows = articles_by_nm(sheet)
+    assert sum(Decimal(str(row.get(profit.TAX_COLUMN))) for row in rows.values()) == (
+        tax_total
+    )
+    assert sum(
+        Decimal(str(row.get(profit.AFTER_TAX_COLUMN)))
+        for row in rows.values()
+        if row.get(profit.AFTER_TAX_COLUMN) != profit.NO_DATA
+    ) == after_total
+
+    # И сказано, что именно проверять: оговорки словами здесь мало, селлер
+    # проверяет вычитанием.
+    note = str(bridge.values[1])
+    assert "«Итого прибыль после налога» это не «Итого прибыль» минус" in note
+    assert "«Итого налог» минус это число" in note
+    assert str(report.tax_without_profit) == "60.02"
+
+
+def test_without_articles_out_of_the_profit_there_is_no_bridge_row(seller, db_path):
+    """Себестоимость загружена по всем: строке-мосту в книге делать нечего.
+
+    Строка объясняет расхождение, которого в этой книге нет: вычитание здесь
+    сходится само. Постоянная строка про случай, которого нет, отучает читать
+    строки под итогом вообще.
+    """
+    tax.set_rule(seller, tax.USN_INCOME, 6, path=db_path)
+    report = report_of(seller, db_path)
+    sheet = articles_sheet(report)
+    total = by_label(sheet)[profit.TOTAL_LABEL]
+
+    assert report.tax_without_profit == Decimal("0.00")
+    assert profit.TAX_UNPRICED_LABEL not in by_label(sheet)
+    # И вычитание в лоб здесь сходится: 5350 - 780 = 4570.
+    assert Decimal(str(total.get("Чистая прибыль, ₽"))) - Decimal(
+        str(total.get(profit.TAX_COLUMN))
+    ) == Decimal(str(total.get(profit.AFTER_TAX_COLUMN)))
+
+
+# Товар 555 продан в прошлом периоде, а вернулся в этом: в этой неделе у него
+# только строка возврата, и выручка за период уходит в минус. На живом кабинете
+# это обычная неделя, а не редкость.
+RETURN_ROWS = [
+    {
+        "reportId": 5,
+        "rrdId": 51,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        "nmId": 444,
+        "vendorCode": "D-4",
+        "subjectName": "Кружка",
+        "docTypeName": "Продажа",
+        "quantity": 5,
+        "retailAmount": 10000,
+        "retailPriceWithDisc": 2000,
+        "forPay": 7000,
+        "vw": 1500,
+    },
+    {
+        "reportId": 5,
+        "rrdId": 52,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        "nmId": 555,
+        "vendorCode": "E-5",
+        "subjectName": "Ложка",
+        "docTypeName": "Возврат",
+        "quantity": 1,
+        "retailAmount": 3000,
+        "retailPriceWithDisc": 3000,
+        "forPay": -2100,
+        "vw": -450,
+    },
+]
+
+
+@pytest.fixture
+def return_seller(db_path):
+    """Кабинет, где у одного товара за период только возврат."""
+    client_id = db.admin_repo(db_path).ensure_client(7272)
+    finance.save_rows(client_id, RETURN_ROWS, path=db_path)
+    for week in finance.aggregate(RETURN_ROWS).values():
+        finance.save_week(client_id, week, path=db_path)
+    costs_module.save_costs(
+        client_id, {444: Decimal("200"), 555: Decimal("300")}, path=db_path
+    )
+    tax.set_rule(client_id, tax.USN_INCOME, 6, path=db_path)
+    return client_id
+
+
+def return_report(client_id, db_path):
+    return profit.build(
+        client_id, "week", today=TODAY, ads=profit.AdSpend({}), path=db_path
+    )
+
+
+def test_a_negative_tax_is_a_return_and_not_a_payment_from_the_state(
+    return_seller, db_path
+):
+    """Минус в колонке налога объяснён словами, потому что число верное.
+
+    Товар продан в прошлом периоде, а вернулся в этом: выручка за период у него
+    отрицательная, и налог выходит с минусом. Расчёт при этом правильный,
+    возврат по-настоящему уменьшает налог периода. Отсечь минус в ноль нельзя,
+    поэтому чинится подпись, а не число: селлер должен прочитать «возврат
+    уменьшил налог», а не «государство мне доплатит».
+
+    Числа руками: выручка 444 это 10000, налог 600. У 555 выручка -3000, налог
+    -180. Доходы периода 7000, налог кабинета 420, и сумма строк та же.
+    """
+    report = return_report(return_seller, db_path)
+    allocation = report.tax_by_article
+
+    assert allocation.of(444) == Decimal("600.00")
+    assert allocation.of(555) == Decimal("-180.00")
+    assert allocation.negative == (555,)
+    assert allocation.negative_total == Decimal("-180.00")
+
+    sheet = articles_sheet(report)
+    note = str(by_label(sheet)[profit.TAX_NOTE_LABEL].values[1])
+    assert "налог с минусом" in note
+    assert "возврат уменьшил налог" in note
+    assert "не доплату вам от государства" in note
+    # Вторая половина той же строки: прибыль после налога выходит больше
+    # прибыли, и об этом сказано там же.
+    assert "прибыль после налога выходит больше прибыли" in note
+
+    row = articles_by_nm(sheet)[555]
+    item_profit = Decimal(str(row.get("Чистая прибыль, ₽")))
+    after = Decimal(str(row.get(profit.AFTER_TAX_COLUMN)))
+    assert after == item_profit + Decimal("180.00")
+    assert after > item_profit
+
+    # И на листе «Методология» та же история остаётся с книгой, с номером
+    # артикула: через месяц текста сообщения селлер уже не помнит.
+    method = method_text(report)
+    assert "Налог с минусом" in method
+    assert "555" in method
+    assert "не доплата от государства" in method
+
+
+def test_the_column_still_adds_up_to_the_tax_of_the_cabinet_with_a_minus(
+    return_seller, db_path
+):
+    """Расчёт не тронут: сумма строк с минусом сходится с налогом кабинета.
+
+    Это и есть причина не отсекать минус в ноль. Владелец проверяет таблицу
+    сложением, и отсечение развалило бы именно эту проверку: столбец дал бы
+    600, а налог кабинета 420.
+    """
+    report = return_report(return_seller, db_path)
+    allocation = report.tax_by_article
+
+    assert report.tax.income == Decimal("7000.00")
+    assert report.tax.amount == Decimal("420.00")
+    assert allocation.total == Decimal("420.00")
+    assert allocation.gap == Decimal("0")
+    assert allocation.matches is True
+    # Та же сумма сложением столбца в книге, а не только в расчёте.
+    rows = articles_by_nm(articles_sheet(report))
+    column = [Decimal(str(row.get(profit.TAX_COLUMN))) for row in rows.values()]
+    assert sum(column) == Decimal("420.00")
+    assert min(column) == Decimal("-180.00")
+    # А с отсечением минуса в ноль столбец перестал бы сходиться. Число ниже
+    # это то, что селлер увидел бы вместо налога кабинета.
+    assert sum(value for value in column if value > 0) == Decimal("600.00")
+
+
+def test_without_a_minus_the_book_says_nothing_about_it(return_seller, db_path):
+    """Отрицательной строки нет: про минус не говорится ни слова.
+
+    Постоянное предупреждение про случай, которого в отчёте нет, читать
+    перестанут, а вместе с ним перестанут читать и остальные пояснения.
+    """
+    whole = return_report(return_seller, db_path)
+    # У отчёта остался только проданный товар, возврата в нём нет.
+    report = replace(whole, articles=whole.articles[:1])
+    allocation = report.tax_by_article
+
+    assert allocation.negative == ()
+    note = str(by_label(articles_sheet(report))[profit.TAX_NOTE_LABEL].values[1])
+    assert "налог с минусом" not in note
+    assert "возврат уменьшил налог" not in note
+    assert "Налог с минусом" not in method_text(report)
+
+
+def test_revenue_without_an_article_is_not_passed_off_as_rounding():
+    """Предел округления не растёт вместе с числом товаров.
+
+    Прежний предел был копейка на артикул, то есть при двух сотнях товаров два
+    рубля: настоящая нехватка налога в столбце объяснялась селлеру словом
+    «округление». Теперь считается то, чем разница объясняется на самом деле:
+    налог с выручки, у которой нет артикула, и половина копейки на строку,
+    которая правда округлялась.
+
+    Числа руками: двести товаров по 50 рублей выручки это 10000, а доходы
+    периода 10030: тридцать рублей Wildberries по товарам не разнёс. Налог с
+    них 1,80, и ровно столько не хватает в столбце.
+    """
+    rule = tax.Rule(mode=tax.USN_INCOME, rate=Decimal("6"))
+    estimate = tax.Estimate(rule=rule, income=Decimal("10030"))
+    bases = {index: Decimal("50") for index in range(200)}
+    allocation = tax.allocate(estimate, bases)
+
+    assert allocation.gap == Decimal("1.80")
+    # Прежний предел эту разницу пропускал, и это была уверенная неправда.
+    assert abs(allocation.gap) <= Decimal("0.01") * len(bases)
+    # А теперь она округлением не называется, потому что ею не является.
+    assert allocation.rounding is False
+    # Причина названа точно: выручка без артикула и налог с неё.
+    assert allocation.uncovered == Decimal("30.00")
+    assert allocation.uncovered_tax == Decimal("1.80")
+    assert allocation.explained is True
+    assert allocation.residue == Decimal("0")
+    # Предел считается по строкам, которые округлялись, а не по числу товаров.
+    assert allocation.rounded_rows == 200
+
+
+def test_a_difference_nothing_explains_is_not_explained_away(
+    rounding_seller, db_path
+):
+    """Разницу, которую не объясняют ни выручка без артикула, ни округление,
+    бот признаёт необъяснённой.
+
+    Такого на живом кабинете быть не должно, и именно поэтому бот обязан
+    сказать «не знаю», а не выбрать из двух готовых объяснений то, которое
+    ближе: придуманное объяснение хуже признанного незнания. Проверяется
+    лишним артикулом в отчёте: сумма выручки по товарам больше доходов
+    периода, то есть так выглядела бы ошибка сборщика.
+    """
+    whole = rounding_report(rounding_seller, db_path)
+    extra = replace(whole.articles[0], nm_id=999)
+    report = replace(whole, articles=whole.articles + (extra,))
+    allocation = report.tax_by_article
+
+    # Столбец теперь 300,10 при налоге кабинета 240,06.
+    assert allocation.total == Decimal("300.10")
+    assert allocation.gap == Decimal("-60.04")
+    # Выручкой без артикула это не объясняется: её тут нет вовсе, по товарам
+    # выручки больше, чем в базе периода. Отрицательной «обезличкой» разница
+    # не прикрывается.
+    assert allocation.uncovered == Decimal("0")
+    assert allocation.uncovered_tax == Decimal("0")
+    assert allocation.rounding is False
+    assert allocation.explained is False
+
+    note = str(by_label(articles_sheet(report))[profit.TAX_NOTE_LABEL].values[1])
+    assert "больше, чем дают округление строк и выручка без артикула" in note
+    assert "бот не знает" in note
+    assert "это округление строк до копейки" not in note
 
 
 def test_on_income_minus_expenses_the_column_is_called_a_spread(seller, db_path):

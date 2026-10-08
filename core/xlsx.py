@@ -363,6 +363,13 @@ def _fill(worksheet: Any, sheet: Sheet) -> None:
             if index >= len(lengths):
                 lengths.append(0)
             lengths[index] = max(lengths[index], len(str(value if value is not None else "")))
+            if isinstance(value, str) and value.startswith("="):
+                # Название товара или кампании придумывает сам селлер, и
+                # начинаться оно может с чего угодно. Со знака равенства
+                # openpyxl запишет его формулой, Excel покажет ошибку вычисления,
+                # и название пропадёт из книги вовсе: сильнее всего это бьёт по
+                # тому, кто книгу и получил. Клетка остаётся текстом.
+                worksheet.cell(row=worksheet.max_row, column=index + 1).data_type = "s"
             if index in money:
                 worksheet.cell(row=worksheet.max_row, column=index + 1).number_format = (
                     MONEY_FORMAT

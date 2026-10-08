@@ -606,6 +606,37 @@ async def test_a_charge_without_a_time_is_not_thrown_away(cabinet, db_path):
     assert report.fact_spend == Decimal("1250")
 
 
+@pytest.mark.asyncio
+async def test_a_charge_of_a_vanished_campaign_still_counts_in_the_invoice(
+    cabinet, db_path
+):
+    """Кампанию удалили: статистики по ней нет, а деньги списаны.
+
+    Такая кампания своей строки в отчёте не получает, и сумма «фактически
+    списано» прежде теряла её вместе со строкой. Расхождение со счётом
+    выходило меньше настоящего, а селлер сверяет его с разделом «Финансы»
+    рекламного кабинета, где стоит полная сумма.
+    """
+    vanished = [dict(item) for item in UPD] + [
+        {
+            "updNum": 9,
+            "updTime": "2026-09-02T10:00:00+03:00",
+            "updSum": 500,
+            "advertId": 999,  # этой кампании в статистике нет вовсе
+            "paymentType": "Счёт",
+        }
+    ]
+
+    await collect_into(cabinet, db_path, Recorder(upd=vanished))
+    report = report_of(cabinet, db_path)
+
+    assert [item.advert_id for item in report.campaigns] == [777, 888]
+    assert report.fact_orphan == Decimal("500")
+    assert report.fact_spend == Decimal("1750")
+    assert report.gap == Decimal("650")
+    assert "650" in handlers_ads.summary_text(report)
+
+
 async def collect_window(client_id, db_path, recorder, last, *, days=7):
     """Один заход сбора окном, которое кончается днём `last`."""
     clock = FakeTime()
@@ -1063,6 +1094,22 @@ async def test_a_made_up_period_puts_nothing_in_the_queue(cabinet, db_path):
         await handlers_ads.period_chosen(
             FakeUpdate(telegram_id, query.message, query), None, path=db_path
         )
+    assert db.admin_repo(db_path).tasks_by_kind(ads.TASK_KIND) == []
+
+
+def test_the_ads_agent_knows_nothing_about_a_year(cabinet, db_path):
+    """Года у рекламы нет и в самом агенте, а не только на кнопках.
+
+    Год это 12 окон по 31 дню на каждые 50 кампаний по дорожке «3 запроса в
+    минуту»: часы одной задачи. Проверка стоит у постановки работы, поэтому
+    второй вызывающий её не обойдёт.
+    """
+    queue.reset()
+    assert "year" not in ads.PERIODS
+    assert set(ads.PERIODS) == {key for key, _ in handlers_ads.BUTTONS}
+
+    with pytest.raises(ValueError):
+        ads.request_report(cabinet, "year", path=db_path)
     assert db.admin_repo(db_path).tasks_by_kind(ads.TASK_KIND) == []
 
 

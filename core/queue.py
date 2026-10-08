@@ -7,6 +7,18 @@
 Здесь только механика. Сами задачи (выгрузка отчёта, суточные данные,
 рассылки) регистрируют их владельцы через `register(kind, fn)`.
 
+Длинная работа одного клиента не держит остальных. Отчёт по рекламе за
+квартал это десятки запросов к Wildberries по дорожке «3 в минуту», то есть
+около десяти минут одной задачи, и почти всё это время она ждёт разрешения
+ограничителя частоты, а не считает. Поэтому воркер ведёт несколько работ
+одновременно (`[queue] workers`), но тремя правилами: у одного клиента в
+работе всегда не больше одной задачи, часть мест закреплена за работами
+расписания (`[queue] client_slots`), и следующей берётся задача свободного
+клиента, а не следующая по номеру. Потоков здесь нет и не будет: соединение
+с базой одно на процесс и настоящих потоков не переживает, а корутина
+прерваться посреди запроса к базе не может, поэтому выборка «взял и отметил
+в работе» остаётся неделимой без всякого замка.
+
 Сорвавшаяся задача не молчит, и это правило очереди, а не каждого агента.
 Кому сказать, решает вид работы: заказанную клиентом объясняем клиенту его
 словами (`title=` при регистрации), незаказанную (`quiet=True`: ночные
@@ -27,7 +39,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core import audit, config, db
-from core.wbapi import WBAuthError, WBForbiddenError, WBRateLimited, WBUnavailable
+from core.wbapi import (
+    WBAuthError,
+    WBForbiddenError,
+    WBRateLimited,
+    WBTokenMissing,
+    WBUnavailable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +262,7 @@ def reset() -> None:
     _titles.clear()
     _quiet.clear()
     _said.clear()
+    _busy.clear()
     _notifier = None
     _auth_handler = None
 
@@ -281,19 +300,59 @@ async def _call(fn: Handler, task: Task) -> None:
         await result
 
 
+# Клиенты, у которых работа идёт прямо сейчас. Ключ это `client_id` задачи,
+# и `None` в нём это тоже ключ: работы расписания и служебные проверки делят
+# одного исполнителя. Память здесь, а не в базе: состояние `running` в таблице
+# и так есть, а после перезапуска его подбирает `recover`.
+#
+# Больше одной задачи одного клиента одновременно не идёт, и это не только
+# справедливость. Корзина лимита Wildberries своя на клиента и общая на все
+# его задачи: две работы одного кабинета сразу выбрали бы её вдвоём и довели
+# бы дело до блокировки токена.
+_busy: set[Any] = set()
+
+
+def _take(
+    path: str | Path | None = None, *, kinds: Any = None
+) -> Task | None:
+    """Берёт следующую задачу свободного клиента и отмечает её в работе.
+
+    Синхронная целиком, и это обязательное свойство: между выборкой и
+    отметкой `running` нет ни одного `await`, поэтому второй исполнитель не
+    может взять ту же задачу. Замка для этого не нужно ровно потому, что
+    исполнители это корутины одного потока, а не потоки.
+    """
+    repo = db.admin_repo(path)
+    rows = repo.due_tasks(
+        _stamp(_now()), limit=1, skip_clients=tuple(_busy), kinds=kinds
+    )
+    if not rows:
+        return None
+    task = _task_from_row(rows[0])
+    repo.update_task(task.id, state=RUNNING)
+    _busy.add(task.client_id)
+    return task
+
+
 async def run_once(path: str | Path | None = None) -> bool:
     """Берёт одну задачу, которой пора, и выполняет её.
 
-    Возвращает False, если очередь пуста. По одной задаче за раз: так
-    фоновая работа не обгоняет бюджет запросов `core.wbapi`.
+    Возвращает False, если очередь пуста. Одна задача за вызов: так эту
+    функцию зовут тесты и так же работает воркер, когда место свободно одно.
     """
-    repo = db.admin_repo(path)
-    rows = repo.due_tasks(_stamp(_now()), limit=1)
-    if not rows:
+    task = _take(path)
+    if task is None:
         return False
+    try:
+        await _execute(task, path)
+    finally:
+        _busy.discard(task.client_id)
+    return True
 
-    task = _task_from_row(rows[0])
-    repo.update_task(task.id, state=RUNNING)
+
+async def _execute(task: Task, path: str | Path | None = None) -> None:
+    """Выполняет взятую задачу и закрывает её в таблице. Не бросает наружу."""
+    repo = db.admin_repo(path)
     fn = _handlers.get(task.kind)
     if fn is None:
         repo.update_task(
@@ -314,10 +373,15 @@ async def run_once(path: str | Path | None = None) -> bool:
             path=path,
         )
         await _tell_about_failure(task, path)
-        return True
+        return
 
     try:
         await _call(fn, task)
+    except WBTokenMissing as error:
+        # Кабинет не подключён вовсе. Это не «Wildberries отверг ключ»: ставить
+        # модули на паузу тут нечем и незачем, а пугать селлера рассказом про
+        # непринятый ключ значит объяснять ему чужую беду вместо его.
+        await _cancel(repo, task, error, path, token=False, missing=True)
     except WBAuthError as error:
         await _cancel(repo, task, error, path, token=True)
     except WBForbiddenError as error:
@@ -342,16 +406,31 @@ async def run_once(path: str | Path | None = None) -> bool:
         await _tell_about_failure(task, path)
     else:
         repo.update_task(task.id, state=DONE, finished_at=_stamp(_now()))
-    return True
 
 
 async def _cancel(
-    repo: Any, task: Task, error: BaseException, path: Any, *, token: bool
+    repo: Any,
+    task: Task,
+    error: BaseException,
+    path: Any,
+    *,
+    token: bool,
+    missing: bool = False,
 ) -> None:
     """Повторять бессмысленно: дело в ключе, а не в доступности WB."""
     repo.update_task(
         task.id, state=CANCELLED, last_error=str(error), finished_at=_stamp(_now())
     )
+    if missing:
+        audit.log(
+            "queue",
+            task.client_id,
+            f"задача {task.kind} отменена: кабинет Wildberries не подключён",
+            level="warning",
+            path=path,
+        )
+        await _notify(task.client_id, NEED_CONNECT)
+        return
     if token:
         audit.log(
             "queue",
@@ -412,32 +491,94 @@ async def _retry_or_give_up(repo: Any, task: Task, error: BaseException, path: A
     )
 
 
+async def _run_in_slot(task: Task, path: str | Path | None) -> None:
+    """Одна работа на своём месте. Место освобождается в любом случае."""
+    try:
+        await _execute(task, path)
+    except asyncio.CancelledError:
+        # Бота гасят. Задача останется в `running`, и после перезапуска её
+        # вернёт в очередь `recover`: это и есть её страховка.
+        raise
+    except Exception:  # noqa: BLE001 - воркер не имеет права упасть
+        logger.exception("сбой задачи %s #%s", task.kind, task.id)
+    finally:
+        _busy.discard(task.client_id)
+
+
+def _start_available(
+    live: dict[Any, bool], slots: int, client_slots_count: int, path: Any
+) -> int:
+    """Занимает свободные места задачами. Возвращает, сколько работ началось.
+
+    Места двух видов. Общее число работ ограничено `slots`, а заказанные
+    клиентами отчёты занимают не больше `client_slots_count` из них: остаток
+    закреплён за работами расписания. Иначе три заказанных квартала заняли бы
+    всё, а ночной сбор воронки сдвинулся бы на эти минуты, и его потерянные
+    сутки не вернуть: WB отдаёт воронку по дням только за последнюю неделю.
+    """
+    started = 0
+    while len(live) < slots:
+        ordered = sum(1 for client_task in live.values() if client_task)
+        if ordered >= client_slots_count:
+            # Клиентские места кончились: берём только то, что клиент не
+            # заказывал, то есть сборщики и служебные проверки.
+            task = _take(path, kinds=sorted(_quiet))
+        else:
+            task = _take(path)
+        if task is None:
+            return started
+        live[asyncio.ensure_future(_run_in_slot(task, path))] = not is_quiet(task.kind)
+        started += 1
+    return started
+
+
 async def run_worker(
     *,
     path: str | Path | None = None,
     poll_sec: float = 5.0,
     stop: asyncio.Event | None = None,
+    workers: int | None = None,
 ) -> None:
     """Вечный цикл: подобрать брошенное после рестарта и разбирать очередь.
 
-    Задачи берутся по одной, поэтому бюджет запросов WB не обходится.
+    Работ одновременно не больше, чем мест (`[queue] workers`), у одного
+    клиента в работе всегда одна, и часть мест закреплена за работами
+    расписания. `workers` в параметрах нужен тестам и владельцу скрипта:
+    в работе число берётся из конфига.
     """
     recover(path)
-    while stop is None or not stop.is_set():
-        try:
-            busy = await run_once(path=path)
-        except Exception:  # noqa: BLE001 - воркер не имеет права упасть
-            logger.exception("сбой цикла очереди")
-            busy = False
-        if busy:
-            continue
-        if stop is None:
-            await asyncio.sleep(poll_sec)
-            continue
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=poll_sec)
-        except asyncio.TimeoutError:
-            pass
+    slots = max(1, int(workers) if workers is not None else worker_slots())
+    ordered_slots = max(1, min(slots, client_slots()))
+    live: dict[Any, bool] = {}
+    try:
+        while stop is None or not stop.is_set():
+            try:
+                _start_available(live, slots, ordered_slots, path)
+            except Exception:  # noqa: BLE001 - воркер не имеет права упасть
+                logger.exception("сбой цикла очереди")
+            if live:
+                done, _ = await asyncio.wait(
+                    set(live), timeout=poll_sec, return_when=asyncio.FIRST_COMPLETED
+                )
+                for finished in done:
+                    live.pop(finished, None)
+                continue
+            if stop is None:
+                await asyncio.sleep(poll_sec)
+                continue
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=poll_sec)
+            except asyncio.TimeoutError:
+                pass
+        # Выключение не рвёт начатое: новых задач не берём, а те, что идут,
+        # доводим до конца. Ждать до бесконечности не придётся, выключение
+        # само снимет воркер по своему сроку.
+        if live:
+            await asyncio.wait(set(live))
+    except asyncio.CancelledError:
+        for child in live:
+            child.cancel()
+        raise
 
 
 # --- тексты клиенту. Русский, без кодов ошибок и слова «таймаут» ---
@@ -497,6 +638,15 @@ OWNER_FAILED = (
 # Клиент получил слово о сбое совсем недавно. Второе такое же сообщение это
 # не забота, а наказание: молчим и оставляем запись в журнале.
 HUSHED = "о сбое задачи {kind} #{task} клиенту {client} промолчал: недавно уже писал"
+
+# Кабинета нет вовсе. Прежде такая задача отвечала текстом про непринятый
+# ключ и заодно ставила модули на паузу: клиент, которому модуль выдали
+# вручную, получал испуг вместо следующего шага.
+NEED_CONNECT = (
+    "Чтобы собрать этот разбор, нужен доступ к вашему кабинету Wildberries. "
+    "Выпустите ключ доступа в личном кабинете и пришлите его командой "
+    "/connect: дальше бот всё соберёт сам."
+)
 
 TOKEN_TEXT = (
     "Wildberries больше не принимает ваш ключ доступа. Выпустите новый "
@@ -662,6 +812,27 @@ def max_attempts() -> int:
         return max(1, int(_conf().get("attempts", 3)))
     except (TypeError, ValueError):
         return 3
+
+
+def worker_slots() -> int:
+    """Сколько работ очередь ведёт одновременно. Из конфига, секция queue."""
+    try:
+        return max(1, int(_conf().get("workers", 3)))
+    except (TypeError, ValueError):
+        return 3
+
+
+def client_slots() -> int:
+    """Сколько мест из них могут занять заказанные клиентами отчёты.
+
+    Меньше общего числа мест: остаток закреплён за работами расписания,
+    иначе заказанные отчёты задержали бы ночной сбор, а несобранную воронку
+    Wildberries потом не отдаст.
+    """
+    try:
+        return max(1, int(_conf().get("client_slots", 2)))
+    except (TypeError, ValueError):
+        return 2
 
 
 def notice_gap_sec() -> float:

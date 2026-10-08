@@ -636,16 +636,49 @@ class AdminRepo:
             params.append(int(limit))
         return list(self._conn.execute(sql, params))
 
-    def due_tasks(self, now: str, limit: int = 10) -> list[sqlite3.Row]:
-        """Задачи, которым пора выполняться."""
-        return list(
-            self._conn.execute(
-                "SELECT * FROM tasks WHERE state = 'queued'"
-                " AND (next_run_at IS NULL OR next_run_at <= ?)"
-                " ORDER BY id LIMIT ?",
-                (now, int(limit)),
-            )
+    def due_tasks(
+        self,
+        now: str,
+        limit: int = 10,
+        *,
+        skip_clients: Any = (),
+        kinds: Any = None,
+    ) -> list[sqlite3.Row]:
+        """Задачи, которым пора выполняться.
+
+        `skip_clients` это те, у кого работа уже идёт. Их задачи в выборку не
+        попадают вовсе, поэтому следующей берётся работа другого клиента, а не
+        следующая по номеру: отчёт за квартал у одного кабинета длится минуты,
+        и порядок строго по номеру означал бы, что всё это время остальные
+        стоят. `None` в наборе значит «идёт работа без клиента»: это тоже один
+        исполнитель, расписание и служебные проверки делят его между собой.
+
+        `kinds` сужает выборку до перечисленных видов работ. Нужно разделению
+        дорожек: когда заказанные клиентами отчёты заняли свои места, воркер
+        берёт только работы расписания, и ночной сбор не ждёт их конца.
+        """
+        sql = (
+            "SELECT * FROM tasks WHERE state = 'queued'"
+            " AND (next_run_at IS NULL OR next_run_at <= ?)"
         )
+        params: list[Any] = [now]
+        skip = list(skip_clients or ())
+        numbered = [int(value) for value in skip if value is not None]
+        if numbered:
+            marks = ", ".join("?" * len(numbered))
+            sql += f" AND (client_id IS NULL OR client_id NOT IN ({marks}))"
+            params.extend(numbered)
+        if any(value is None for value in skip):
+            sql += " AND client_id IS NOT NULL"
+        if kinds is not None:
+            names = [str(name) for name in kinds]
+            if not names:
+                # Дорожка есть, а видов работ для неё не названо: брать нечего.
+                return []
+            sql += " AND kind IN (" + ", ".join("?" * len(names)) + ")"
+            params.extend(names)
+        params.append(int(limit))
+        return list(self._conn.execute(sql + " ORDER BY id LIMIT ?", params))
 
     def update_task(self, task_id: int, **values: Any) -> int:
         if not values:
