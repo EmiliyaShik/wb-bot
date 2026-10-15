@@ -804,6 +804,233 @@ def test_without_articles_out_of_the_profit_there_is_no_bridge_row(seller, db_pa
     ) == Decimal(str(total.get(profit.AFTER_TAX_COLUMN)))
 
 
+# --- одно число в сводке и в книге --------------------------------------------
+#
+# Селлер читает сводку с телефона, потом открывает файл. Два разных числа под
+# одним названием стоят ему доверия к обоим, и ловится это только сравнением
+# самих чисел: совпадение подписей ничего не доказывает. Поэтому числа здесь
+# достаются из готового текста сообщения и из готовой книги, а не из тех же
+# свойств, которыми их считают.
+
+
+def message_lines(report):
+    """Строки сводки по подписи: что селлер читает, без разметки."""
+    found = {}
+    for line in str(handlers_profit.summary_text(report)).splitlines():
+        label, sign, value = line.partition(": ")
+        if sign:
+            found[label] = value.replace("<b>", "").replace("</b>", "").strip()
+    return found
+
+
+def said_money(report, label):
+    """Сумма из сводки числом. «нет данных» остаётся словами, как в книге."""
+    value = message_lines(report)[label]
+    if value == profit.NO_DATA:
+        return value
+    return Decimal(value.replace("₽", "").replace(" ", "").replace(",", "."))
+
+
+def cell_money(cell):
+    """Клетка книги числом. «нет данных» остаётся словами, как в сводке."""
+    return cell if cell == profit.NO_DATA else Decimal(str(cell))
+
+
+def cabinet(db_path, telegram_id, rows, costs, mode=tax.USN_INCOME, rate=6):
+    """Кабинет с неделей агента 1, себестоимостью и выбранным режимом."""
+    client_id = db.admin_repo(db_path).ensure_client(telegram_id)
+    finance.save_rows(client_id, rows, path=db_path)
+    for week in finance.aggregate(rows).values():
+        finance.save_week(client_id, week, path=db_path)
+    if costs:
+        costs_module.save_costs(client_id, costs, path=db_path)
+    tax.set_rule(client_id, mode, rate, path=db_path)
+    return client_id
+
+
+@pytest.fixture
+def costed_seller(db_path):
+    """Тот же кабинет округления, но себестоимость есть у всех четырёх."""
+    return cabinet(
+        db_path,
+        7373,
+        ROUNDING_ROWS,
+        {nm_id: Decimal("100") for nm_id in (101, 102, 103, 104)},
+    )
+
+
+@pytest.fixture
+def uncosted_seller(db_path):
+    """Тот же кабинет округления, но себестоимости нет ни у одного товара."""
+    return cabinet(db_path, 7474, ROUNDING_ROWS, None)
+
+
+def test_the_message_and_the_workbook_show_one_after_tax_number(
+    rounding_seller, db_path
+):
+    """Прибыль после налога в сводке это ровно итог книги, а не свой расчёт.
+
+    Числа руками: прибыль 2400,75; налог кабинета от общей базы 240,06; в
+    столбце книги 240,08, и 60,02 из них у артикула 104, прибыли по которому
+    нет вовсе. Значит из прибыли вычтено 180,06, и прибыль после налога
+    2220,69 в обоих местах.
+
+    Прежде сводка вычитала налог кабинета целиком и показывала 2160,69: на 60
+    рублей меньше файла, под тем же названием. Ровно это расхождение тест и
+    ловит, и число 2160,69 оставлено в нём нарочно, чтобы возврат к прежнему
+    расчёту не прошёл молча.
+    """
+    report = rounding_report(rounding_seller, db_path)
+    total = by_label(articles_sheet(report))[profit.TOTAL_LABEL]
+    said = said_money(report, "Прибыль после налога")
+
+    assert said == Decimal("2220.69")
+    assert cell_money(total.get(profit.AFTER_TAX_COLUMN)) == Decimal("2220.69")
+    assert said == cell_money(total.get(profit.AFTER_TAX_COLUMN))
+    # Прежнее число живо: оно стоит на листе «Налог», где оговорено словами.
+    assert report.profit_after_tax == Decimal("2160.69")
+    assert said - report.profit_after_tax == Decimal("60.00")
+
+    # Прибыль строкой выше тоже одна и та же.
+    assert said_money(report, "Прибыль за период") == Decimal("2400.75")
+    assert said_money(report, "Прибыль за период") == cell_money(
+        total.get(profit.PROFIT_COLUMN)
+    )
+
+
+def test_the_message_names_the_tax_it_subtracted_so_the_seller_can_check(
+    rounding_seller, db_path
+):
+    """Вычитание в сводке не сходится, и сказано об этом числами.
+
+    «Прибыль 2400,75 минус налог 240,06» даёт 2160,69, а стоит 2220,69.
+    Молчание тут читается как ошибка бота, поэтому названы оба слагаемых
+    налога, и по ним сводка проверяется: 180,06 + 60 = 240,06, а
+    2400,75 - 180,06 = 2220,69.
+    """
+    report = rounding_report(rounding_seller, db_path)
+    text = str(handlers_profit.summary_text(report))
+
+    assert report.tax_in_profit == Decimal("180.06")
+    assert report.tax_outside_profit == Decimal("60.00")
+    assert report.tax_in_profit + report.tax_outside_profit == report.tax.amount
+    assert report.total_profit - report.tax_in_profit == report.cabinet_after_tax
+
+    assert "Из прибыли вычтено не всё" in text
+    assert "180,06 ₽" in text and "60 ₽" in text
+    # И сказано, где в файле стоит то же число.
+    assert profit.ARTICLES_SHEET in text
+
+
+def test_two_kopecks_of_rounding_do_not_buy_an_explanation_in_the_message(
+    costed_seller, db_path
+):
+    """Про копейки округления сводка молчит, и это дешевле оговорки.
+
+    Себестоимость есть у всех, и единственная разница это построчное
+    округление столбца: 60,02 в каждой из четырёх строк дают 240,08 против
+    240,06 от общей базы. Сводка показывает итог книги 2960,92, вычитание в
+    лоб дало бы 2960,94, и абзац про две копейки в сообщении, которое читают
+    с телефона, стоит дороже самих двух копеек. Книга называет их на листе
+    «Методология», где место есть.
+    """
+    report = rounding_report(costed_seller, db_path)
+    total = by_label(articles_sheet(report))[profit.TOTAL_LABEL]
+
+    assert report.tax_without_profit == Decimal("0.00")
+    assert report.tax_in_profit == Decimal("240.08")
+    assert report.tax.amount == Decimal("240.06")
+    # Разница есть, но она в пределах построчного округления, и сводка молчит.
+    assert report.tax_outside_profit is None
+
+    said = said_money(report, "Прибыль после налога")
+    assert said == Decimal("2960.92")
+    assert said == cell_money(total.get(profit.AFTER_TAX_COLUMN))
+    assert report.total_profit - report.tax.amount == Decimal("2960.94")
+    assert "Из прибыли вычтено не всё" not in str(
+        handlers_profit.summary_text(report)
+    )
+
+
+def test_with_no_profit_at_all_the_message_says_no_data_like_the_workbook(
+    uncosted_seller, db_path
+):
+    """Прибыли нет ни по одному артикулу: в сводке «нет данных», а не ноль.
+
+    Себестоимости нет вовсе, и прибыль не посчитана ни по одному товару. Книга
+    в такой итог ставит «нет данных»: ноль прочитался бы как «не заработали».
+    Сводка же складывала прибыль из пустого множества и показывала ноль, а
+    после налога минус 240,06, то есть единственным итогом периода оказывался
+    налог, которого не вычитали ни из чего.
+    """
+    report = rounding_report(uncosted_seller, db_path)
+    total = by_label(articles_sheet(report))[profit.TOTAL_LABEL]
+
+    assert report.totals.priced == 0
+    assert report.cabinet_profit is None
+    assert report.cabinet_after_tax is None
+    for label, column in (
+        ("Прибыль за период", profit.PROFIT_COLUMN),
+        ("Прибыль после налога", profit.AFTER_TAX_COLUMN),
+    ):
+        assert said_money(report, label) == profit.NO_DATA
+        assert cell_money(total.get(column)) == profit.NO_DATA
+    # Прежние числа оставлены в тесте, чтобы возврат к ним не прошёл молча.
+    assert report.total_profit == Decimal("0")
+    assert report.profit_after_tax == Decimal("-240.06")
+    # И про вычитание, которого в сводке нет, сводка не рассуждает.
+    assert "Из прибыли вычтено не всё" not in str(
+        handlers_profit.summary_text(report)
+    )
+
+
+def test_not_one_cabinet_shows_one_number_in_the_message_and_another_in_the_file(
+    db_path,
+):
+    """Сторож на будущее: сводка и итог книги сходятся на любом кабинете.
+
+    Пять кабинетов подряд: себестоимость у всех, у части, ни у кого, кабинет с
+    возвратом (налог товара уходит в минус) и кабинет на «доходы минус
+    расходы», где налог по товарам это раскладка. Сравниваются готовый текст
+    сообщения и готовая книга, поэтому расхождение поймается, какой бы из двух
+    расчётов потом ни поменяли.
+    """
+    cabinets = (
+        cabinet(
+            db_path,
+            8001,
+            ROUNDING_ROWS,
+            {nm_id: Decimal("100") for nm_id in (101, 102, 103, 104)},
+        ),
+        cabinet(db_path, 8002, ROUNDING_ROWS, {101: Decimal("100")}),
+        cabinet(db_path, 8003, ROUNDING_ROWS, None),
+        cabinet(
+            db_path, 8004, RETURN_ROWS, {444: Decimal("200"), 555: Decimal("300")}
+        ),
+        cabinet(db_path, 8005, ROWS, {111: Decimal("400"), 222: Decimal("900")},
+                mode=tax.USN_INCOME_MINUS, rate=15),
+    )
+    checked = 0
+    for client_id in cabinets:
+        report = rounding_report(client_id, db_path)
+        total = by_label(articles_sheet(report))[profit.TOTAL_LABEL]
+        after_column = (
+            profit.AFTER_TAX_COLUMN
+            if profit.AFTER_TAX_COLUMN in articles_sheet(report).headers
+            else None
+        )
+        assert after_column is not None
+        assert said_money(report, "Прибыль за период") == cell_money(
+            total.get(profit.PROFIT_COLUMN)
+        )
+        assert said_money(report, "Прибыль после налога") == cell_money(
+            total.get(after_column)
+        )
+        checked += 1
+    # Проверка пустым списком молчит и проходит, поэтому счёт проверяется тоже.
+    assert checked == 5
+
+
 # Товар 555 продан в прошлом периоде, а вернулся в этом: в этой неделе у него
 # только строка возврата, и выручка за период уходит в минус. На живом кабинете
 # это обычная неделя, а не редкость.
@@ -1246,3 +1473,152 @@ def test_the_seller_reads_words_and_not_field_names(seller, db_path):
     assert "заплатил покупатель" in text
     for machine in ("retailAmount", "forPay", "usn_income", "Decimal"):
         assert machine not in text
+
+
+# --- рекламный счёт в расходах «доходы минус расходы» ------------------------
+#
+# Поле `deduction` Wildberries описывает как «удержания, в том числе за
+# рекламу», и это правда буквально: счёт рекламного кабинета приходит в отчёт
+# о реализации удержанием, а за что удержали, написано в `bonusTypeName`.
+# Расходы на «доходы минус расходы» складываются из удержаний и рекламы, и
+# пока удержание шло в них целиком, рекламные рубли попадали в базу дважды.
+#
+# Дважды принятый расход занижает базу, то есть обещает селлеру налог меньше
+# настоящего. Это хуже, чем завысить: по завышенной оценке он отложит лишнее,
+# по заниженной недоплатит.
+AD_INVOICE = {
+    "reportId": 1,
+    "rrdId": 9,
+    "dateFrom": "2026-09-01",
+    "dateTo": "2026-09-07",
+    # Живая строка: типа документа нет, артикула нет, обоснование от WB.
+    "docTypeName": "",
+    "sellerOperName": "Удержание",
+    "bonusTypeName": "Оказание услуг «WB Продвижение», документ №313728640",
+    "deduction": 500,
+}
+
+
+@pytest.fixture
+def seller_with_ad_invoice(db_path):
+    """Тот же кабинет, но Wildberries выставил за рекламу счёт на 500."""
+    client_id = db.admin_repo(db_path).ensure_client(7474)
+    rows = ROWS + [AD_INVOICE]
+    finance.save_rows(client_id, rows, path=db_path)
+    for week in finance.aggregate(rows).values():
+        finance.save_week(client_id, week, path=db_path)
+    costs_module.save_costs(
+        client_id, {111: Decimal("400"), 222: Decimal("900")}, path=db_path
+    )
+    return client_id
+
+
+def test_the_ad_invoice_does_not_land_in_the_tax_base_twice(
+    seller_with_ad_invoice, db_path
+):
+    """Счёт за рекламу не меняет базу налога: реклама в ней уже есть.
+
+    Числа руками. Удержания недели теперь 900: 400 прочих и 500 рекламных.
+    Расходы: комиссия 2000 + эквайринг 300 + логистика 800 + хранение 100 +
+    приёмка 50 + штрафы 200 + удержания 900 = 4350. Штрафы не принимаются,
+    остаётся 4150. Из них вычитается рекламный счёт 500, потому что реклама
+    прибавляется своей строкой: 3650. Плюс себестоимость 3400 и расход
+    рекламы 400, итого 7450.
+
+    Ровно столько же выходило у той же недели без строки счёта, и это и есть
+    проверка: счёт Wildberries это второе имя денег, которые в базе уже
+    посчитаны, и добавить его к неделе не должно менять ни базы, ни налога.
+
+    Без починки те же расходы вышли бы 7950, база 5050, а налог 757.50 вместо
+    832.50: бот обещал бы налог на 75 рублей меньше настоящего.
+    """
+    tax.set_rule(seller_with_ad_invoice, tax.USN_INCOME_MINUS, 15, path=db_path)
+    report = report_of(seller_with_ad_invoice, db_path)
+    estimate = report.tax
+
+    assert report.ad_deductions == Decimal("500")
+    assert report.total_ad_spend == Decimal("400")
+    assert estimate.expenses == Decimal("7450")
+    assert estimate.base == Decimal("5550.00")
+    assert estimate.amount == Decimal("832.50")
+
+
+def test_the_base_is_the_same_with_the_invoice_row_and_without_it(db_path):
+    """Одна и та же неделя с рекламным счётом и без него даёт одну базу.
+
+    Второй кабинет собран из тех же строк без строки счёта. Если бы счёт
+    принимался в расходы вторым разом, базы разошлись бы ровно на него.
+    """
+    bare = db.admin_repo(db_path).ensure_client(7575)
+    finance.save_rows(bare, ROWS, path=db_path)
+    for week in finance.aggregate(ROWS).values():
+        finance.save_week(bare, week, path=db_path)
+    costs_module.save_costs(
+        bare, {111: Decimal("400"), 222: Decimal("900")}, path=db_path
+    )
+    tax.set_rule(bare, tax.USN_INCOME_MINUS, 15, path=db_path)
+
+    billed = db.admin_repo(db_path).ensure_client(7676)
+    rows = ROWS + [AD_INVOICE]
+    finance.save_rows(billed, rows, path=db_path)
+    for week in finance.aggregate(rows).values():
+        finance.save_week(billed, week, path=db_path)
+    costs_module.save_costs(
+        billed, {111: Decimal("400"), 222: Decimal("900")}, path=db_path
+    )
+    tax.set_rule(billed, tax.USN_INCOME_MINUS, 15, path=db_path)
+
+    without = report_of(bare, db_path).tax
+    with_invoice = report_of(billed, db_path).tax
+
+    assert without.expenses == with_invoice.expenses == Decimal("7450")
+    assert without.amount == with_invoice.amount == Decimal("832.50")
+
+
+def test_without_campaign_stats_the_ad_invoice_goes_into_the_base_itself(
+    seller_with_ad_invoice, db_path
+):
+    """Нет расхода рекламы по товарам - в базу идёт сам счёт.
+
+    Иначе починка двойного счёта отняла бы у селлера без категории
+    «Продвижение» настоящий расход: счёт Wildberries удержал по-настоящему, и
+    выбросить его значило бы завысить налог.
+
+    Числа руками: 4150 расходов без штрафов, рекламный счёт из них не
+    вычитается, расход рекламы не прибавляется: 4150 + 3400 себестоимости =
+    7550. Это на 100 больше, чем с известной статистикой, потому что счёт
+    (500) больше статистического расхода (400).
+    """
+    tax.set_rule(seller_with_ad_invoice, tax.USN_INCOME_MINUS, 15, path=db_path)
+    report = profit.build(
+        seller_with_ad_invoice,
+        "week",
+        today=TODAY,
+        ads=profit.AdSpend({}, available=False, reason=profit.ADS_NO_CATEGORY),
+        path=db_path,
+    )
+    estimate = report.tax
+
+    assert report.ad_deductions_counted is True
+    assert estimate.expenses == Decimal("7550")
+    # 13000 - 7550 = 5450, 15 процентов это 817.50.
+    assert estimate.base == Decimal("5450.00")
+    assert estimate.amount == Decimal("817.50")
+    # И отчёт говорит вслух, что расходы посчитаны не полностью.
+    assert tax.MISSING_ADS in estimate.missing
+
+
+def test_the_income_mode_does_not_care_about_the_ad_invoice(
+    seller_with_ad_invoice, db_path
+):
+    """На УСН «доходы» расходы в базу не входят вовсе, и счёт её не трогает.
+
+    Проверка на то, что починка не уехала в чужой режим: база «доходов» это
+    то, что заплатил покупатель, и рекламный счёт к ней отношения не имеет.
+    """
+    tax.set_rule(seller_with_ad_invoice, tax.USN_INCOME, 6, path=db_path)
+    estimate = report_of(seller_with_ad_invoice, db_path).tax
+
+    assert estimate.expenses is None
+    assert estimate.income == INCOME
+    assert estimate.amount == Decimal("780.00")

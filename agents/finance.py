@@ -61,6 +61,8 @@ __all__ = [
     "UNKNOWN",
     "doc_kind",
     "row_kind",
+    "AD_DEDUCTION_MARK",
+    "is_ad_deduction",
     "Amounts",
     "Week",
     "Month",
@@ -304,6 +306,47 @@ def row_kind(row: dict) -> str:
     return doc_kind(row.get("docTypeName"), row.get("retailAmount"))
 
 
+# --- рекламная часть удержаний -----------------------------------------------
+#
+# Поле `deduction` Wildberries описывает как «удержания, в том числе за
+# рекламу», и это не оговорка в документации: счёт рекламного кабинета
+# приходит в отчёт о реализации служебной строкой с `sellerOperName`
+# «Удержание», а за что удержали, написано в `bonusTypeName` словами самого
+# Wildberries: «Оказание услуг «WB Продвижение», документ №N».
+#
+# Отделять эту часть пришлось потому, что те же деньги приходят в отчёт о
+# прибыли вторым путём: расходом по товарам из статистики кампаний. Вычесть
+# их оба раза значит отнять у селлера прибыль, которой он не терял.
+#
+# Доказано на живом кабинете, а не выведено из названия поля: `документ №N`
+# из `bonusTypeName` это `updNum` из `GET /adv/v1/upd`, и по всем 38
+# документам, у которых Wildberries дописал номер, суммы совпали до рубля.
+#
+# Сравнение по вхождению, а не целиком, и это осознанное исключение из
+# правила `doc_kind`. Там сравнивается тип документа, у него короткий
+# закрытый список значений, и вхождение уже подводило. Здесь же свободный
+# текст, в который Wildberries дописывает номер счёта, так что целиком
+# сравнивать нечего. Название продукта взято узко нарочно: пропущенная строка
+# оставит всё как было, то есть реклама вычтется дважды, а лишняя выкинет из
+# расходов настоящее удержание и завысит прибыль. Из двух ошибок первая
+# безопаснее, поэтому угадывать синонимы здесь тоже не станем.
+#
+# Строчными буквами, потому что сравнивается тоже приведённое к строчным:
+# регистр у Wildberries в этом поле не постоянен, а продукт один.
+AD_DEDUCTION_MARK = "wb продвижение"
+
+
+def is_ad_deduction(reason: Any) -> bool:
+    """Удержание выставлено за рекламу: Wildberries назвал её своим продуктом.
+
+    На входе `bonusTypeName` строки отчёта (в базе колонка `bonus_type_name`),
+    то есть обоснование удержания. Пустое обоснование это «не знаем, за что»,
+    и рекламой оно не становится: неизвестное удержание должно остаться в
+    расходах, а не исчезнуть из них.
+    """
+    return AD_DEDUCTION_MARK in str(reason or "").lower()
+
+
 # --- результат ---------------------------------------------------------------
 
 
@@ -321,6 +364,13 @@ class Amounts:
     acceptance: Decimal = ZERO
     penalties: Decimal = ZERO
     deductions: Decimal = ZERO
+    # Рекламная часть `deductions`, а не прибавка к ней: эти деньги уже
+    # посчитаны строкой выше. Названа отдельно ради отчёта о прибыли, где
+    # реклама приходит вторым путём из статистики кампаний и иначе вычиталась
+    # бы дважды. Сверка `/finance` с итогами Wildberries смотрит на
+    # `deductions` и этого поля не видит вовсе: `deductionSum` у WB один, и
+    # делить его нельзя.
+    ad_deductions: Decimal = ZERO
     additional_payment: Decimal = ZERO
     # Возмещение за выбывший товар: сумма `forPay` по строкам-компенсациям и
     # сколько товара по ним выбыло. В `for_pay` эти же деньги уже сидят, здесь
@@ -344,6 +394,7 @@ class Amounts:
             acceptance=self.acceptance + other.acceptance,
             penalties=self.penalties + other.penalties,
             deductions=self.deductions + other.deductions,
+            ad_deductions=self.ad_deductions + other.ad_deductions,
             additional_payment=self.additional_payment + other.additional_payment,
             compensation=self.compensation + other.compensation,
             compensation_units=self.compensation_units + other.compensation_units,
@@ -353,7 +404,13 @@ class Amounts:
 
     @property
     def costs(self) -> Decimal:
-        """Всё, что Wildberries забрал за неделю."""
+        """Всё, что Wildberries забрал за неделю.
+
+        Удержания берутся целиком, вместе с рекламной частью: это сумма
+        фактически удержанного, и из неё стоит сверка с итогами Wildberries.
+        Кому нужно вычесть рекламу отдельным путём, тот вычитает
+        `ad_deductions` сам и говорит об этом вслух.
+        """
         return (
             self.commission
             + self.acquiring
@@ -363,6 +420,16 @@ class Amounts:
             + self.penalties
             + self.deductions
         )
+
+    @property
+    def other_deductions(self) -> Decimal:
+        """Удержания, кроме выставленных за рекламу.
+
+        Статья «прочие удержания» в отчёте о прибыли считается по этому полю:
+        счёт рекламного кабинета там вычитается не удержанием, а расходом по
+        товарам, и держать его в двух статьях сразу нельзя.
+        """
+        return self.deductions - self.ad_deductions
 
 
 @dataclass(frozen=True)
@@ -573,6 +640,11 @@ def aggregate(rows: Iterable[dict]) -> dict[int, Week]:
             acceptance=money(row.get("paidAcceptance")),
             penalties=money(row.get("penalty")),
             deductions=money(row.get("deduction")),
+            ad_deductions=(
+                money(row.get("deduction"))
+                if is_ad_deduction(row.get("bonusTypeName"))
+                else ZERO
+            ),
             additional_payment=money(row.get("additionalPayment")),
             # Компенсация: деньги за выбывший товар. В `for_pay` строкой выше
             # они уже вошли, здесь названы отдельно.
@@ -1004,6 +1076,11 @@ def articles_of(
                 acceptance=db.from_kop(row["acceptance_kop"]),
                 penalties=db.from_kop(row["penalty_kop"]),
                 deductions=db.from_kop(row["deduction_kop"]),
+                ad_deductions=(
+                    db.from_kop(row["deduction_kop"])
+                    if is_ad_deduction(row["bonus_type_name"])
+                    else ZERO
+                ),
                 additional_payment=db.from_kop(row["additional_payment_kop"]),
                 compensation=(
                     db.from_kop(row["ppvz_for_pay_kop"]) if kind == COMPENSATION else ZERO

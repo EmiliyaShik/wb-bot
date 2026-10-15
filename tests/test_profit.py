@@ -603,12 +603,15 @@ def test_faceless_expenses_are_broken_down_and_the_parts_add_up(db_path):
     report = report_of(client_id, db_path, ads=profit.AdSpend({}))
 
     parts = {item.key: item.faceless for item in report.faceless_parts}
-    assert parts == {"storage": Decimal("600"), "deductions": Decimal("300")}
+    assert parts == {"storage": Decimal("600"), "other_deductions": Decimal("300")}
     assert sum(parts.values(), Decimal("0")) == report.unallocated == Decimal("900")
     # Хранение и удержания Wildberries по товарам не разнёс вовсе, логистику
     # разнёс: правило одно на все статьи и стоит на данных, а не на списке
     # имён в коде.
-    assert {item.key for item in report.unshared_items} == {"storage", "deductions"}
+    assert {item.key for item in report.unshared_items} == {
+        "storage",
+        "other_deductions",
+    }
 
 
 def test_a_column_that_can_never_fill_is_absent_and_the_money_is_named(db_path):
@@ -1418,3 +1421,242 @@ async def test_a_deleted_card_does_not_send_the_report_to_wb_every_time(
     # Два похода: первый и тот, что случился по сроку. Третий не понадобился.
     assert seen == [CARDS_PATH, CARDS_PATH]
     assert profit.names_of(cabinet, path=db_path)[222] == ""
+
+
+# --- рекламный счёт внутри удержаний -----------------------------------------
+#
+# Wildberries выставляет за рекламу счёт и удерживает его из отчёта о
+# реализации: строка приходит без nmId, sellerOperName у неё «Удержание», а
+# за что удержали, написано в bonusTypeName словами самого Wildberries.
+# Те же деньги приходят в отчёт вторым путём, расходом по товарам из
+# статистики кампаний, и пока удержание лежало в общей куче расходов без
+# артикула, одни и те же рубли вычитались дважды.
+#
+# Неделя ниже собрана так, чтобы двойной счёт было видно в лоб: рекламное
+# удержание 400 ровно равно сумме расхода по товарам (300 плюс 100), и больше
+# рекламных удержаний в ней нет.
+AD_DEDUCTION_ROWS = ROWS + [
+    {
+        "reportId": 1,
+        "rrdId": 7,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        # Так выглядит живая строка: типа документа нет, артикула нет,
+        # обоснование названо Wildberries.
+        "docTypeName": "",
+        "sellerOperName": "Удержание",
+        "bonusTypeName": "Оказание услуг «WB Продвижение», документ №313728640",
+        "deduction": 400,
+    },
+    {
+        "reportId": 1,
+        "rrdId": 8,
+        "dateFrom": "2026-09-01",
+        "dateTo": "2026-09-07",
+        # Удержание с другим обоснованием. Оно обязано остаться расходом:
+        # вычесть рекламу один раз это не повод потерять транзитную доставку.
+        "docTypeName": "",
+        "sellerOperName": "Удержание",
+        "bonusTypeName": "Услуги доставки транзитных поставок. Поставка №39328480",
+        "deduction": 50,
+    },
+]
+
+AD_DEDUCTION_COSTS = {111: Decimal("500"), 222: Decimal("900")}
+
+
+@pytest.mark.parametrize(
+    "reason, expected",
+    [
+        ("Оказание услуг «WB Продвижение»", True),
+        ("Оказание услуг «WB Продвижение», документ №313728640", True),
+        # Регистр у Wildberries не постоянен, а продукт тот же.
+        ("оказание услуг «wb продвижение»", True),
+        ("Услуги доставки транзитных поставок. Поставка №39328480", False),
+        ("Добровольная выплата за товары", False),
+        # Пустое обоснование это «не знаем, за что», а не реклама: неизвестное
+        # удержание обязано остаться расходом.
+        ("", False),
+        (None, False),
+    ],
+)
+def test_wb_names_the_ad_invoice_itself_and_nothing_is_guessed(reason, expected):
+    """Рекламное удержание узнаётся по словам Wildberries, а не по сумме.
+
+    Проверено на живом кабинете: «документ №N» из обоснования это updNum из
+    GET /adv/v1/upd, и по всем 38 документам с номером суммы совпали до рубля.
+    Поэтому признак берётся из обоснования, а не выводится из величины или из
+    близости к расходу кампаний.
+    """
+    assert finance.is_ad_deduction(reason) is expected
+
+
+def test_full_deductions_stay_whole_for_the_reconciliation(db_path):
+    """Сверка /finance смотрит на удержания целиком, и делить их нельзя.
+
+    Числа руками: удержания недели это 300 служебных плюс 400 рекламных плюс
+    50 транзитных, всего 750. Из них рекламных 400, прочих 350. Wildberries
+    отдаёт в итогах отчёта одно число deductionSum, и если наша сумма
+    перестанет быть полной, сверка начнёт расходиться на рекламу каждую
+    неделю.
+    """
+    client_id = seed(db_path, AD_DEDUCTION_ROWS, AD_DEDUCTION_COSTS, telegram_id=8181)
+
+    # Путь первый: ответ Wildberries как он есть.
+    fresh = finance.aggregate(AD_DEDUCTION_ROWS)[1].amounts
+    assert fresh.deductions == Decimal("750")
+    assert fresh.ad_deductions == Decimal("400")
+    assert fresh.other_deductions == Decimal("350")
+    # Рекламная часть это часть удержаний, а не прибавка к ним: сложение
+    # обязано сойтись, иначе сверка потеряет или удвоит рекламу.
+    assert fresh.ad_deductions + fresh.other_deductions == Decimal("750")
+
+    # Путь второй: те же строки, прочитанные из базы. Два пути сбора не имеют
+    # права разойтись в том, что считать рекламой.
+    weeks = finance.weeks_of(client_id, date(2026, 9, 1), TODAY, path=db_path)
+    stored = finance.articles_of(client_id, weeks, path=db_path)
+    faceless = [item for item in stored if item.nm_id is None][0]
+    assert faceless.amounts.ad_deductions == Decimal("400")
+    assert faceless.amounts.deductions == Decimal("750")
+    # Сверка /finance берёт удержания целиком, и рекламы из них не вычитает:
+    # у Wildberries в итогах отчёта одно число deductionSum.
+    assert weeks[0].amounts.deductions == Decimal("750")
+
+
+def test_the_ad_invoice_is_subtracted_once_not_twice(db_path):
+    """Одни и те же рекламные рубли вычитаются из прибыли ровно один раз.
+
+    Числа руками. Расход рекламы по товарам: 300 у 111 и 100 у 222, всего 400.
+    Рекламное удержание той же недели тоже 400: это и есть те же деньги,
+    пришедшие вторым путём.
+
+    Расходы без артикула теперь только 300 служебных плюс 50 транзитных, то
+    есть 350, а не 750. Разносятся они по выручке за вычетом возвратов:
+    у 111 это 4000 - 800 = 3200, у 222 это 1000, вес всего 4200.
+    Доля 111: 350 * 3200 / 4200 = 266.67 (округление до копейки).
+    Доля 222: 350 * 1000 / 4200 = 83.33.
+
+    Прибыль 111: 3200 - 500 (себестоимость одной проданной за вычетом
+    возврата) - 460 (комиссия 560 - 100) - 60 эквайринга - 200 логистики
+    - 40 хранения - 10 приёмки - 300 рекламы - 266.67 обезлички = 1363.33.
+    Прибыль 222: 1000 - 900 - 170 - 20 - 100 - 10 хранения - 30 штрафов
+    - 100 рекламы - 83.33 = -413.33.
+
+    Если бы реклама вычиталась дважды, обезличка осталась бы 750, доли вышли
+    бы 571.43 и 178.57, и прибыль упала бы ровно на эти же 400 рублей.
+    """
+    client_id = seed(db_path, AD_DEDUCTION_ROWS, AD_DEDUCTION_COSTS, telegram_id=8282)
+    report = report_of(client_id, db_path)
+
+    assert report.ad_deductions == Decimal("400")
+    assert report.ad_deductions_counted is False
+    assert report.total_ad_spend == Decimal("400")
+    # Обезличка без рекламного счёта: 300 служебных плюс 50 транзитных.
+    assert report.unallocated == Decimal("350")
+
+    assert article(report, 111).unallocated == Decimal("266.67")
+    assert article(report, 222).unallocated == Decimal("83.33")
+    assert article(report, 111).profit == Decimal("1363.33")
+    assert article(report, 222).profit == Decimal("-413.33")
+    # Колонка «прочие удержания» показывает удержания без рекламы, и по этим
+    # артикулам она пуста: строки пришли без nmId.
+    assert article(report, 111).deductions == Decimal("0")
+    assert article(report, 111).ad_deductions == Decimal("0")
+
+    # Та же проверка со стороны денег: расходы, вошедшие в прибыль, содержат
+    # рекламу один раз. Прибыль по товарам, посчитанная сложением, обязана
+    # сойтись с выручкой минус себестоимость минус расходы.
+    spent = sum(
+        (
+            item.wb_costs
+            + (item.ad_spend or Decimal("0"))
+            + item.unallocated
+            for item in report.priced
+        ),
+        Decimal("0"),
+    )
+    # 460 + 60 + 200 + 40 + 10 комиссии и услуг у 111 это 770, плюс
+    # 170 + 20 + 100 + 10 + 30 у 222 это 330, плюс 400 рекламы, плюс 350
+    # обезлички. Рекламных денег здесь 400, а не 800.
+    assert spent == Decimal("1850")
+
+
+def test_without_campaign_stats_the_ad_invoice_is_still_an_expense(db_path):
+    """Нет расхода по товарам - вычитается удержание, а не ничего.
+
+    Иначе починка двойного счёта подарила бы селлеру без категории
+    «Продвижение» прибыль, которой у него нет: рекламный счёт Wildberries
+    забрал по-настоящему.
+
+    Числа руками: обезличка снова полная, 300 + 400 + 50 = 750. Доля 111:
+    750 * 3200 / 4200 = 571.43, доля 222: 750 * 1000 / 4200 = 178.57.
+    Прибыль 111: 3200 - 500 - 460 - 60 - 200 - 40 - 10 - 571.43 = 1358.57
+    (расхода рекламы по товарам нет вовсе).
+    Прибыль 222: 1000 - 900 - 170 - 20 - 100 - 10 - 30 - 178.57 = -408.57.
+    """
+    client_id = seed(db_path, AD_DEDUCTION_ROWS, AD_DEDUCTION_COSTS, telegram_id=8383)
+    report = report_of(
+        client_id,
+        db_path,
+        ads=profit.AdSpend({}, available=False, reason=profit.ADS_NO_CATEGORY),
+    )
+
+    assert report.ad_deductions_counted is True
+    assert report.unallocated == Decimal("750")
+    assert article(report, 111).profit == Decimal("1358.57")
+    assert article(report, 222).profit == Decimal("-408.57")
+
+
+def test_the_faceless_breakdown_still_adds_up_to_the_spread_money(db_path):
+    """Расшифровка обезлички сходится с ней самой и после правки.
+
+    Статья, которой в обезличке нет, в расшифровке не появляется: иначе
+    сложение строк дало бы 750 против 350 в колонке, и селлер увидел бы две
+    разные правды об одних деньгах.
+    """
+    client_id = seed(db_path, AD_DEDUCTION_ROWS, AD_DEDUCTION_COSTS, telegram_id=8484)
+    report = report_of(client_id, db_path)
+
+    parts = {item.key: item.faceless for item in report.faceless_parts}
+    assert parts == {"other_deductions": Decimal("350")}
+    assert sum(parts.values(), Decimal("0")) == report.unallocated
+    assert profit.AD_DEDUCTIONS_KEY not in {item.key for item in report.unshared_items}
+
+    # Без статистики кампаний статья возвращается в обезличку целиком.
+    blind = report_of(
+        client_id,
+        db_path,
+        ads=profit.AdSpend({}, available=False, reason=profit.ADS_UNAVAILABLE),
+    )
+    parts = {item.key: item.faceless for item in blind.faceless_parts}
+    assert parts == {
+        profit.AD_DEDUCTIONS_KEY: Decimal("400"),
+        "other_deductions": Decimal("350"),
+    }
+    assert sum(parts.values(), Decimal("0")) == blind.unallocated == Decimal("750")
+
+
+def test_the_book_and_the_message_name_the_ad_invoice_by_its_own_name(db_path):
+    """Деньги, которых нет в расходах, обязаны быть названы.
+
+    Крупная сумма, исчезнувшая из расходов без объяснения, читается как
+    потеря отчёта, а не как исправленный двойной счёт.
+    """
+    client_id = seed(db_path, AD_DEDUCTION_ROWS, AD_DEDUCTION_COSTS, telegram_id=8585)
+    report = report_of(client_id, db_path)
+
+    book = xlsx.read_book(profit.excel_bytes(report))
+    named = [
+        row
+        for row in book[profit.PROBLEMS_SHEET].rows
+        if row.get("Блок") == profit.AD_DEDUCTION_BLOCK
+    ]
+    assert len(named) == 1
+    assert named[0].get("Сумма, ₽") == 400
+
+    # Методология говорит, каким путём реклама вычтена.
+    method = [row.get("Показатель") for row in book[profit.METHOD_SHEET].rows]
+    assert "Реклама, удержано Wildberries" in method
+
+    text = str(handlers_profit.summary_text(report))
+    assert "удержал 400" in text

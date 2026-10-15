@@ -92,6 +92,7 @@ __all__ = [
     "ADS_UNAVAILABLE",
     "ADS_NOT_REQUESTED",
     "CARDS_TABLE",
+    "AD_DEDUCTIONS_KEY",
     "COST_ITEMS",
     "NOT_SUMMABLE",
     "TOTAL_LABEL",
@@ -100,6 +101,7 @@ __all__ = [
     "TAX_UNPRICED_LABEL",
     "BEFORE_TAX",
     "COMPENSATION_BLOCK",
+    "AD_DEDUCTION_BLOCK",
     "PROFIT_COLUMN",
     "MARGIN_COLUMN",
     "TAX_COLUMN",
@@ -546,7 +548,14 @@ class ArticleProfit:
     storage: Decimal = ZERO
     acceptance: Decimal = ZERO
     penalties: Decimal = ZERO
+    # Удержания без рекламной части: счёт рекламного кабинета вычитается не
+    # здесь, а рядом. Почему так - в `METHODOLOGY`.
     deductions: Decimal = ZERO
+    # Сколько Wildberries удержал по этому артикулу за рекламу. В прибыль эта
+    # сумма идёт только тогда, когда расхода по товарам нет вовсе
+    # (`ad_deductions_counted`): иначе одни деньги вычлись бы дважды.
+    ad_deductions: Decimal = ZERO
+    ad_deductions_counted: bool = False
     ad_spend: Decimal | None = None
     unallocated: Decimal = ZERO
     # Возмещение Wildberries за выбывший товар: деньги пришли, товар не
@@ -583,10 +592,15 @@ class ArticleProfit:
 
     @property
     def wb_costs(self) -> Decimal | None:
-        """Всё, что Wildberries забрал по этому артикулу.
+        """Всё, что Wildberries забрал по этому артикулу и вошло в прибыль.
 
         Неизвестная комиссия делает неизвестной и сумму: складывать её с
         нулём значит занизить расходы и завысить прибыль.
+
+        Рекламное удержание прибавляется только тогда, когда оно и вычтено:
+        при известном расходе по товарам реклама стоит в `ad_spend`, и второй
+        раз её здесь быть не должно. Сумма этого свойства и есть то, что
+        вычиталось, иначе проверять ей было бы нечего.
         """
         if self.commission is None:
             return None
@@ -598,6 +612,7 @@ class ArticleProfit:
             + self.acceptance
             + self.penalties
             + self.deductions
+            + (self.ad_deductions if self.ad_deductions_counted else ZERO)
         )
 
     @property
@@ -614,8 +629,19 @@ class ArticleProfit:
         return self.compensation != ZERO or self.compensation_units > 0
 
 
-# Статьи расходов Wildberries. Ключ это поле `finance.Amounts`, название то
-# же, что в заголовке колонки. Порядок тот же, что в книге.
+# Ключ рекламного удержания. Назван константой, потому что по нему статья
+# отличается от остальных в двух местах: её нет в разнесении обезлички, когда
+# реклама уже вычтена расходом по товарам.
+AD_DEDUCTIONS_KEY = "ad_deductions"
+
+# Статьи расходов Wildberries. Ключ это поле или свойство `finance.Amounts`,
+# название то же, что в заголовке колонки. Порядок тот же, что в книге.
+#
+# Удержания разделены на две статьи нарочно. Счёт рекламного кабинета приходит
+# в отчёт о реализации удержанием, и те же деньги приходят расходом по товарам
+# из статистики кампаний: в одной статье с арендой приёмки и транзитной
+# доставкой они бы вычлись дважды. Поэтому «прочие удержания» считаются по
+# `other_deductions`, а реклама стоит своей строкой.
 COST_ITEMS: tuple[tuple[str, str], ...] = (
     ("commission", "Комиссия WB"),
     ("acquiring", "Эквайринг"),
@@ -623,7 +649,8 @@ COST_ITEMS: tuple[tuple[str, str], ...] = (
     ("storage", "Хранение"),
     ("acceptance", "Приёмка"),
     ("penalties", "Штрафы"),
-    ("deductions", "Прочие удержания"),
+    (AD_DEDUCTIONS_KEY, "Реклама, удержано Wildberries"),
+    ("other_deductions", "Прочие удержания"),
 )
 
 
@@ -635,6 +662,12 @@ class CostItem:
     title: str
     by_article: Decimal = ZERO
     faceless: Decimal = ZERO
+    # Идёт ли безартикульная часть статьи в разнесение по товарам. Ложь стоит
+    # ровно у рекламного удержания и ровно тогда, когда расход рекламы уже
+    # вычтен по товарам: деньги статьи настоящие, но в обезличке их нет, и
+    # расшифровка обезлички обязана про такую статью молчать, иначе её сумма
+    # перестанет сходиться с колонкой «Расходы без артикула, ₽».
+    in_unallocated: bool = True
 
     @property
     def only_faceless(self) -> bool:
@@ -720,6 +753,13 @@ class ProfitReport:
     articles: tuple[ArticleProfit, ...] = ()
     unallocated: Decimal = ZERO
     unallocated_left: Decimal = ZERO
+    # Сколько Wildberries удержал за рекламу за период. Полем, а не свойством
+    # по неделям: в `fin_weeks` колонки под эту статью нет, а новых миграций в
+    # проекте не пишут. Поэтому число считается по строкам `fin_rows` в
+    # `build`, и на уже выгруженных неделях оно верное сразу, а не «приедет со
+    # следующей выгрузкой». Тем же способом сюда попадает комиссия: она тоже
+    # поднимается из строк, а не из агрегата недели.
+    ad_deductions: Decimal = ZERO
     # Из чего состоят расходы периода: по каждой статье отдельно то, что
     # Wildberries разнёс по товарам, и то, что отдал общей строкой.
     costs_breakdown: tuple[CostItem, ...] = ()
@@ -773,12 +813,38 @@ class ProfitReport:
     @property
     def faceless_parts(self) -> tuple[CostItem, ...]:
         """Расшифровка обезлички: её сумма сходится с `unallocated`."""
-        return tuple(item for item in self.costs_breakdown if item.faceless != ZERO)
+        return tuple(
+            item
+            for item in self.costs_breakdown
+            if item.faceless != ZERO and item.in_unallocated
+        )
 
     @property
     def unshared_items(self) -> tuple[CostItem, ...]:
-        """Статьи, которых в разрезе по товарам нет вовсе."""
-        return tuple(item for item in self.costs_breakdown if item.only_faceless)
+        """Статьи, которых в разрезе по товарам нет вовсе.
+
+        Статья, не попавшая в обезличку, сюда не входит: о ней книга говорит
+        своими словами, а не фразой «деньги в колонке расходов без артикула».
+        """
+        return tuple(
+            item
+            for item in self.costs_breakdown
+            if item.only_faceless and item.in_unallocated
+        )
+
+    @property
+    def ad_deductions_counted(self) -> bool:
+        """Рекламное удержание вычитается само, а не расходом по товарам.
+
+        Так бывает ровно в одном случае: расхода рекламы по товарам нет вовсе
+        (нет категории «Продвижение», метод не ответил, за рекламой не
+        ходили). Тогда счёт рекламного кабинета это единственное, что про
+        рекламу известно, и выбросить его значило бы потерять настоящий
+        расход. Когда расход по товарам есть, вычитается он: он привязан к
+        товару, а удержание приходит общей суммой по кабинету.
+        """
+        return not self.ads.available
+
 
     @property
     def compensations(self) -> tuple[ArticleProfit, ...]:
@@ -913,6 +979,19 @@ class ProfitReport:
             expenses = (
                 amounts.costs
                 - amounts.penalties
+                # Та же двойная трата, что была в прибыли, и ровно по той же
+                # причине: удержания Wildberries уже включают выставленный
+                # счёт за рекламу, а строкой ниже прибавляется расход из
+                # статистики кампаний. Дважды принятый расход занижает базу и
+                # сам налог, то есть обещает селлеру налог меньше настоящего,
+                # а это хуже, чем завысить. Когда расхода по товарам нет,
+                # вычитать нечего: тогда в базу идёт само удержание.
+                #
+                # Число берётся у отчёта, а не у `amounts`: агрегат недели
+                # лежит в `fin_weeks`, колонки под эту статью там нет, и
+                # считается она по строкам отчёта о реализации. Ровно так же
+                # здесь появляется комиссия по артикулам.
+                - (ZERO if ad_spend is None else self.ad_deductions)
                 + totals.cost
                 + (ad_spend if ad_spend is not None else ZERO)
             )
@@ -929,10 +1008,95 @@ class ProfitReport:
         )
 
     @property
+    def cabinet_profit(self) -> Decimal | None:
+        """Прибыль по кабинету для итога и для сообщения, или None.
+
+        Прибыль складывается только по тем артикулам, у которых она посчитана,
+        поэтому ноль из пустого множества это не «не заработали», а «не
+        посчитано ни по одному». Книга и сообщение берут это число отсюда, а
+        не считают каждое своё: разойдясь, они дали бы два ответа на один
+        вопрос.
+        """
+        return self.total_profit if self.totals.priced else None
+
+    @property
     def profit_after_tax(self) -> Decimal | None:
-        """Прибыль за вычетом оценки налога. Без режима налога нет и строки."""
+        """Прибыль за вычетом налога кабинета целиком. Лист «Налог».
+
+        Это расчёт от общей базы: из прибыли вычтена вся оценка, включая налог
+        тех артикулов, прибыль по которым не посчитана. Число честное, но
+        неоднородное, поэтому стоит оно только на листе «Налог» рядом с
+        оговоркой. В сообщении и в итоге листа артикулов стоит
+        `cabinet_after_tax`: там налог и прибыль взяты по одним и тем же
+        товарам.
+        """
         estimate = self.tax
         return None if estimate is None else estimate.after(self.total_profit)
+
+    @property
+    def tax_in_profit(self) -> Decimal | None:
+        """Налог, который из прибыли вычтен: налог артикулов с прибылью.
+
+        Сумма столбца налога минус налог тех артикулов, у которых прибыли
+        после налога нет. Именно это число вычитается из прибыли и в итоге
+        книги, и в сообщении, поэтому оно и названо: по нему селлер проверяет
+        вычитание, и других слагаемых в нём нет.
+        """
+        allocation = self.tax_by_article
+        if allocation is None:
+            return None
+        rest = allocation.total - (self.tax_without_profit or ZERO)
+        return rest.quantize(CENT, rounding=ROUND_HALF_UP)
+
+    @property
+    def cabinet_after_tax(self) -> Decimal | None:
+        """Прибыль после налога по кабинету: одно число на книгу и сообщение.
+
+        Сумма столбца «прибыль после налога», то есть прибыль минус налог тех
+        же самых товаров. Селлер читает сводку с телефона, потом открывает
+        файл, и два разных числа под одним названием стоят ему доверия к
+        обоим, поэтому источник у них один: и итоговая клетка книги, и строка
+        сообщения берутся отсюда.
+
+        Прибыль не посчитана ни по одному артикулу - здесь None, а не минус
+        налог: вычитать его не из чего.
+        """
+        allocation = self.tax_by_article
+        if allocation is None or not self.totals.priced:
+            return None
+        return sum(
+            (
+                value
+                for value in (
+                    self.after_tax_of(item, allocation.of(item.nm_id))
+                    for item in self.articles
+                )
+                if value is not None
+            ),
+            ZERO,
+        )
+
+    @property
+    def tax_outside_profit(self) -> Decimal | None:
+        """Налог, из прибыли не вычтенный, если он больше копеек округления.
+
+        Это налог артикулов без посчитанной прибыли и налог той части базы, у
+        которой артикула нет вовсе. Из прибыли он не вычитается: вычитать его
+        не из чего, а подставить ноль прибыли значило бы соврать.
+
+        Копеечная разница здесь None нарочно. Столбец округляется построчно, и
+        расхождение в пределах `Allocation.rounding_limit` это только
+        округление: оговорка о двух копейках в сводке, которую читают с
+        телефона, стоит дороже самих двух копеек. Книга называет их на листе
+        «Методология», где место есть.
+        """
+        estimate = self.tax
+        taken = self.tax_in_profit
+        if estimate is None or taken is None:
+            return None
+        rest = (estimate.amount - taken).quantize(CENT, rounding=ROUND_HALF_UP)
+        allocation = self.tax_by_article
+        return None if abs(rest) <= allocation.rounding_limit else rest
 
     @property
     def tax_by_article(self) -> Any:
@@ -1086,10 +1250,33 @@ def build(
     named = [item for item in pieces if item.nm_id is not None]
     faceless = [item for item in pieces if item.nm_id is None]
 
+    # Реклама вычитается один раз, и здесь решается, каким путём. Wildberries
+    # выставляет за неё счёт и удерживает его из отчёта о реализации строкой
+    # «Удержание», а те же деньги приходят в отчёт вторым путём: расходом по
+    # товарам из статистики кампаний. Пока удержание лежало в общей куче
+    # расходов без артикула, одни и те же рубли вычитались дважды, и на живом
+    # кабинете это было полмиллиона в год.
+    #
+    # Когда расход по товарам известен, вычитается он: реклама привязана к
+    # товару, а удержание приходит общей суммой по кабинету и разносилось бы
+    # по всем поровну, то есть и на те товары, которые не рекламировали.
+    # Когда расхода нет вовсе, вычитается удержание: это единственное, что
+    # про рекламу известно, и выбросить его значило бы потерять настоящие
+    # деньги. Обе дороги названы на листе «Методология».
+    ads_counted = not ads.available
+    # По всем строкам периода, и с артикулом, и без него: счёт приходит
+    # обезличенным, но у другого кабинета Wildberries может разнести его по
+    # товарам, и тогда он тоже обязан попасть в это число.
+    ad_deductions = sum((item.amounts.ad_deductions for item in pieces), ZERO)
+
+    def spent(amounts: Any) -> Decimal:
+        """Расходы Wildberries, которые идут в прибыль по этим строкам."""
+        return amounts.costs - (ZERO if ads_counted else amounts.ad_deductions)
+
     # Обезличка: расходы строк без артикула. Разносим пропорционально выручке,
     # потому что другого честного признака у этих строк нет. Правило названо
     # на листе «Методология», а не спрятано здесь.
-    unallocated = sum((item.amounts.costs for item in faceless), ZERO)
+    unallocated = sum((spent(item.amounts) for item in faceless), ZERO)
     weights = {
         item.nm_id: item.amounts.revenue - item.amounts.returns_amount for item in named
     }
@@ -1130,7 +1317,7 @@ def build(
         net_revenue = amounts.revenue - amounts.returns_amount
         value = None
         if cost is not None and known_commission:
-            value = (net_revenue - cost - amounts.costs - (ad or ZERO) - piece).quantize(
+            value = (net_revenue - cost - spent(amounts) - (ad or ZERO) - piece).quantize(
                 CENT, rounding=ROUND_HALF_UP
             )
         rows.append(
@@ -1152,7 +1339,9 @@ def build(
                 storage=amounts.storage,
                 acceptance=amounts.acceptance,
                 penalties=amounts.penalties,
-                deductions=amounts.deductions,
+                deductions=amounts.other_deductions,
+                ad_deductions=amounts.ad_deductions,
+                ad_deductions_counted=ads_counted,
                 ad_spend=ad,
                 unallocated=piece,
                 compensation=amounts.compensation,
@@ -1182,6 +1371,10 @@ def build(
             title=title,
             by_article=sum((getattr(item.amounts, key) for item in named), ZERO),
             faceless=sum((getattr(item.amounts, key) for item in faceless), ZERO),
+            # Рекламного удержания в обезличке нет, когда реклама вычтена
+            # расходом по товарам: иначе расшифровка обещала бы селлеру деньги
+            # в колонке, где их нет, и перестала бы сходиться с ней.
+            in_unallocated=key != AD_DEDUCTIONS_KEY or ads_counted,
         )
         for key, title in COST_ITEMS
     )
@@ -1193,6 +1386,7 @@ def build(
         articles=articles,
         unallocated=unallocated,
         unallocated_left=left,
+        ad_deductions=ad_deductions,
         costs_breakdown=breakdown,
         ads=ads,
         weeks=tuple(weeks),
@@ -1256,6 +1450,11 @@ BEFORE_TAX = "прибыль до налога"
 # Подпись блока компенсаций в листе проблем.
 COMPENSATION_BLOCK = "компенсация WB"
 
+# Подпись блока рекламного счёта. Деньги настоящие и крупные, а в расходах их
+# нет, потому что они уже вычтены другим путём: без названного блока селлер
+# решит, что отчёт их потерял.
+AD_DEDUCTION_BLOCK = "реклама, удержано WB"
+
 # Маржинальность названа «до налога» нарочно. Считается она как раньше, от
 # прибыли до налога, и смысл колонки не поменялся: маржа это свойство экономики
 # товара, по ней товары сравнивают между собой и ставят цену, а налог это
@@ -1285,7 +1484,7 @@ ARTICLE_COLUMNS: tuple[tuple[str, str | None], ...] = (
     ("Хранение, ₽", "storage"),
     ("Приёмка, ₽", "acceptance"),
     ("Штрафы, ₽", "penalties"),
-    ("Прочие удержания, ₽", "deductions"),
+    ("Прочие удержания, ₽", "other_deductions"),
     ("Реклама, ₽", None),
     ("Расходы без артикула, ₽", None),
     ("Чистая прибыль, ₽", None),
@@ -1436,7 +1635,29 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
         "сумма days[].apps[].nms[].sum по артикулу",
         "Ограничения Wildberries: не больше 50 кампаний и 31 дня за запрос, "
         "3 запроса в минуту. Без категории «Продвижение» в колонке стоит "
-        "«нет данных», а не ноль, и прибыль считается без рекламы.",
+        "«нет данных», а не ноль, и прибыль считается без рекламы. Это "
+        "статистический расход кампаний: сколько реклама отработала. Сколько "
+        "за неё выставили счётом, стоит в строке «Реклама, удержано "
+        "Wildberries» и совпадает не до копейки, потому что счёт выставляется "
+        "своим числом и попадает в отчёт о реализации своей неделей.",
+    ),
+    (
+        "Реклама, удержано Wildberries",
+        "обоснование bonusTypeName строки отчёта о реализации",
+        "сумма deduction по строкам с обоснованием «WB Продвижение»",
+        "Счёт рекламного кабинета Wildberries удерживает из отчёта о "
+        "реализации: строка приходит удержанием, а за что удержали, написано в "
+        "обосновании словами самого Wildberries. Эти же деньги приходят в "
+        "отчёт вторым путём, расходом по товарам из статистики кампаний, "
+        "поэтому в прибыль они идут один раз и только одним путём. Пока "
+        "расход по товарам известен, вычитается он, а рекламное удержание "
+        "стоит здесь справкой и в «Расходы без артикула, ₽» не входит: оно "
+        "разносилось бы по всем товарам поровну, в том числе по тем, которые "
+        "никто не рекламировал. Если расхода по товарам нет вовсе, вычитается "
+        "удержание: это всё, что про рекламу известно, и выбросить его значило "
+        "бы подарить селлеру прибыль, которой у него нет. Удержания, "
+        "обоснованные чем-то другим, остаются в «Прочих удержаниях» целиком: "
+        "незнакомое удержание расходом быть не перестаёт.",
     ),
     (
         "Расходы без артикула, ₽",
@@ -1444,7 +1665,9 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
         "разносятся пропорционально выручке артикула за вычетом возвратов",
         "Это правило, а не факт от Wildberries. Артикулы без выручки доли не "
         "получают. Если выручки нет вовсе, расходы остаются в блоке "
-        "«обезличка» и в прибыль не входят.",
+        "«обезличка» и в прибыль не входят. Рекламного счёта в этих деньгах "
+        "нет, пока расход рекламы по товарам известен: почему, написано в "
+        "строке «Реклама, удержано Wildberries».",
     ),
     (
         "Чистая прибыль, ₽",
@@ -1452,7 +1675,8 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
         "выручка - возвраты - себестоимость - расходы WB - реклама - "
         "расходы без артикула",
         "Расходы WB это комиссия, эквайринг, логистика, хранение, приёмка, "
-        "штрафы и прочие удержания.",
+        "штрафы и прочие удержания. Выставленного счёта за рекламу среди них "
+        "нет: реклама вычитается строкой «Реклама, ₽», и вычитается один раз.",
     ),
     (
         "Маржинальность до налога, %",
@@ -1506,9 +1730,13 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
         "Расходы, принятые в базу, ₽",
         "те же источники, что и в прибыли",
         "себестоимость проданного товара + удержания Wildberries без штрафов "
-        "+ реклама",
+        "и без выставленного счёта за рекламу + реклама",
         "Только на УСН «доходы минус расходы». Штрафы Wildberries в базу не "
-        "идут: такие расходы обычно не принимаются. Себестоимость принимается "
+        "идут: такие расходы обычно не принимаются. Выставленный счёт за "
+        "рекламу из удержаний вычтен, потому что реклама прибавляется строкой "
+        "рядом: дважды принятый расход занизил бы базу и обещал бы налог "
+        "меньше настоящего. Если расхода рекламы по товарам нет, в базу идёт "
+        "сам счёт. Себестоимость принимается "
         "после продажи, поэтому берётся по проданным штукам за вычетом "
         "возвращённых. Чего бот не знает, того в расходах нет: страховых "
         "взносов, зарплаты, аренды, упаковки, услуг банка и всего, что "
@@ -1689,23 +1917,16 @@ def _tax_totals(report: ProfitReport, allocation: Any) -> list[Any]:
     которой не сумма своего столбца, ломает ту самую проверку сложением.
     Поэтому разница названа отдельной строкой под итогом
     (`TAX_UNPRICED_LABEL`), и по ней строку можно проверить.
+
+    Сумму столбца прибыли после налога эта функция не считает сама:
+    `report.cabinet_after_tax` отдаёт то же число и сообщению бота. Своим
+    расчётом здесь книга и сводка однажды уже разошлись.
     """
     if allocation is None:
         return []
-    after = sum(
-        (
-            value
-            for value in (
-                report.after_tax_of(item, allocation.of(item.nm_id))
-                for item in report.articles
-            )
-            if value is not None
-        ),
-        ZERO,
-    )
     return [
         _cell(allocation.total),
-        _cell(after if report.totals.priced else None),
+        _cell(report.cabinet_after_tax),
     ]
 
 
@@ -1736,7 +1957,7 @@ def _totals_values(report: ProfitReport, allocation: Any = None) -> list[Any]:
         _cell(totals.deductions),
         _cell(totals.ad_spend),
         _cell(totals.unallocated),
-        _cell(totals.profit if totals.priced else None),
+        _cell(report.cabinet_profit),
         _cell(totals.margin),
         # Доля в прибыли в итоге всегда сто процентов и не значит ничего.
         NOT_SUMMABLE,
@@ -1771,6 +1992,40 @@ def _compensation_note(item: ArticleProfit) -> str:
     if item.compensation_reasons:
         reasons = "; ".join(item.compensation_reasons)
         text += f" Обоснование Wildberries: {reasons}."
+    return text
+
+
+def _ad_deduction_note(report: ProfitReport) -> str:
+    """Куда делся рекламный счёт. Главный вопрос здесь «почему не вычли».
+
+    Пустая строка в блоке была бы хуже её отсутствия: деньги большие, и
+    селлер, не найдя их в расходах, решит, что отчёт их потерял. Поэтому
+    рядом стоит и расход из статистики кампаний, и разница между двумя
+    числами, и сказано, какое из них вычтено.
+    """
+    text = (
+        "Столько Wildberries удержал за рекламу: выставил счёт рекламного "
+        "кабинета и забрал его из отчёта о реализации. В расходы эта сумма "
+        "второй раз не идёт, потому что расход рекламы уже вычтен по товарам "
+        "в колонке «Реклама, ₽»: там видно, какой именно товар рекламировали, "
+        "а удержание приходит общей суммой по кабинету и разошлось бы поровну "
+        "по всем, включая те, что никто не рекламировал."
+    )
+    spend = report.total_ad_spend
+    if spend is not None:
+        gap = (spend - report.ad_deductions).quantize(CENT, rounding=ROUND_HALF_UP)
+        text += (
+            f" Статистика кампаний за период даёт {_cell(spend)} ₽, то есть на "
+            f"{_cell(gap)} ₽ больше удержанного. Числа и не обязаны совпасть: "
+            "статистика считает отработавшую рекламу по дням периода, а счёт "
+            "Wildberries выставляет своим числом и удерживает той неделей, "
+            "которой дойдёт до отчёта. Разницу так же показывает /ads, двумя "
+            "цифрами расхода."
+        )
+    text += (
+        " Удержания с другим обоснованием из расходов никуда не делись, они в "
+        "колонке «Прочие удержания, ₽»."
+    )
     return text
 
 
@@ -2298,6 +2553,19 @@ def excel_sheets(report: ProfitReport) -> list:
         ]
         for item in report.compensations
     ]
+    # Рекламный счёт. Стоит перед обезличкой, потому что раньше он лежал
+    # внутри неё и вычитался вторым разом: деньги большие, и селлер обязан
+    # найти их по имени, а не считать, что они пропали из расходов.
+    if report.ad_deductions != ZERO and not report.ad_deductions_counted:
+        problems.append(
+            [
+                AD_DEDUCTION_BLOCK,
+                None,
+                "",
+                _cell(report.ad_deductions),
+                _ad_deduction_note(report),
+            ]
+        )
     if report.unallocated != ZERO:
         problems.append(
             [
