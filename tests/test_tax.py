@@ -1516,21 +1516,23 @@ def seller_with_ad_invoice(db_path):
 def test_the_ad_invoice_does_not_land_in_the_tax_base_twice(
     seller_with_ad_invoice, db_path
 ):
-    """Счёт за рекламу не меняет базу налога: реклама в ней уже есть.
+    """Рекламные рубли входят в базу один раз, но и не меньше одного раза.
 
     Числа руками. Удержания недели теперь 900: 400 прочих и 500 рекламных.
     Расходы: комиссия 2000 + эквайринг 300 + логистика 800 + хранение 100 +
     приёмка 50 + штрафы 200 + удержания 900 = 4350. Штрафы не принимаются,
-    остаётся 4150. Из них вычитается рекламный счёт 500, потому что реклама
-    прибавляется своей строкой: 3650. Плюс себестоимость 3400 и расход
-    рекламы 400, итого 7450.
+    остаётся 4150. Из них вычитается не весь счёт, а заменённая его часть:
+    статистика кампаний дала 400, и ровно 400 из счёта в расходах заменены
+    расходом по товарам. 4150 - 400 = 3750, плюс себестоимость 3400 и расход
+    рекламы 400, итого 7550.
 
-    Ровно столько же выходило у той же недели без строки счёта, и это и есть
-    проверка: счёт Wildberries это второе имя денег, которые в базе уже
-    посчитаны, и добавить его к неделе не должно менять ни базы, ни налога.
+    Рекламных денег в расходах при этом 500, а не 900 и не 400: остаток счёта
+    (100) Wildberries правда удержал, а дни показов за него в неделю не
+    попали. Вычти счёт целиком, и в расходах осталось бы 400 вместо 500, то
+    есть бот насчитал бы налог с денег, которых у селлера нет.
 
-    Без починки те же расходы вышли бы 7950, база 5050, а налог 757.50 вместо
-    832.50: бот обещал бы налог на 75 рублей меньше настоящего.
+    Без починки двойного счёта расходы вышли бы 7950, база 5050, а налог
+    757.50: бот обещал бы налог меньше настоящего.
     """
     tax.set_rule(seller_with_ad_invoice, tax.USN_INCOME_MINUS, 15, path=db_path)
     report = report_of(seller_with_ad_invoice, db_path)
@@ -1538,16 +1540,22 @@ def test_the_ad_invoice_does_not_land_in_the_tax_base_twice(
 
     assert report.ad_deductions == Decimal("500")
     assert report.total_ad_spend == Decimal("400")
-    assert estimate.expenses == Decimal("7450")
-    assert estimate.base == Decimal("5550.00")
-    assert estimate.amount == Decimal("832.50")
+    assert report.ad_replaced == Decimal("400")
+    assert report.ad_uncovered == Decimal("100")
+    assert estimate.expenses == Decimal("7550")
+    assert estimate.base == Decimal("5450.00")
+    assert estimate.amount == Decimal("817.50")
 
 
-def test_the_base_is_the_same_with_the_invoice_row_and_without_it(db_path):
-    """Одна и та же неделя с рекламным счётом и без него даёт одну базу.
+def test_the_base_differs_by_the_part_of_the_invoice_stats_did_not_explain(db_path):
+    """Неделя со счётом и неделя без него расходятся ровно на остаток счёта.
 
-    Второй кабинет собран из тех же строк без строки счёта. Если бы счёт
-    принимался в расходы вторым разом, базы разошлись бы ровно на него.
+    Второй кабинет собран из тех же строк без строки счёта: расход рекламы по
+    товарам у обоих 400, а удержано 500 только у одного. Базы обязаны
+    разойтись на 100, и это не двойной счёт, а те деньги, которые Wildberries
+    забрал у одного кабинета и не забрал у другого. Разойдись они на все 500,
+    счёт попал бы в базу вторым разом; сойдись в одно число, из расходов
+    пропали бы настоящие 100.
     """
     bare = db.admin_repo(db_path).ensure_client(7575)
     finance.save_rows(bare, ROWS, path=db_path)
@@ -1571,8 +1579,12 @@ def test_the_base_is_the_same_with_the_invoice_row_and_without_it(db_path):
     without = report_of(bare, db_path).tax
     with_invoice = report_of(billed, db_path).tax
 
-    assert without.expenses == with_invoice.expenses == Decimal("7450")
-    assert without.amount == with_invoice.amount == Decimal("832.50")
+    assert without.expenses == Decimal("7450")
+    assert with_invoice.expenses == Decimal("7550")
+    # Разница это ровно неразобранный остаток счёта, а не весь счёт.
+    assert with_invoice.expenses - without.expenses == Decimal("100")
+    assert without.amount == Decimal("832.50")
+    assert with_invoice.amount == Decimal("817.50")
 
 
 def test_without_campaign_stats_the_ad_invoice_goes_into_the_base_itself(
@@ -1586,8 +1598,11 @@ def test_without_campaign_stats_the_ad_invoice_goes_into_the_base_itself(
 
     Числа руками: 4150 расходов без штрафов, рекламный счёт из них не
     вычитается, расход рекламы не прибавляется: 4150 + 3400 себестоимости =
-    7550. Это на 100 больше, чем с известной статистикой, потому что счёт
-    (500) больше статистического расхода (400).
+    7550. Столько же выходит и с известной статистикой этой недели, и это не
+    совпадение: рекламных денег в базе ровно столько, сколько их в большем из
+    двух источников, а здесь больше счёт (500 против 400). Разница между
+    путями не в сумме, а в том, что при известной статистике расход привязан к
+    товару, и в том, что без неё отчёт честно говорит о неполных расходах.
     """
     tax.set_rule(seller_with_ad_invoice, tax.USN_INCOME_MINUS, 15, path=db_path)
     report = profit.build(

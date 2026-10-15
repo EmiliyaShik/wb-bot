@@ -1157,12 +1157,15 @@ async def test_profit_offers_periods_and_only_queues_the_work(seller, db_path):
     message = FakeMessage()
     await handlers_profit.profit_command(FakeUpdate(telegram_id, message), None, path=db_path)
     buttons = message.sent[0][1]["reply_markup"].inline_keyboard
-    assert [row[0].callback_data for row in buttons] == [
+    # Относительные кнопки стоят первыми и считаются как раньше. Названные
+    # месяцы и «свои даты» идут ниже: у них свой, точный способ счёта.
+    assert [row[0].callback_data for row in buttons[:4]] == [
         "profit:week",
         "profit:month",
         "profit:quarter",
         "profit:year",
     ]
+    assert buttons[-1][0].callback_data == "profit:custom"
 
     query = FakeQuery("profit:month", FakeMessage())
     await handlers_profit.period_chosen(
@@ -1660,3 +1663,170 @@ def test_the_book_and_the_message_name_the_ad_invoice_by_its_own_name(db_path):
 
     text = str(handlers_profit.summary_text(report))
     assert "удержал 400" in text
+
+
+# --- счёт и статистика живут в разных днях ------------------------------------
+#
+# Wildberries выставляет счёт рекламного кабинета одной неделей, а показы, за
+# которые он выставлен, были в другие дни. На годе два числа почти сходятся, и
+# замена счёта расходом по товарам работала. На коротком периоде счёт больше
+# отработавшей в нём рекламы, и пока из расходов убирался весь счёт, разница
+# исчезала из отчёта совсем: расходы без артикула уходили в минус, а селлер
+# видел прибыль, которой у него нет. На живом кабинете за неделю это выглядело
+# как прибыль 1094.70 при настоящем убытке 1628.30.
+#
+# Строка добровольной выплаты ниже это не выдумка для теста: Wildberries
+# возвращает деньги за испорченный товар тем же полем `deduction`, но с
+# минусом. У владельца за квартал это 28 тысяч, и именно из-за них расходы без
+# артикула у неё отрицательные по-настоящему, а не из-за рекламы.
+GOODWILL_ROW = {
+    "reportId": 1,
+    "rrdId": 10,
+    "dateFrom": "2026-09-01",
+    "dateTo": "2026-09-07",
+    "docTypeName": "",
+    "sellerOperName": "Удержание",
+    "bonusTypeName": (
+        "Добровольная выплата за товары, пострадавшие в результате "
+        "обстоятельств непреодолимой силы, документ №2298944"
+    ),
+    "deduction": -1000,
+}
+
+
+def test_on_a_short_period_the_invoice_is_not_removed_beyond_what_was_replaced(
+    db_path,
+):
+    """Счёт больше статистики: остаток счёта остаётся расходом.
+
+    Числа руками. Счёт 400, а статистика кампаний за тот же период дала
+    только 100 (у артикула 111): остальные показы были в другие дни, и в этот
+    период они не попали. Заменить можно ровно 100, остаток 300 остаётся
+    расходом и разносится вместе с обезличкой: 300 служебных + 50 транзитных
+    + 300 остатка = 650.
+
+    Доли: 650 * 3200 / 4200 = 495.24 у 111 и 650 * 1000 / 4200 = 154.76 у 222.
+    Прибыль 111: 3200 - 500 - 460 - 60 - 200 - 40 - 10 - 100 рекламы
+    - 495.24 = 1334.76. Прибыль 222: 1000 - 900 - 170 - 20 - 100 - 10 - 30
+    - 154.76 = -384.76.
+
+    Главное здесь не доли, а сумма: рекламных денег в расходах 400, то есть
+    ровно столько, сколько Wildberries удержал. Старое правило убирало весь
+    счёт и возвращало 100, и 300 рублей настоящего расхода исчезали из отчёта.
+    """
+    client_id = seed(db_path, AD_DEDUCTION_ROWS, AD_DEDUCTION_COSTS, telegram_id=8686)
+    report = report_of(client_id, db_path, ads=profit.AdSpend({111: Decimal("100")}))
+
+    assert report.ad_deductions == Decimal("400")
+    assert report.total_ad_spend == Decimal("100")
+    assert report.ad_replaced == Decimal("100")
+    assert report.ad_uncovered == Decimal("300")
+
+    # Обезличка положительная, и рекламная механика её вниз не тянет: в неё
+    # вошёл остаток счёта, а не минус от него.
+    assert report.unallocated == Decimal("650")
+    assert article(report, 111).unallocated == Decimal("495.24")
+    assert article(report, 222).unallocated == Decimal("154.76")
+    assert article(report, 111).profit == Decimal("1334.76")
+    assert article(report, 222).profit == Decimal("-384.76")
+
+    # Рекламных денег в расходах ровно столько, сколько удержал Wildberries:
+    # не 100 (тогда 300 потерялись бы) и не 500 (тогда 100 вычлись бы дважды).
+    assert (report.total_ad_spend or Decimal("0")) + report.ad_uncovered == Decimal(
+        "400"
+    )
+    # Расшифровка обезлички сходится с ней самой, а рекламная строка в ней
+    # показывает остаток счёта, а не весь счёт.
+    parts = {item.key: item.in_pool for item in report.faceless_parts}
+    assert parts == {
+        profit.AD_DEDUCTIONS_KEY: Decimal("300"),
+        "other_deductions": Decimal("350"),
+    }
+    assert sum(parts.values(), Decimal("0")) == report.unallocated
+
+
+def test_the_faceless_minus_from_wildberries_paying_the_seller_stays_a_minus(db_path):
+    """Законный минус остаётся минусом: его делает не реклама, а выплата WB.
+
+    Добровольная выплата за испорченный товар приходит удержанием с минусом,
+    и расходы без артикула от неё отрицательные по-настоящему: Wildberries
+    вернул больше, чем забрал. Трогать такой минус нельзя, иначе отчёт
+    спрячет деньги, которые селлер получил.
+
+    Числа руками: 300 служебных + 50 транзитных - 1000 выплаты = -650. Счёт
+    400 статистика объяснила целиком (300 + 100), поэтому остатка нет, и в
+    обезличке рекламы нет вовсе: весь её минус до копейки это выплата.
+    """
+    client_id = seed(
+        db_path,
+        AD_DEDUCTION_ROWS + [GOODWILL_ROW],
+        AD_DEDUCTION_COSTS,
+        telegram_id=8787,
+    )
+    report = report_of(client_id, db_path)
+
+    assert report.ad_replaced == Decimal("400")
+    assert report.ad_uncovered == Decimal("0")
+    assert report.unallocated == Decimal("-650")
+    parts = {item.key: item.in_pool for item in report.faceless_parts}
+    assert parts == {"other_deductions": Decimal("-650")}
+    assert profit.AD_DEDUCTIONS_KEY not in parts
+
+    # И отчёт об этом минусе говорит вслух, вместе с составом: молчание
+    # оставило бы селлера с необъяснённой прибавкой к прибыли.
+    text = str(handlers_profit.summary_text(report))
+    assert "-650" in text
+    assert "прочие удержания -650" in text
+
+    # Та же неделя, но статистика объяснила из счёта только 100. Минус от
+    # выплаты остался, а реклама его не углубила: её вклад в обезличку это
+    # остаток счёта, то есть плюс 300, и ниже -650 обезличка не опускается
+    # ни на каком расходе по товарам.
+    partly = report_of(client_id, db_path, ads=profit.AdSpend({111: Decimal("100")}))
+    assert partly.ad_uncovered == Decimal("300")
+    assert partly.unallocated == Decimal("-350")
+    assert partly.unallocated > report.unallocated
+
+
+def test_on_a_long_period_the_statistics_cover_the_invoice_and_it_is_counted_once(
+    db_path,
+):
+    """Статистика больше счёта: счёт заменён целиком и второй раз не вычтен.
+
+    Так выглядит год живого кабинета: статистика кампаний 531 359.55 против
+    счёта 497 539, и поведение обязано остаться прежним. Здесь то же в малом:
+    статистика 600 (500 у 111 и 100 у 222) против счёта 400.
+
+    Числа руками: обезличка только служебная, 300 + 50 = 350. Доли 266.67 и
+    83.33. Прибыль 111: 3200 - 500 - 460 - 60 - 200 - 40 - 10 - 500 рекламы
+    - 266.67 = 1163.33. Прибыль 222: 1000 - 900 - 170 - 20 - 100 - 10 - 30
+    - 100 - 83.33 = -413.33.
+
+    Рекламных денег в расходах 600: больше, чем удержано счётом, потому что
+    часть показов этого периода Wildberries выставит счётом позже. Дважды не
+    вычтено ничего.
+    """
+    client_id = seed(db_path, AD_DEDUCTION_ROWS, AD_DEDUCTION_COSTS, telegram_id=8888)
+    report = report_of(
+        client_id,
+        db_path,
+        ads=profit.AdSpend({111: Decimal("500"), 222: Decimal("100")}),
+    )
+
+    assert report.total_ad_spend == Decimal("600")
+    assert report.ad_replaced == Decimal("400")
+    assert report.ad_uncovered == Decimal("0")
+    assert report.unallocated == Decimal("350")
+    assert article(report, 111).profit == Decimal("1163.33")
+    assert article(report, 222).profit == Decimal("-413.33")
+
+    # Сумма расходов, вошедших в прибыль: 770 по 111, 330 по 222, 600 рекламы
+    # и 350 обезлички. Рекламных денег здесь 600, а не 1000.
+    spent = sum(
+        (
+            item.wb_costs + (item.ad_spend or Decimal("0")) + item.unallocated
+            for item in report.priced
+        ),
+        Decimal("0"),
+    )
+    assert spent == Decimal("2050")

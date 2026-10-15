@@ -1071,7 +1071,15 @@ async def test_ads_offers_periods_and_only_queues_the_work(cabinet, db_path):
     message = FakeMessage()
     await handlers_ads.ads_command(FakeUpdate(telegram_id, message), None, path=db_path)
     buttons = message.sent[0][1]["reply_markup"].inline_keyboard
-    assert [row[0].callback_data for row in buttons] == ["ads:week", "ads:month", "ads:quarter"]
+    # Относительные кнопки стоят первыми и считаются как раньше. Названные
+    # месяцы и «свои даты» идут ниже: у рекламы они почти даром, расход лежит
+    # по суткам.
+    assert [row[0].callback_data for row in buttons[:3]] == [
+        "ads:week",
+        "ads:month",
+        "ads:quarter",
+    ]
+    assert buttons[-1][0].callback_data == "ads:custom"
 
     query = FakeQuery("ads:month", FakeMessage())
     await handlers_ads.period_chosen(

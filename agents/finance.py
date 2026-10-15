@@ -36,15 +36,17 @@
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
+import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-from core import db, queue, wbapi
+from core import config, db, queue, wbapi
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,27 @@ __all__ = [
     "COLLECT_KIND",
     "PERIODS",
     "PERIOD_TITLES",
+    "DATES",
+    "MONTH_NAMES",
+    "Period",
+    "PeriodError",
+    "BAD_FORMAT",
+    "BAD_ORDER",
+    "TOO_EARLY",
+    "TOO_LATE",
+    "TOO_LONG",
+    "days_words",
+    "parse_dates",
+    "period_of",
+    "period_of_task",
+    "period_title",
+    "month_period",
+    "recent_months",
+    "custom_max_days",
+    "month_buttons",
+    "exact_weeks",
+    "row_amounts",
+    "row_taken",
     "SALE",
     "RETURN",
     "COMPENSATION",
@@ -108,12 +131,67 @@ COLLECT_KIND = "finance_collect"
 # проекте, поэтому работа всегда через очередь.
 PERIODS: dict[str, int] = {"week": 7, "month": 31, "quarter": 92, "year": 365}
 
+
+def days_words(days: int) -> str:
+    """«7 дней», «31 день», «92 дня»: число и слово рядом, согласованно."""
+    tail = abs(int(days)) % 100
+    if 11 <= tail <= 14:
+        word = "дней"
+    elif tail % 10 == 1:
+        word = "день"
+    elif tail % 10 in (2, 3, 4):
+        word = "дня"
+    else:
+        word = "дней"
+    return f"{days} {word}"
+
+
+# Названия относительных периодов считаются из PERIODS, а не выписаны рядом
+# вторым списком. Число дней в названии стоит не для красоты: кнопка «Месяц»
+# отсчитывала 31 день назад от сегодня и забирала каждую неделю, которая этот
+# отрезок хотя бы задела, а владелец читала её как календарный месяц и сводила
+# с бухгалтерией. Названный месяц и ручной период называет `period_title`:
+# они считаются по датам операций, и путать их с этими кнопками нельзя.
 PERIOD_TITLES: dict[str, str] = {
-    "week": "последняя неделя",
-    "month": "месяц",
-    "quarter": "квартал",
-    "year": "год",
+    name: f"последние {days_words(days)}" for name, days in PERIODS.items()
 }
+
+# Период, заданный датами: кнопка месяца и ручной ввод. Вид у них один
+# намеренно. Кнопка «Сентябрь» это тот же ручной период, просто названный,
+# и считать её вторым способом значило бы завести второе определение месяца.
+DATES = "dates"
+
+MONTH_NAMES: tuple[str, ...] = (
+    "январь",
+    "февраль",
+    "март",
+    "апрель",
+    "май",
+    "июнь",
+    "июль",
+    "август",
+    "сентябрь",
+    "октябрь",
+    "ноябрь",
+    "декабрь",
+)
+
+# Почему период не принят. Код, а не готовая фраза: текст для селлера живёт
+# рядом с хендлером, как и все остальные тексты бота.
+BAD_FORMAT = "format"
+BAD_ORDER = "order"
+TOO_EARLY = "early"
+TOO_LATE = "future"
+TOO_LONG = "long"
+
+# Предел ручного периода в сутках по умолчанию. Триста шестьдесят шесть это
+# самый длинный период, который бот и так умеет (кнопка года это 365 дней),
+# плюс сутки на високосный год: чтобы «01.01 - 31.12» принималось целиком.
+CUSTOM_MAX_DAYS_DEFAULT = 366
+
+# Сколько кнопок месяцев показывать. Полгода назад закрывает и прошлый
+# квартал, и прошлый месяц, а на экране телефона это три ряда по две кнопки.
+MONTH_BUTTONS_DEFAULT = 6
 
 # Данные отчёта о реализации начинаются 29 января 2024 года, раньше просить
 # нечего.
@@ -468,6 +546,15 @@ class Week:
     # Выгрузка не упёрлась в потолок страниц. Неполная неделя обязана
     # отличаться от полной: иначе половина года выглядит как год.
     complete: bool = True
+    # Период обрезал эту неделю: взята не вся, а её часть по датам операций.
+    # Сверять такую часть не с чем, и это не то же самое, что «Wildberries не
+    # отдал итоги»: итоги у нас есть, но они на неделю целиком. Поэтому
+    # признак отдельный, а не ещё одно значение `verified`.
+    clipped: bool = False
+    # Строки недели без даты операции, которые в обрезанную неделю взять
+    # некуда. На живом кабинете таких нет ни одной, и денег в них нет вовсе,
+    # но молча потерять строку нельзя: отчёт называет их числом.
+    undated: int = 0
     # Типы документов, которых бот не знает. Пусто у всех обычных недель.
     # Хранится рядом с признаком полноты, в `control_payload`: незнакомый тип
     # это не ошибка выгрузки, но и не мелочь, о которой можно промолчать.
@@ -545,6 +632,10 @@ class FinanceReport:
     weeks: tuple[Week, ...] = ()
     months: tuple[Month, ...] = ()
     articles: tuple[Article, ...] = ()
+    # Период считан по датам операций, а не целыми неделями Wildberries.
+    # Отчёт обязан говорить об этом вслух: способ счёта виден только в
+    # заголовке, а в бухгалтерию уходит число.
+    exact: bool = False
 
     @property
     def totals(self) -> Amounts:
@@ -564,8 +655,26 @@ class FinanceReport:
 
     @property
     def unverified(self) -> tuple[Week, ...]:
-        """Недели, для которых агрегат WB не получен: сверка не выполнена."""
-        return tuple(week for week in self.weeks if not week.verified)
+        """Недели, для которых агрегат WB не получен: сверка не выполнена.
+
+        Обрезанные периодом недели сюда не попадают: про них говорится
+        отдельно и другими словами. «Wildberries не отдал итоги» и «итоги есть,
+        но они на неделю целиком» это разные вещи, и одна подсказка «запросите
+        период ещё раз чуть позже» к обрезанной неделе не подходит вовсе.
+        """
+        return tuple(
+            week for week in self.weeks if not week.verified and not week.clipped
+        )
+
+    @property
+    def clipped(self) -> tuple[Week, ...]:
+        """Недели, вошедшие в период не целиком: сверить их нечем."""
+        return tuple(week for week in self.weeks if week.clipped)
+
+    @property
+    def undated(self) -> int:
+        """Строки без даты операции, которые в обрезанные недели не взяты."""
+        return sum(week.undated for week in self.weeks)
 
     @property
     def incomplete(self) -> tuple[Week, ...]:
@@ -588,6 +697,8 @@ class FinanceReport:
 
     @property
     def title(self) -> str:
+        if self.exact:
+            return period_title(self.date_from, self.date_to)
         return PERIOD_TITLES.get(self.period, self.period)
 
 
@@ -602,6 +713,237 @@ def period_bounds(period: str, today: date | None = None) -> tuple[date, date]:
     end = today or datetime.now(timezone.utc).date()
     start = max(end - timedelta(days=days), DATA_SINCE)
     return start, end
+
+
+class PeriodError(ValueError):
+    """Период не принят. Причина названа кодом, фраза для селлера у хендлера.
+
+    Отдельное исключение, а не возврат `None`: ручной ввод и подделанная
+    кнопка приходят в одну и ту же функцию, и «не принято» у них одно, а
+    объяснение разное. Код причины и есть то, что хендлер превращает в
+    подсказку с примером.
+    """
+
+    def __init__(self, reason: str, limit: int = 0) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.limit = limit
+
+
+@dataclass(frozen=True)
+class Period:
+    """Период отчёта: границы и способ счёта.
+
+    `exact` это не украшение, а развилка расчёта. Относительная кнопка берёт
+    каждую неделю Wildberries, которая период хотя бы задела, и сверяется с
+    итогами отчёта целиком. Названный месяц и ручной период считаются по датам
+    операций (`fin_rows.rr_dt`), поэтому в них попадает ровно запрошенное, а
+    сверить с итогами Wildberries можно только недели, вошедшие целиком:
+    готовых сумм на часть недели у Wildberries нет вовсе.
+    """
+
+    key: str
+    date_from: date
+    date_to: date
+    exact: bool = False
+
+    @property
+    def days(self) -> int:
+        return (self.date_to - self.date_from).days + 1
+
+    @property
+    def bounds(self) -> tuple[date, date]:
+        return self.date_from, self.date_to
+
+    @property
+    def title(self) -> str:
+        if self.exact:
+            return period_title(self.date_from, self.date_to)
+        return PERIOD_TITLES.get(self.key, self.key)
+
+    @property
+    def payload(self) -> dict[str, str]:
+        """Период в задаче очереди. Точный период едет датами, а не именем.
+
+        Иначе работа, взятая воркером на следующих сутках, посчитала бы другой
+        отрезок: у относительной кнопки «сегодня» подвижно, у названного
+        месяца нет.
+        """
+        if not self.exact:
+            return {"period": self.key}
+        return {
+            "period": self.key,
+            "from": self.date_from.isoformat(),
+            "to": self.date_to.isoformat(),
+        }
+
+
+def month_end(day: date) -> date:
+    """Последний день того месяца, в который попал день."""
+    return day.replace(day=calendar.monthrange(day.year, day.month)[1])
+
+
+def period_title(date_from: date, date_to: date) -> str:
+    """Название периода по датам: «сентябрь 2026» или «свои даты».
+
+    Месяцем период называется только тогда, когда он и есть месяц целиком.
+    Иначе селлер прочитал бы «сентябрь» там, где посчитаны три его дня: такая
+    подпись в бухгалтерии стоит дороже, чем безымянные даты.
+    """
+    whole_month = (
+        date_from.day == 1
+        and (date_from.year, date_from.month) == (date_to.year, date_to.month)
+        and date_to == month_end(date_from)
+    )
+    if whole_month:
+        return f"{MONTH_NAMES[date_from.month - 1]} {date_from.year}"
+    return "свои даты"
+
+
+def custom_max_days() -> int:
+    """Предел ручного периода в сутках. Настройка владельца, не факт про WB."""
+    try:
+        section = config.settings().get("reports") or {}
+        value = int(section.get("custom_max_days", CUSTOM_MAX_DAYS_DEFAULT))
+    except (KeyError, TypeError, ValueError, OSError):
+        return CUSTOM_MAX_DAYS_DEFAULT
+    return value if value > 0 else CUSTOM_MAX_DAYS_DEFAULT
+
+
+def month_buttons() -> int:
+    """Сколько кнопок месяцев показывать. Ноль и меньше это «не показывать»."""
+    try:
+        section = config.settings().get("reports") or {}
+        return int(section.get("month_buttons", MONTH_BUTTONS_DEFAULT))
+    except (KeyError, TypeError, ValueError, OSError):
+        return MONTH_BUTTONS_DEFAULT
+
+
+# Дата, как её пишет человек: 01.09.2026, 1.9.26, 2026-09-01, с точкой,
+# дефисом или косой чертой. Разделитель периода отдельно не разбирается:
+# берутся две найденные даты, а что между ними, тире или пробел, неважно.
+_DATE_PART = re.compile(r"(\d{1,4})[.\-/](\d{1,2})[.\-/](\d{1,4})")
+
+
+def _one_date(parts: tuple[str, str, str]) -> date | None:
+    """Одна дата из трёх найденных чисел. Непохожее на дату это None."""
+    first, second, third = parts
+    try:
+        if len(first) == 4:
+            return date(int(first), int(second), int(third))
+        year = int(third)
+        if year < 100:
+            year += 2000
+        return date(year, int(second), int(first))
+    except ValueError:
+        return None
+
+
+def parse_dates(text: Any) -> tuple[date, date]:
+    """Две даты из того, что написал человек. Непонятное это `PeriodError`.
+
+    Принимается так, как пишут: «01.09.2026 - 30.09.2026», «1.9.2026-30.9.2026»,
+    две даты через пробел, ГГГГ-ММ-ДД. Границы и длина здесь не проверяются,
+    это дело `period_of`: разбор строки и правила периода это разные вопросы, и
+    объяснять селлеру их надо тоже по-разному.
+    """
+    found = _DATE_PART.findall(str(text or ""))
+    if len(found) != 2:
+        raise PeriodError(BAD_FORMAT)
+    first, second = _one_date(found[0]), _one_date(found[1])
+    if first is None or second is None:
+        raise PeriodError(BAD_FORMAT)
+    return first, second
+
+
+def period_of(
+    period: "str | Period" = "week",
+    today: date | None = None,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    max_days: int | None = None,
+) -> Period:
+    """Период по имени кнопки или по датам. Единственная дверь для обоих.
+
+    Даты приходят из `callback_data` или из текста клиента, то есть сочинить
+    их может кто угодно. Поэтому проверяются они здесь, в функции, а не
+    клавиатурой: нарисованные кнопки чужой клиент Telegram не ограничивают.
+    Подделанный период не считается вовсе, и у Wildberries по нему ничего не
+    просится: начало не раньше первых данных отчёта о реализации, конец не
+    позже сегодня, длина не больше предела из конфига.
+    """
+    if isinstance(period, Period):
+        return period
+    key = str(period)
+    if key != DATES:
+        if key not in PERIODS:
+            raise ValueError(f"неизвестный период: {key}")
+        start, end = period_bounds(key, today)
+        return Period(key=key, date_from=start, date_to=end)
+    if date_from is None or date_to is None:
+        raise PeriodError(BAD_FORMAT)
+    last = today or datetime.now(timezone.utc).date()
+    if date_from > date_to:
+        raise PeriodError(BAD_ORDER)
+    if date_to < DATA_SINCE:
+        raise PeriodError(TOO_EARLY)
+    if date_from > last:
+        raise PeriodError(TOO_LATE)
+    # Края подрезаются молча, потому что молчать тут не о чем: отчёт печатает
+    # те даты, по которым посчитал, и селлер видит их в заголовке.
+    start = max(date_from, DATA_SINCE)
+    end = min(date_to, last)
+    limit = int(max_days if max_days else custom_max_days())
+    if (end - start).days + 1 > limit:
+        raise PeriodError(TOO_LONG, limit)
+    return Period(key=DATES, date_from=start, date_to=end, exact=True)
+
+
+def month_period(
+    year: Any, month: Any, today: date | None = None, *, max_days: int | None = None
+) -> Period:
+    """Названный месяц как период. Проверка та же, что у ручного ввода.
+
+    Номер месяца и год приходят кнопкой, то есть от клиента: несуществующий
+    месяц это `PeriodError`, а не падение.
+    """
+    try:
+        first = date(int(year), int(month), 1)
+    except (TypeError, ValueError):
+        raise PeriodError(BAD_FORMAT) from None
+    return period_of(
+        DATES, today, date_from=first, date_to=month_end(first), max_days=max_days
+    )
+
+
+def recent_months(
+    count: int | None = None, *, today: date | None = None
+) -> tuple[Period, ...]:
+    """Последние закончившиеся месяцы, свежий первым.
+
+    Текущий месяц кнопкой не предлагается. «Октябрь» в середине октября это не
+    месяц, а его половина, а кнопка обещает календарный месяц целиком; за
+    недоделанным месяцем есть относительные кнопки и свои даты. Список
+    кончается там, где кончаются данные отчёта о реализации.
+    """
+    last = today or datetime.now(timezone.utc).date()
+    year, month = last.year, last.month
+    found: list[Period] = []
+    for _ in range(max(int(count if count is not None else month_buttons()), 0)):
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+        # Месяц, у которого данных есть только хвост, кнопкой не предлагается.
+        # Январь 2024 начался до первых данных отчёта (29.01.2024), и кнопка
+        # «Январь» показала бы три дня под именем месяца.
+        if date(year, month, 1) < DATA_SINCE:
+            break
+        try:
+            found.append(month_period(year, month, last))
+        except PeriodError:
+            break
+    return tuple(found)
 
 
 # --- сбор из WB --------------------------------------------------------------
@@ -1026,8 +1368,62 @@ def _payload_of(raw: Any) -> _Payload:
     )
 
 
-def _report_ids(weeks: Sequence[Week]) -> set[int]:
-    return {week.report_id for week in weeks}
+def row_amounts(row: Any) -> tuple[str, Amounts]:
+    """Вид строки `fin_rows` и её статьи. Одно место на весь проект.
+
+    Раскладка строки нужна двум читателям: разрезу по артикулам и точному
+    периоду, который складывает неделю сам, по датам операций. Две копии этой
+    арифметики разошлись бы молча, а расходятся такие копии в самом дорогом:
+    в том, что считать продажей и чьи это штуки.
+    """
+    amount = db.from_kop(row["retail_amount_kop"])
+    kind = doc_kind(row["doc_type_name"], amount)
+    quantity = int(row["quantity"] or 0)
+    return kind, Amounts(
+        revenue=amount if kind == SALE else ZERO,
+        returns_amount=amount if kind == RETURN else ZERO,
+        for_pay=db.from_kop(row["ppvz_for_pay_kop"]),
+        commission=vw_of(row),
+        acquiring=db.from_kop(row["acquiring_fee_kop"]),
+        logistics=db.from_kop(row["delivery_kop"]),
+        storage=db.from_kop(row["storage_fee_kop"]),
+        acceptance=db.from_kop(row["acceptance_kop"]),
+        penalties=db.from_kop(row["penalty_kop"]),
+        deductions=db.from_kop(row["deduction_kop"]),
+        ad_deductions=(
+            db.from_kop(row["deduction_kop"])
+            if is_ad_deduction(row["bonus_type_name"])
+            else ZERO
+        ),
+        additional_payment=db.from_kop(row["additional_payment_kop"]),
+        compensation=(
+            db.from_kop(row["ppvz_for_pay_kop"]) if kind == COMPENSATION else ZERO
+        ),
+        compensation_units=quantity if kind == COMPENSATION else 0,
+        sales_count=quantity if kind == SALE else 0,
+        returns_count=quantity if kind == RETURN else 0,
+    )
+
+
+def row_taken(day: Any, week: Week, window: Period | None) -> bool:
+    """Берётся ли эта строка недели в период.
+
+    Без окна берутся все строки недели: так считался и считается любой
+    относительный период. С окном строка решается своей датой операции
+    (`rr_dt`), и ровно поэтому точный период возможен: у Wildberries эта дата
+    заполнена во всех строках и всегда лежит внутри границ своей недели.
+
+    Строка без даты операции берётся только в неделю, вошедшую целиком: в
+    обрезанной её некуда положить, а угадать половину недели нельзя. Таких
+    строк на живом кабинете нет ни одной, и денег в них нет вовсе, но
+    промолчать о пропаже всё равно не годится: неделя считает их числом.
+    """
+    if window is None:
+        return True
+    text = str(day or "")[:10]
+    if not text:
+        return not week.clipped
+    return window.date_from.isoformat() <= text <= window.date_to.isoformat()
 
 
 def articles_of(
@@ -1035,12 +1431,20 @@ def articles_of(
     weeks: Sequence[Week],
     *,
     path: str | Path | None = None,
+    window: Period | None = None,
 ) -> tuple[Article, ...]:
-    """Разрез по артикулам за те же недели. Считается по `fin_rows`."""
-    wanted = _report_ids(weeks)
+    """Разрез по артикулам за те же недели. Считается по `fin_rows`.
+
+    `window` это точный период: тогда в разрез идут только строки, чья дата
+    операции попала в его границы. Недели для чтения отбираются всё равно по
+    `report_id`: по нему в схеме стоит индекс, а по дате операции нет, и
+    новых миграций мы не пишем.
+    """
     buckets: dict[int | None, dict[str, Any]] = {}
-    for report_id in sorted(wanted):
-        for row in db.repo(client_id, path).rows("fin_rows", report_id=report_id):
+    for week in sorted(weeks, key=lambda item: item.report_id):
+        for row in db.repo(client_id, path).rows("fin_rows", report_id=week.report_id):
+            if not row_taken(row["rr_dt"], week, window):
+                continue
             nm_id = int(row["nm_id"]) if row["nm_id"] is not None else None
             bucket = buckets.setdefault(
                 nm_id,
@@ -1054,41 +1458,16 @@ def articles_of(
                     "reasons": {},
                 },
             )
-            amount = db.from_kop(row["retail_amount_kop"])
-            kind = doc_kind(row["doc_type_name"], amount)
-            quantity = int(row["quantity"] or 0)
+            kind, piece = row_amounts(row)
             # «Штук» в книге это проданное плюс возвращённое. Служебная строка
             # артикула тоже касается (логистика и хранение приходят по
             # товарам), но штук в ней нет. Компенсация тоже не даёт: товар по
             # ней выбыл, а не продался.
             if kind in (SALE, RETURN):
-                bucket["quantity"] += quantity
+                bucket["quantity"] += int(row["quantity"] or 0)
             if kind == COMPENSATION:
                 bucket["reasons"][str(row["supplier_oper_name"] or "").strip()] = None
-            bucket["amounts"] = bucket["amounts"] + Amounts(
-                revenue=amount if kind == SALE else ZERO,
-                returns_amount=amount if kind == RETURN else ZERO,
-                for_pay=db.from_kop(row["ppvz_for_pay_kop"]),
-                commission=vw_of(row),
-                acquiring=db.from_kop(row["acquiring_fee_kop"]),
-                logistics=db.from_kop(row["delivery_kop"]),
-                storage=db.from_kop(row["storage_fee_kop"]),
-                acceptance=db.from_kop(row["acceptance_kop"]),
-                penalties=db.from_kop(row["penalty_kop"]),
-                deductions=db.from_kop(row["deduction_kop"]),
-                ad_deductions=(
-                    db.from_kop(row["deduction_kop"])
-                    if is_ad_deduction(row["bonus_type_name"])
-                    else ZERO
-                ),
-                additional_payment=db.from_kop(row["additional_payment_kop"]),
-                compensation=(
-                    db.from_kop(row["ppvz_for_pay_kop"]) if kind == COMPENSATION else ZERO
-                ),
-                compensation_units=quantity if kind == COMPENSATION else 0,
-                sales_count=quantity if kind == SALE else 0,
-                returns_count=quantity if kind == RETURN else 0,
-            )
+            bucket["amounts"] = bucket["amounts"] + piece
     articles = [
         Article(
             nm_id=nm_id,
@@ -1104,16 +1483,50 @@ def articles_of(
     return tuple(articles)
 
 
-def months_of(weeks: Sequence[Week]) -> tuple[Month, ...]:
-    """Свод недель в месяц. Неделя относится к месяцу своего начала."""
+def months_of(
+    weeks: Sequence[Week], *, window: Period | None = None
+) -> tuple[Month, ...]:
+    """Свод недель в месяц. Неделя относится к месяцу своего начала.
+
+    У точного периода началом считается первый день недели, попавший в
+    период: иначе отчёт за сентябрь показал бы месяц «2026-08», потому что
+    первая его неделя началась 31 августа.
+    """
     buckets: dict[str, Month] = {}
     for week in weeks:
-        key = str(week.date_from)[:7]
+        start = str(week.date_from)[:10]
+        if window is not None:
+            start = max(start, window.date_from.isoformat())
+        key = start[:7]
         found = buckets.get(key) or Month(key=key)
         buckets[key] = replace(
             found, amounts=found.amounts + week.amounts, weeks=found.weeks + 1
         )
     return tuple(buckets[key] for key in sorted(buckets))
+
+
+_PERCENT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("commission_percent", "commission_percent"),
+    ("acquiring_percent", "acquiring_percent"),
+    ("spp", "ppvz_spp_prc"),
+    ("kvw", "ppvz_kvw_prc"),
+)
+
+
+def _collect_percent(
+    pairs: dict[str, list[tuple[Decimal, Decimal]]], row: Any
+) -> None:
+    """Складывает готовые проценты строки с весом её суммы. Свой пересчёт тут
+    запрещён: у Wildberries эти поля готовые, а наш счёт разошёлся бы с
+    кабинетом (R165)."""
+    base = db.from_kop(row["retail_price_withdisc_kop"]) or db.from_kop(
+        row["retail_amount_kop"]
+    )
+    for name, column in _PERCENT_COLUMNS:
+        value = row[column]
+        if value is None:
+            continue
+        pairs.setdefault(name, []).append((money(value), base))
 
 
 def _percents(
@@ -1124,43 +1537,125 @@ def _percents(
     for week in weeks:
         pairs: dict[str, list[tuple[Decimal, Decimal]]] = {}
         for row in db.repo(client_id, path).rows("fin_rows", report_id=week.report_id):
-            base = db.from_kop(row["retail_price_withdisc_kop"]) or db.from_kop(
-                row["retail_amount_kop"]
-            )
-            for name, column in (
-                ("commission_percent", "commission_percent"),
-                ("acquiring_percent", "acquiring_percent"),
-                ("spp", "ppvz_spp_prc"),
-                ("kvw", "ppvz_kvw_prc"),
-            ):
-                value = row[column]
-                if value is None:
-                    continue
-                pairs.setdefault(name, []).append((money(value), base))
+            _collect_percent(pairs, row)
         result.append(
             replace(week, **{name: _weighted(items) for name, items in pairs.items()})
         )
     return tuple(result)
 
 
+def exact_weeks(
+    client_id: int,
+    window: Period,
+    *,
+    path: str | Path | None = None,
+) -> tuple[Week, ...]:
+    """Недели периода, посчитанные по датам операций, а не целиком.
+
+    Плата за точность одна, и она названа в отчёте: сверить с итогами
+    Wildberries можно только неделю, вошедшую в период целиком. Готовых сумм
+    на часть недели у `sales-reports/list` нет вовсе, поэтому обрезанная
+    неделя помечается `clipped`, сверка по ней не выполняется и «сошлось» в
+    ней не стоит никогда.
+
+    Недели отбираются по `fin_weeks`, строки читаются по `report_id`: по этим
+    колонкам в схеме стоят индексы, а по дате операции нет, и новых миграций
+    мы не пишем.
+
+    Неделя, вошедшая целиком, даёт здесь те же цифры, что и её агрегат в
+    `fin_weeks`, кроме комиссии: она поднимается из `raw` построчно (поле `vw`)
+    и хранит доли копейки, а в агрегате лежит уже округлённая. Проверено на
+    живом кабинете, все 99 недель: расходится третий знак после копейки, в
+    рублях и копейках цифра та же. Основание выбрано не случайно: по этому же
+    `vw` считает комиссию артикула `/profit`, и второго определения комиссии в
+    проекте быть не должно.
+    """
+    start, end = window.date_from.isoformat(), window.date_to.isoformat()
+    repo = db.repo(client_id, path)
+    result: list[Week] = []
+    for row in repo.rows("fin_weeks", order_by="date_from"):
+        date_from, date_to = str(row["date_from"]), str(row["date_to"])
+        if date_to < start or date_from > end:
+            continue
+        payload = _payload_of(row["control_payload"])
+        week = Week(
+            report_id=int(row["report_id"]),
+            date_from=date_from,
+            date_to=date_to,
+            complete=payload.complete,
+            clipped=date_from < start or date_to > end,
+            unknown_doc_types=payload.unknown_doc_types,
+        )
+        amounts = Amounts()
+        pairs: dict[str, list[tuple[Decimal, Decimal]]] = {}
+        taken = 0
+        undated = 0
+        for item in repo.rows("fin_rows", report_id=week.report_id):
+            if not row_taken(item["rr_dt"], week, window):
+                if not str(item["rr_dt"] or ""):
+                    undated += 1
+                continue
+            _, piece = row_amounts(item)
+            amounts = amounts + piece
+            _collect_percent(pairs, item)
+            taken += 1
+        if taken == 0:
+            if week.clipped:
+                # В период не попало ни одной строки этой недели: ей тут
+                # нечего делать вовсе.
+                continue
+            # Неделя вошла целиком, а строк её в базе нет: так бывает у недель,
+            # записанных прежней версией бота. Берём агрегат недели, иначе
+            # точный период молча потерял бы её деньги.
+            amounts = _amounts_of_week(row, payload)
+        result.append(
+            replace(
+                week,
+                amounts=amounts,
+                undated=undated if week.clipped else 0,
+                checks=() if week.clipped else _checks(amounts, payload.aggregate),
+                verified=bool(payload.aggregate) and not week.clipped,
+                **{name: _weighted(items) for name, items in pairs.items()},
+            )
+        )
+    return tuple(result)
+
+
 def build(
     client_id: int,
-    period: str = "week",
+    period: "str | Period" = "week",
     *,
     today: date | None = None,
     path: str | Path | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
 ) -> FinanceReport:
-    """Отчёт за период по тому, что уже лежит в базе. В WB отсюда не ходят."""
-    date_from, date_to = period_bounds(period, today)
-    weeks = _percents(client_id, weeks_of(client_id, date_from, date_to, path=path), path=path)
+    """Отчёт за период по тому, что уже лежит в базе. В WB отсюда не ходят.
+
+    Период это имя относительной кнопки или `Period`. Точный период считается
+    по датам операций, относительный целыми неделями, как считался всегда:
+    существующие кнопки нового способа не получают намеренно, иначе цифры,
+    которые селлер уже видел, однажды молча поехали бы.
+    """
+    window = period_of(period, today, date_from=date_from, date_to=date_to)
+    if window.exact:
+        weeks = exact_weeks(client_id, window, path=path)
+    else:
+        weeks = _percents(
+            client_id,
+            weeks_of(client_id, window.date_from, window.date_to, path=path),
+            path=path,
+        )
+    slice_of = window if window.exact else None
     return FinanceReport(
         client_id=client_id,
-        period=period,
-        date_from=date_from,
-        date_to=date_to,
+        period=window.key,
+        date_from=window.date_from,
+        date_to=window.date_to,
         weeks=weeks,
-        months=months_of(weeks),
-        articles=articles_of(client_id, weeks, path=path),
+        months=months_of(weeks, window=slice_of),
+        articles=articles_of(client_id, weeks, path=path, window=slice_of),
+        exact=window.exact,
     )
 
 
@@ -1189,31 +1684,56 @@ def set_sender(fn: Callable[[int, FinanceReport, bytes], Any] | None) -> None:
     _sender = fn
 
 
-def _period_of(task: Any) -> str:
-    return str((task.payload or {}).get("period") or "week")
+def _date_of(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value or "")[:10])
+    except ValueError:
+        return None
+
+
+def period_of_task(task: Any) -> Period:
+    """Период задачи очереди. Точный приезжает датами, а не именем кнопки.
+
+    Воркер может взять работу и на следующих сутках. У относительной кнопки
+    «сегодня» подвижно, и это её свойство, а названный месяц обязан остаться
+    тем же месяцем, поэтому его границы лежат в задаче.
+    """
+    payload = getattr(task, "payload", None) or {}
+    key = str(payload.get("period") or "week")
+    if key != DATES:
+        return period_of(key)
+    return period_of(
+        DATES,
+        date_from=_date_of(payload.get("from")),
+        date_to=_date_of(payload.get("to")),
+    )
 
 
 def request_report(
-    client_id: int, period: str = "week", *, path: str | Path | None = None
+    client_id: int,
+    period: "str | Period" = "week",
+    *,
+    path: str | Path | None = None,
 ) -> queue.TaskId:
     """Ставит выгрузку в очередь. «Принято» клиенту говорит сама очередь."""
-    if period not in PERIODS:
-        raise ValueError(f"неизвестный период: {period}")
-    return queue.enqueue(client_id, TASK_KIND, {"period": period}, path=path)
+    window = period_of(period)
+    return queue.enqueue(client_id, TASK_KIND, window.payload, path=path)
 
 
 def request_collect(
-    client_id: int, period: str = "week", *, path: str | Path | None = None
+    client_id: int,
+    period: "str | Period" = "week",
+    *,
+    path: str | Path | None = None,
 ) -> queue.TaskId:
     """Ставит в очередь сбор без отправки: расписание, а не просьба клиента.
 
     `notify=False` здесь не мелочь: клиент этой задачи не просил, и «принято,
     пришлю» на неё было бы сообщением ни о чём.
     """
-    if period not in PERIODS:
-        raise ValueError(f"неизвестный период: {period}")
+    window = period_of(period)
     return queue.enqueue(
-        client_id, COLLECT_KIND, {"period": period}, notify=False, path=path
+        client_id, COLLECT_KIND, window.payload, notify=False, path=path
     )
 
 
@@ -1226,13 +1746,17 @@ async def collect_task(task: Any, *, path: str | Path | None = None) -> Collecte
     `report_id`. Требование R43 говорит «еженедельные после появления нового
     финотчёта WB», и без сбора по расписанию оно не выполнялось вовсе.
     """
-    period = _period_of(task)
-    date_from, date_to = period_bounds(period)
-    return await collect(int(task.client_id), date_from, date_to, path=path)
+    window = period_of_task(task)
+    return await collect(
+        int(task.client_id), window.date_from, window.date_to, path=path
+    )
 
 
 async def deliver(
-    client_id: int, period: str = "week", *, path: str | Path | None = None
+    client_id: int,
+    period: "str | Period" = "week",
+    *,
+    path: str | Path | None = None,
 ) -> FinanceReport:
     """Отдать отчёт по тому, что уже собрано. В WB отсюда не ходят ни разу.
 
@@ -1251,9 +1775,9 @@ async def deliver(
 async def report_task(task: Any, *, path: str | Path | None = None) -> FinanceReport:
     """Обработчик задачи клиента: собрать период и сразу отдать собранное."""
     client_id = int(task.client_id)
-    period = _period_of(task)
+    window = period_of_task(task)
     await collect_task(task, path=path)
-    return await deliver(client_id, period, path=path)
+    return await deliver(client_id, window, path=path)
 
 
 def register_jobs() -> None:

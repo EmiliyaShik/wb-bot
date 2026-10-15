@@ -42,8 +42,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
-from agents import ads
+from agents import ads, finance
 from core import queue
+from bot.handlers import period
 from bot.handlers.tariffs import client_id_of, require_module
 from bot.texts import Safe, fill
 
@@ -51,10 +52,12 @@ logger = logging.getLogger(__name__)
 
 PREFIX = "ads:"
 
-BUTTONS = (
-    ("week", "Последняя неделя"),
-    ("month", "Месяц"),
-    ("quarter", "Квартал"),
+# Подписи относительных кнопок считаются из PERIODS: число дней в подписи и
+# есть то, чего кнопке «Месяц» не хватало. Названные месяцы стоят ниже и
+# считаются точно по датам.
+BUTTONS = tuple(
+    (name, f"Последние {finance.days_words(days)}")
+    for name, days in ads.PERIODS.items()
 )
 
 ASK_PERIOD = (
@@ -62,7 +65,10 @@ ASK_PERIOD = (
     "Покажу по каждой кампании и по каждому дню: сколько ушло, сколько "
     "заказов пришло, во что обошёлся один заказ и какой получился ДРР рядом "
     "с вашей целью.\n\n"
-    "За какой период посчитать?"
+    "За какой период посчитать?\n\n"
+    "Кнопки «Последние ...» отсчитывают дни назад от сегодня. Месяц и свои "
+    "даты это ровно те дни, которые вы попросили: расход и заказы бот хранит "
+    "по суткам, поэтому месяц здесь выходит точным."
 )
 
 LONG_PERIOD = (
@@ -91,6 +97,17 @@ TROUBLE = {
 }
 
 HEADER = "📣 <b>Реклама: {title}</b>\n{period}"
+
+DATES_ACCEPTED = (
+    "Принято: {period}. Посчитаю ровно эти дни и пришлю отчёт."
+)
+
+CLIPPED = (
+    "\n\n⚠️ Вторая цифра ДРР взята из недель финансового отчёта, и не целиком "
+    "в период вошли недели: {weeks}. Выручка по ним посчитана по датам "
+    "операций, но итогами кабинета не подтверждена. Сам расход рекламы это не "
+    "задевает, он лежит по суткам."
+)
 
 TOTALS = (
     "\nРасход: <b>{spend}</b>\n"
@@ -259,15 +276,15 @@ def _campaign_line(number: int, item: Any) -> Safe:
     return Safe(", ".join(parts))
 
 
-def keyboard() -> InlineKeyboardMarkup:
+def keyboard(today: Any = None) -> InlineKeyboardMarkup:
     """Кнопки периода. Года здесь нет: столько рекламы Wildberries отдаёт
-    неделями, а копить её бот начал не раньше подключения кабинета."""
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(title, callback_data=f"{PREFIX}{key}")]
-            for key, title in BUTTONS
-        ]
-    )
+    неделями, а копить её бот начал не раньше подключения кабинета. По той же
+    причине и ручной период у рекламы короче, чем в деньгах."""
+    rows = [
+        [InlineKeyboardButton(title, callback_data=f"{PREFIX}{key}")]
+        for key, title in BUTTONS
+    ]
+    return InlineKeyboardMarkup(rows + period.month_rows(PREFIX, today=today))
 
 
 def summary_text(report: Any) -> Safe:
@@ -326,6 +343,17 @@ def summary_text(report: Any) -> Safe:
             text
             + fill(WEEKS, weeks="; ".join(_week_days(week) for week in report.weeks))
         )
+    # Расход рекламы точный всегда: он лежит по суткам. А вот выручка товара
+    # приходит неделями финансового отчёта, и в точном периоде её крайние
+    # недели обрезаны. Молчать об этом нельзя: вторая цифра ДРР считается
+    # именно от неё.
+    if report.clipped:
+        text = Safe(
+            text
+            + fill(
+                CLIPPED, weeks="; ".join(_week_days(week) for week in report.clipped)
+            )
+        )
     if report.trouble in TROUBLE:
         text = Safe(text + "\n\n" + TROUBLE[report.trouble])
     return Safe(text + FILE_NOTE)
@@ -353,12 +381,34 @@ async def period_chosen(
     *,
     path: str | Path | None = None,
 ) -> None:
-    """Кнопка периода: ставит задачу в очередь и отвечает сразу."""
+    """Кнопка периода: ставит задачу в очередь и отвечает сразу.
+
+    Период из кнопки проверяет функция, а не клавиатура: `callback_data`
+    присылает клиент. У рекламы свой предел длины (`ads.max_days`), и
+    подделанный период его не обходит.
+    """
     query = update.callback_query
     if query is None:
         return
-    period = str(query.data or "")[len(PREFIX) :]
-    if period not in dict(BUTTONS):
+    tail = str(query.data or "")[len(PREFIX) :]
+
+    if tail == period.CUSTOM:
+        await query.answer()
+        await period.ask(update, context, ads.MODULE, max_days=ads.max_days())
+        return
+
+    if tail.startswith(period.MARK):
+        window = period.period_of_callback(tail, max_days=ads.max_days())
+        if window is None:
+            await query.answer()
+            if query.message is not None:
+                await query.message.reply_text(
+                    period.stale_text("ads"), parse_mode=ParseMode.HTML
+                )
+            return
+    elif tail in dict(BUTTONS):
+        window = finance.period_of(tail)
+    else:
         await query.answer()
         return
 
@@ -367,10 +417,37 @@ async def period_chosen(
         await query.answer()
         return
 
-    task = ads.request_report(client_id, period, path=path)
+    task = ads.request_report(client_id, window, path=path)
     await query.answer("Принято" if task.created else queue.ALREADY_QUEUED)
-    if period == "quarter" and query.message is not None:
+    if window.days > finance.PERIODS["month"] and query.message is not None:
         await query.message.reply_text(LONG_PERIOD)
+
+
+async def dates_chosen(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    window: Any,
+    *,
+    path: str | Path | None = None,
+) -> None:
+    """Период прислали текстом: ставим задачу и отвечаем сообщением."""
+    message = update.effective_message
+    client_id = client_id_of(update, path)
+    if message is None or client_id is None:
+        return
+    task = ads.request_report(client_id, window, path=path)
+    await message.reply_text(
+        fill(
+            DATES_ACCEPTED,
+            period=f"{_day(window.date_from.isoformat())} - "
+            f"{_day(window.date_to.isoformat())}",
+        )
+        if task.created
+        else Safe(queue.ALREADY_QUEUED),
+        parse_mode=ParseMode.HTML,
+    )
+    if window.days > finance.PERIODS["month"]:
+        await message.reply_text(LONG_PERIOD)
 
 
 # --- доставка готового отчёта ------------------------------------------------
@@ -403,6 +480,9 @@ def register(app, *, path: str | Path | None = None) -> None:
     ads.register_jobs()
 
     guard = require_module(ads.MODULE, path=path)
+    # Ввод дат приходит текстом, мимо кнопки: доступ проверяется той же
+    # обёрткой, своей проверки здесь нет.
+    period.set_owner(ads.MODULE, guard(functools.partial(dates_chosen, path=path)))
     app.add_handler(
         CommandHandler("ads", guard(functools.partial(ads_command, path=path)))
     )

@@ -124,6 +124,17 @@ PERIODS: dict[str, int] = {
     name: days for name, days in finance.PERIODS.items() if name != "year"
 }
 
+
+def max_days() -> int:
+    """Предел периода рекламы в сутках: столько же, сколько у кнопки квартала.
+
+    У рекламы года нет намеренно: Wildberries отдаёт статистику кусками по 31
+    дню и 50 кампаний за запрос при лимите 3 запроса в минуту, и год был бы
+    работой на часы. Ручной период обязан слушаться того же предела, иначе он
+    обошёл бы решение, принятое для кнопок.
+    """
+    return max(PERIODS.values())
+
 # Сколько кампаний называем в сообщении. Остальные в файле.
 TOP_SIZE = 5
 
@@ -779,6 +790,10 @@ class AdsReport:
     # настоящего, а селлер сверяет его с разделом «Финансы» кабинета.
     fact_orphan: Decimal = ZERO
     trouble: str = ""
+    # Период считан по датам, а не целыми неделями. Для расхода это ничего не
+    # меняет (он и так лежит по суткам), а для второй цифры ДРР меняет: её
+    # выручка взята по датам операций.
+    exact: bool = False
 
     @property
     def empty(self) -> bool:
@@ -786,7 +801,14 @@ class AdsReport:
 
     @property
     def title(self) -> str:
+        if self.exact:
+            return finance.period_title(self.date_from, self.date_to)
         return finance.PERIOD_TITLES.get(self.period, self.period)
+
+    @property
+    def clipped(self) -> tuple[Any, ...]:
+        """Недели выручки, вошедшие в период не целиком: сверить их нечем."""
+        return tuple(week for week in self.weeks if getattr(week, "clipped", False))
 
     @property
     def revenue_known(self) -> bool:
@@ -884,6 +906,7 @@ def _revenue_by_article(
     date_to: date,
     *,
     path: str | Path | None = None,
+    window: Any = None,
 ) -> tuple[dict[int, Decimal], tuple[Any, ...]]:
     """Выручка товаров из недель финансового отчёта, попавших в период.
 
@@ -893,11 +916,16 @@ def _revenue_by_article(
     периода не совпадают, поэтому недели, из которых взята выручка, отчёт
     называет датами, а не прячет.
     """
-    weeks = finance.weeks_of(client_id, date_from, date_to, path=path)
+    exact = window if window is not None and window.exact else None
+    weeks = (
+        finance.exact_weeks(client_id, exact, path=path)
+        if exact is not None
+        else finance.weeks_of(client_id, date_from, date_to, path=path)
+    )
     if not weeks:
         return {}, ()
     found: dict[int, Decimal] = {}
-    for item in finance.articles_of(client_id, weeks, path=path):
+    for item in finance.articles_of(client_id, weeks, path=path, window=exact):
         if item.nm_id is None:
             continue
         found[int(item.nm_id)] = (
@@ -908,18 +936,30 @@ def _revenue_by_article(
 
 def build(
     client_id: int,
-    period: str = "month",
+    period: "str | Any" = "month",
     *,
     today: date | None = None,
     path: str | Path | None = None,
     trouble: str = "",
+    date_from: date | None = None,
+    date_to: date | None = None,
 ) -> AdsReport:
     """Отчёт по рекламе за период. В WB отсюда не ходят ни разу.
 
     Всё уже лежит в базе: расход положил сбор этого же агента, выручку
     товаров агент 1. Отчёт только читает и считает.
+
+    Точный период (названный месяц и свои даты) рекламе почти ничего не
+    стоит: расход и заказы лежат по суткам, и выбрать из них ровно месяц
+    можно без всякой потери. Платит только вторая цифра ДРР: выручка товара
+    приходит из недель финансового отчёта, и в точном периоде она тоже
+    считается по датам операций, а недели, вошедшие не целиком, сверить
+    нечем. Об этом говорит сам отчёт.
     """
-    date_from, date_to = finance.period_bounds(period, today)
+    window = finance.period_of(
+        period, today, date_from=date_from, date_to=date_to, max_days=max_days()
+    )
+    date_from, date_to = window.bounds
     first, last = date_from.isoformat(), date_to.isoformat()
     repo = db.repo(client_id, path)
 
@@ -976,7 +1016,9 @@ def build(
         advert_id = int(row["advert_id"])
         charges[advert_id] = charges.get(advert_id, 0) + int(row["sum_kop"] or 0)
 
-    revenue, weeks = _revenue_by_article(client_id, date_from, date_to, path=path)
+    revenue, weeks = _revenue_by_article(
+        client_id, date_from, date_to, path=path, window=window
+    )
     known_revenue = bool(weeks)
 
     campaigns = []
@@ -1037,9 +1079,10 @@ def build(
 
     return AdsReport(
         client_id=client_id,
-        period=period,
+        period=window.key,
         date_from=date_from,
         date_to=date_to,
+        exact=window.exact,
         target=target_drr(client_id, path=path),
         campaigns=tuple(campaigns),
         days=tuple(day_rows),
@@ -1292,16 +1335,20 @@ def set_sender(fn: Callable[[int, AdsReport, bytes], Any] | None) -> None:
 
 
 def request_report(
-    client_id: int, period: str = "month", *, path: str | Path | None = None
+    client_id: int,
+    period: "str | Any" = "month",
+    *,
+    path: str | Path | None = None,
 ) -> queue.TaskId:
     """Ставит отчёт в очередь. «Принято» клиенту говорит сама очередь.
 
     Из хендлера в WB не ходят: у статистики рекламы лимит 3 запроса в минуту,
     и повтор при недоступности Wildberries живёт только в очереди.
     """
-    if period not in PERIODS:
+    window = finance.period_of(period, max_days=max_days())
+    if window.key not in PERIODS and not window.exact:
         raise ValueError(f"неизвестный период: {period}")
-    return queue.enqueue(client_id, TASK_KIND, {"period": period}, path=path)
+    return queue.enqueue(client_id, TASK_KIND, window.payload, path=path)
 
 
 def _payload_date(task: Any) -> date:
@@ -1380,12 +1427,11 @@ async def report_task(task: Any, *, path: str | Path | None = None) -> AdsReport
     квартал: без похода в WB прямо сейчас он получил бы пустую таблицу.
     """
     client_id = int(task.client_id)
-    period = str((task.payload or {}).get("period") or "month")
-    date_from, date_to = finance.period_bounds(period)
-    collected = await collect(client_id, date_from, date_to, path=path)
+    window = finance.period_of_task(task)
+    collected = await collect(client_id, window.date_from, window.date_to, path=path)
     report = build(
         client_id,
-        period,
+        window,
         path=path,
         trouble="" if collected.ok else collected.reason,
     )

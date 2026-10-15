@@ -33,6 +33,7 @@ from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from agents import finance
+from bot.handlers import period
 from bot.handlers.tariffs import client_id_of, require_module
 from bot.texts import Safe, fill
 from core import db, queue
@@ -41,23 +42,34 @@ logger = logging.getLogger(__name__)
 
 PREFIX = "fin:"
 
-BUTTONS = (
-    ("week", "Последняя неделя"),
-    ("month", "Месяц"),
-    ("quarter", "Квартал"),
-    ("year", "Год"),
+# Подписи относительных кнопок считаются из PERIODS: число дней в подписи и
+# есть то, чего кнопке «Месяц» не хватало. Рядом стоят кнопки названных
+# месяцев, и они считаются по-другому, точно по датам. Человек не обязан
+# помнить эту разницу, поэтому она видна в самой подписи.
+BUTTONS = tuple(
+    (name, f"Последние {finance.days_words(days)}")
+    for name, days in finance.PERIODS.items()
 )
 
 ASK_PERIOD = (
     "💰 <b>Финансы</b>\n\n"
     "Покажу, сколько денег забрал Wildberries и за что: комиссия, эквайринг, "
     "логистика, хранение, приёмка, штрафы, прочие удержания.\n\n"
-    "За какой период посчитать?"
+    "За какой период посчитать?\n\n"
+    "Кнопки «Последние ...» считают целыми неделями Wildberries: в отчёт "
+    "попадает каждая неделя, которая этот отрезок задела, и каждая сверяется "
+    "с итогами кабинета.\n"
+    "Месяц и свои даты считают точно по датам операций: ровно запрошенные "
+    "дни, ни дня соседнего месяца. Это то, что сходится с бухгалтерией."
 )
 
 LONG_PERIOD = (
-    "Год Wildberries отдаёт по одной странице в минуту, это надолго. "
-    "Соберу и пришлю, закрывать бот не нужно."
+    "Длинный период Wildberries отдаёт по одной странице в минуту, это "
+    "надолго. Соберу и пришлю, закрывать бот не нужно."
+)
+
+DATES_ACCEPTED = (
+    "Принято: {period}. Посчитаю точно по датам операций и пришлю отчёт."
 )
 
 TAX_BASE_NOTE = (
@@ -85,6 +97,24 @@ UNVERIFIED = (
     "\n\n⚠️ Wildberries не отдал итоги отчёта за недели: {weeks}. Сверить свой "
     "расчёт с кабинетом я по ним не смог, поэтому считайте эти цифры "
     "предварительными. Запросите период ещё раз чуть позже."
+)
+
+EXACT_NOTE = (
+    "\n\nПериод посчитан точно по датам операций: в него вошло ровно "
+    "запрошенное, ни дня соседнего месяца."
+)
+
+CLIPPED = (
+    "\n\n⚠️ Не целиком вошли в период недели, начавшиеся {weeks}. Сверить их "
+    "нечем: готовые итоги Wildberries есть только на неделю целиком. Сами "
+    "цифры посчитаны по датам операций, а вот подтвердить их итогами кабинета "
+    "по этим неделям я не могу."
+)
+
+UNDATED = (
+    "\n\n⚠️ Строк без даты операции: {count}. В обрезанную неделю их класть "
+    "некуда, поэтому в этот отчёт они не вошли. Возьмите период целыми "
+    "неделями, чтобы увидеть их деньги."
 )
 
 INCOMPLETE = (
@@ -130,14 +160,13 @@ def _day(text: str) -> str:
     return ".".join(reversed(parts)) if len(parts) == 3 else str(text)
 
 
-def keyboard() -> InlineKeyboardMarkup:
-    """Кнопки периода: последняя неделя, месяц, квартал, год."""
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(title, callback_data=f"{PREFIX}{key}")]
-            for key, title in BUTTONS
-        ]
-    )
+def keyboard(today: Any = None) -> InlineKeyboardMarkup:
+    """Кнопки периода: относительные, названные месяцы и свои даты."""
+    rows = [
+        [InlineKeyboardButton(title, callback_data=f"{PREFIX}{key}")]
+        for key, title in BUTTONS
+    ]
+    return InlineKeyboardMarkup(rows + period.month_rows(PREFIX, today=today))
 
 
 def summary_text(report: Any) -> Safe:
@@ -187,18 +216,26 @@ def summary_text(report: Any) -> Safe:
     ]
 
     text = Safe("\n".join(lines) + FILE_NOTE)
-    # Три оговорки, и они разные: расхождение, непроверенная неделя и
-    # обрезанная выгрузка. Молчать ни про одну нельзя.
+    # Способ счёта называется прямо: цифра уходит в бухгалтерию, а по какому
+    # правилу она посчитана, видно только здесь.
+    if report.exact:
+        text = Safe(text + EXACT_NOTE)
+    # Четыре оговорки, и они разные: расхождение, непроверенная неделя,
+    # обрезанная выгрузка и обрезанная периодом неделя. Молчать ни про одну
+    # нельзя, а объединять их нельзя тем более: подсказки у них разные.
     for template, weeks in (
         (INCOMPLETE, report.incomplete),
         (MISMATCH, report.mismatches),
         (UNVERIFIED, report.unverified),
+        (CLIPPED, report.clipped),
     ):
         if weeks:
             text = Safe(
                 text
                 + fill(template, weeks=", ".join(_day(week.date_from) for week in weeks))
             )
+    if report.undated:
+        text = Safe(text + fill(UNDATED, count=report.undated))
     return text
 
 
@@ -224,12 +261,34 @@ async def period_chosen(
     *,
     path: str | Path | None = None,
 ) -> None:
-    """Кнопка периода: ставит задачу в очередь и отвечает сразу."""
+    """Кнопка периода: ставит задачу в очередь и отвечает сразу.
+
+    Кнопок три вида: относительная, названный месяц (приезжает датами) и
+    «Свои даты». Период из кнопки проверяется функцией, а не клавиатурой:
+    `callback_data` присылает клиент, и подделать его ничего не стоит.
+    """
     query = update.callback_query
     if query is None:
         return
-    period = str(query.data or "")[len(PREFIX) :]
-    if period not in finance.PERIODS:
+    tail = str(query.data or "")[len(PREFIX) :]
+
+    if tail == period.CUSTOM:
+        await query.answer()
+        await period.ask(update, context, finance.MODULE)
+        return
+
+    if tail.startswith(period.MARK):
+        window = period.period_of_callback(tail)
+        if window is None:
+            await query.answer()
+            if query.message is not None:
+                await query.message.reply_text(
+                    period.stale_text("finance"), parse_mode=ParseMode.HTML
+                )
+            return
+    elif tail in finance.PERIODS:
+        window = finance.period_of(tail)
+    else:
         await query.answer()
         return
 
@@ -241,10 +300,50 @@ async def period_chosen(
     # Задача могла уже стоять: тогда честный ответ «уже считаю», а не второе
     # «принято». Текст берётся у очереди, чтобы всплывающее окно и сообщение
     # не рассказывали клиенту разное.
-    task = finance.request_report(client_id, period, path=path)
+    task = finance.request_report(client_id, window, path=path)
     await query.answer("Принято" if task.created else queue.ALREADY_QUEUED)
-    if period == "year" and query.message is not None:
+    if _long(window) and query.message is not None:
         await query.message.reply_text(LONG_PERIOD)
+
+
+def _long(window: finance.Period) -> bool:
+    """Стоит ли предупредить, что это надолго. Решают сутки, а не имя кнопки.
+
+    Прежде предупреждение висело на кнопке «Год». Ручной период бывает такой
+    же длины, и молчать о нём только потому, что кнопка называется иначе,
+    значило бы обмануть ровно того, кто ждёт дольше всех.
+    """
+    return window.days > finance.PERIODS["quarter"]
+
+
+async def dates_chosen(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    window: finance.Period,
+    *,
+    path: str | Path | None = None,
+) -> None:
+    """Период прислали текстом: ставим задачу и отвечаем сообщением.
+
+    Доступ проверяется ещё раз, обёрткой `require_module` при регистрации:
+    пока человек набирал даты, оплаченные дни могли кончиться.
+    """
+    message = update.effective_message
+    client_id = client_id_of(update, path)
+    if message is None or client_id is None:
+        return
+    task = finance.request_report(client_id, window, path=path)
+    await message.reply_text(
+        fill(
+            DATES_ACCEPTED,
+            period=f"{_day(window.date_from.isoformat())} - {_day(window.date_to.isoformat())}",
+        )
+        if task.created
+        else Safe(queue.ALREADY_QUEUED),
+        parse_mode=ParseMode.HTML,
+    )
+    if _long(window):
+        await message.reply_text(LONG_PERIOD)
 
 
 # --- доставка готового отчёта ------------------------------------------------
@@ -276,6 +375,12 @@ def register(app, *, path: str | Path | None = None) -> None:
     finance.register_jobs()
 
     guard = require_module(finance.MODULE, path=path)
+    # Ввод дат приходит текстом, мимо кнопки, поэтому доступ к модулю
+    # проверяется и на нём: пока человек набирал даты, оплаченные дни могли
+    # кончиться. Обёртка та же самая, своей проверки здесь нет.
+    period.set_owner(
+        finance.MODULE, guard(functools.partial(dates_chosen, path=path))
+    )
     app.add_handler(
         CommandHandler("finance", guard(functools.partial(finance_command, path=path)))
     )

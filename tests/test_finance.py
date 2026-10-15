@@ -422,12 +422,16 @@ async def test_finance_offers_four_periods_and_only_queues_the_work(cabinet, db_
         FakeUpdate(telegram_id, message), None, path=db_path
     )
     buttons = message.sent[0][1]["reply_markup"].inline_keyboard
-    assert [row[0].callback_data for row in buttons] == [
+    # Первыми по-прежнему идут относительные кнопки, и считаются они как
+    # раньше. Ниже них живут названные месяцы и «свои даты»: они считаются
+    # точно по датам, и их проверяют свои тесты.
+    assert [row[0].callback_data for row in buttons[:4]] == [
         "fin:week",
         "fin:month",
         "fin:quarter",
         "fin:year",
     ]
+    assert buttons[-1][0].callback_data == "fin:custom"
 
     query = FakeQuery("fin:quarter", FakeMessage())
     await handlers_finance.period_chosen(

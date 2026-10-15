@@ -53,9 +53,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
-from agents import profit
+from agents import finance, profit
 from core import queue
 from core import tax as tax_module
+from bot.handlers import period
 from bot.handlers.tariffs import client_id_of, require_module
 from bot.texts import Safe, fill
 
@@ -63,11 +64,12 @@ logger = logging.getLogger(__name__)
 
 PREFIX = "profit:"
 
-BUTTONS = (
-    ("week", "Последняя неделя"),
-    ("month", "Месяц"),
-    ("quarter", "Квартал"),
-    ("year", "Год"),
+# Подписи относительных кнопок считаются из PERIODS: число дней в подписи и
+# есть то, чего кнопке «Месяц» не хватало. Рядом стоят названные месяцы, и
+# считаются они иначе, точно по датам.
+BUTTONS = tuple(
+    (name, f"Последние {finance.days_words(days)}")
+    for name, days in profit.PERIODS.items()
 )
 
 ASK_PERIOD = (
@@ -75,12 +77,32 @@ ASK_PERIOD = (
     "Покажу, какие товары зарабатывают, а какие съедают деньги: выручка, "
     "себестоимость, комиссия, логистика, хранение, штрафы, реклама и возвраты "
     "по каждому артикулу.\n\n"
-    "За какой период посчитать?"
+    "За какой период посчитать?\n\n"
+    "Кнопки «Последние ...» считают целыми неделями Wildberries: в отчёт "
+    "попадает каждая неделя, которая этот отрезок задела.\n"
+    "Месяц и свои даты считают точно по датам операций: ровно запрошенные "
+    "дни, ни дня соседнего месяца. Это то, что сходится с бухгалтерией."
 )
 
 LONG_PERIOD = (
-    "Год Wildberries отдаёт медленно, это надолго. Соберу и пришлю, закрывать "
-    "бот не нужно."
+    "Длинный период Wildberries отдаёт медленно, это надолго. Соберу и "
+    "пришлю, закрывать бот не нужно."
+)
+
+DATES_ACCEPTED = (
+    "Принято: {period}. Посчитаю точно по датам операций и пришлю отчёт."
+)
+
+EXACT_NOTE = (
+    "\n\nПериод посчитан точно по датам операций: в него вошло ровно "
+    "запрошенное, ни дня соседнего месяца."
+)
+
+CLIPPED = (
+    "\n\n⚠️ Не целиком вошли в период недели: {weeks}. Сверить их нечем: "
+    "готовые итоги Wildberries есть только на неделю целиком, поэтому цифры по "
+    "этим неделям посчитаны по датам операций, но итогами кабинета не "
+    "подтверждены."
 )
 
 NO_DATA = (
@@ -126,24 +148,38 @@ COMPENSATION_COST = (
     "почему, написано на листе «Методология»."
 )
 
-# Рекламный счёт. Раньше он лежал внутри обезлички и вычитался вторым разом,
-# а теперь не вычитается вовсе: деньги крупные, и молчание о них читалось бы
-# как потеря. Поэтому сумма названа, и сказано, почему её нет в расходах.
+# Рекламный счёт. Раньше он лежал внутри обезлички и вычитался вторым разом:
+# деньги крупные, и молчание о них читалось бы как потеря. Поэтому сумма
+# названа, и сказано, какой её частью реклама вычтена по товарам.
 AD_DEDUCTION = (
     "\n\n📣 За рекламу Wildberries удержал {amount}: выставил счёт рекламного "
-    "кабинета и забрал его из отчёта о реализации. В расходы это второй раз не "
-    "идёт, потому что расход рекламы уже вычтен по каждому товару: там видно, "
-    "какой товар рекламировали, а удержание приходит общей суммой по кабинету. "
+    "кабинета и забрал его из отчёта о реализации. Расход рекламы по товарам я "
+    "считаю не по счёту, а по статистике кампаний: только она знает, какой "
+    "товар рекламировали, а счёт приходит общей суммой по кабинету. "
     "В файле эти деньги названы в блоке «{block}» листа «{sheet}»."
 )
 
-# Разница двух цифр про одни деньги. Та же, что в /ads, и по той же причине:
+# Две цифры про одни деньги. Та же разница, что в /ads, и по той же причине:
 # статистика считает отработавшую рекламу по дням, а счёт Wildberries
 # выставляет своим числом и удерживает той неделей, которой дойдёт до отчёта.
 AD_DEDUCTION_GAP = (
-    " Статистика кампаний за период даёт {amount}, это на {gap} больше "
-    "удержанного: счёт выставляется своим числом и доходит до отчёта своей "
-    "неделей. Ту же разницу показывает /ads."
+    " Статистика кампаний за период даёт {amount}: счёт выставляется своим "
+    "числом и доходит до отчёта своей неделей, поэтому числа и не обязаны "
+    "совпасть. Ту же разницу показывает /ads."
+)
+
+# Что сделано с разницей. Главный вопрос селлера: почему расход рекламы в
+# отчёте не равен счёту Wildberries. Остаток счёта из расходов не выброшен,
+# иначе отчёт обещал бы прибыль, которой нет.
+AD_DEDUCTION_REST = (
+    " Из счёта по товарам вычтено {covered}, а остаток {rest} вычтен вместе с "
+    "расходами без артикула: эти деньги Wildberries правда удержал, а дни "
+    "показов за них в период не попали. Дважды реклама не вычитается."
+)
+
+AD_DEDUCTION_WHOLE = (
+    " Счёт сошёлся со статистикой целиком, поэтому второй раз в расходы он не "
+    "идёт: реклама вычтена один раз, расходом по товарам."
 )
 
 FACELESS = "\n\n🧾 Расходы без артикула (обезличка): {amount}."
@@ -434,8 +470,11 @@ def _faceless_parts(report: Any) -> Safe:
     items = report.faceless_parts
     if not items:
         return Safe("")
+    # Печатается та часть статьи, которая правда попала в обезличку: у
+    # рекламного счёта это его неразобранный остаток, а не весь счёт. Иначе
+    # сложение строк не сошлось бы с названной выше суммой.
     parts = ", ".join(
-        fill("{title} {amount}", title=item.title.lower(), amount=_money(item.faceless))
+        fill("{title} {amount}", title=item.title.lower(), amount=_money(item.in_pool))
         for item in items
     )
     text = fill(FACELESS_PARTS, parts=Safe(parts))
@@ -513,14 +552,13 @@ def tax_block(report: Any) -> Safe:
     return Safe(text + per_article + TAX_NOTE)
 
 
-def keyboard() -> InlineKeyboardMarkup:
-    """Кнопки периода: последняя неделя, месяц, квартал, год."""
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(title, callback_data=f"{PREFIX}{key}")]
-            for key, title in BUTTONS
-        ]
-    )
+def keyboard(today: Any = None) -> InlineKeyboardMarkup:
+    """Кнопки периода: относительные, названные месяцы и свои даты."""
+    rows = [
+        [InlineKeyboardButton(title, callback_data=f"{PREFIX}{key}")]
+        for key, title in BUTTONS
+    ]
+    return InlineKeyboardMarkup(rows + period.month_rows(PREFIX, today=today))
 
 
 def summary_text(report: Any) -> Safe:
@@ -593,15 +631,28 @@ def summary_text(report: Any) -> Safe:
         )
         spend = report.total_ad_spend
         if spend is not None:
-            text = Safe(
-                text
-                + fill(
-                    AD_DEDUCTION_GAP,
-                    amount=_money(spend),
-                    gap=_money(spend - report.ad_deductions),
+            text = Safe(text + fill(AD_DEDUCTION_GAP, amount=_money(spend)))
+            # Остаток счёта, который статистика не объяснила. Ноль значит, что
+            # счёт заменён целиком, и об этом тоже сказано словами: иначе
+            # селлер не поймёт, вычтена реклама один раз или полтора.
+            rest = report.ad_uncovered
+            if rest > 0:
+                text = Safe(
+                    text
+                    + fill(
+                        AD_DEDUCTION_REST,
+                        covered=_money(report.ad_replaced),
+                        rest=_money(rest),
+                    )
                 )
-            )
-    if report.unallocated > 0:
+            elif rest == 0:
+                text = Safe(text + AD_DEDUCTION_WHOLE)
+    # Обезличка называется и когда она отрицательная. Так бывает, когда
+    # Wildberries вернул по кабинету больше, чем удержал (добровольная выплата
+    # за испорченный товар приходит той же строкой удержания с минусом), и
+    # промолчать о такой сумме значит оставить селлера с необъяснённой
+    # прибавкой к прибыли. Состав строкой ниже и говорит, откуда минус.
+    if report.unallocated != 0:
         text = Safe(text + fill(FACELESS, amount=_money(report.unallocated)))
         text = Safe(text + _faceless_parts(report) + FACELESS_SPREAD)
         if report.unallocated_left:
@@ -616,7 +667,13 @@ def summary_text(report: Any) -> Safe:
     # Неделя называется обеими датами, а не одной. Сторож расходов неполные
     # недели пропускает, а тут они посчитаны: без точных границ два ответа
     # выглядели бы как противоречие, а не как разные взгляды на одну неделю.
-    for template, weeks in ((INCOMPLETE, report.incomplete), (UNVERIFIED, report.unverified)):
+    if report.exact:
+        text = Safe(text + EXACT_NOTE)
+    for template, weeks in (
+        (INCOMPLETE, report.incomplete),
+        (UNVERIFIED, report.unverified),
+        (CLIPPED, report.clipped),
+    ):
         if weeks:
             text = Safe(
                 text
@@ -653,12 +710,34 @@ async def period_chosen(
     *,
     path: str | Path | None = None,
 ) -> None:
-    """Кнопка периода: ставит задачу в очередь и отвечает сразу."""
+    """Кнопка периода: ставит задачу в очередь и отвечает сразу.
+
+    Кнопок три вида: относительная, названный месяц (приезжает датами) и
+    «Свои даты». Период из кнопки проверяет функция, а не клавиатура:
+    `callback_data` присылает клиент, и подделать его ничего не стоит.
+    """
     query = update.callback_query
     if query is None:
         return
-    period = str(query.data or "")[len(PREFIX) :]
-    if period not in profit.PERIODS:
+    tail = str(query.data or "")[len(PREFIX) :]
+
+    if tail == period.CUSTOM:
+        await query.answer()
+        await period.ask(update, context, profit.MODULE)
+        return
+
+    if tail.startswith(period.MARK):
+        window = period.period_of_callback(tail)
+        if window is None:
+            await query.answer()
+            if query.message is not None:
+                await query.message.reply_text(
+                    period.stale_text("profit"), parse_mode=ParseMode.HTML
+                )
+            return
+    elif tail in profit.PERIODS:
+        window = finance.period_of(tail)
+    else:
         await query.answer()
         return
 
@@ -670,10 +749,50 @@ async def period_chosen(
     # Задача могла уже стоять: тогда честный ответ «уже считаю», а не второе
     # «принято». Текст берётся у очереди, чтобы всплывающее окно и сообщение
     # не рассказывали клиенту разное.
-    task = profit.request_report(client_id, period, path=path)
+    task = profit.request_report(client_id, window, path=path)
     await query.answer("Принято" if task.created else queue.ALREADY_QUEUED)
-    if period == "year" and query.message is not None:
+    if _long(window) and query.message is not None:
         await query.message.reply_text(LONG_PERIOD)
+
+
+def _long(window: Any) -> bool:
+    """Стоит ли предупредить, что это надолго. Решают сутки, а не имя кнопки.
+
+    Ручной период бывает длиной в год, и молчать о нём только потому, что
+    кнопка называется иначе, значило бы обмануть того, кто ждёт дольше всех.
+    """
+    return window.days > profit.PERIODS["quarter"]
+
+
+async def dates_chosen(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    window: Any,
+    *,
+    path: str | Path | None = None,
+) -> None:
+    """Период прислали текстом: ставим задачу и отвечаем сообщением.
+
+    Доступ проверяется ещё раз, обёрткой `require_module` при регистрации:
+    пока человек набирал даты, оплаченные дни могли кончиться.
+    """
+    message = update.effective_message
+    client_id = client_id_of(update, path)
+    if message is None or client_id is None:
+        return
+    task = profit.request_report(client_id, window, path=path)
+    await message.reply_text(
+        fill(
+            DATES_ACCEPTED,
+            period=f"{_day(window.date_from.isoformat())} - "
+            f"{_day(window.date_to.isoformat())}",
+        )
+        if task.created
+        else Safe(queue.ALREADY_QUEUED),
+        parse_mode=ParseMode.HTML,
+    )
+    if _long(window):
+        await message.reply_text(LONG_PERIOD)
 
 
 # --- доставка готового отчёта ------------------------------------------------
@@ -706,6 +825,9 @@ def register(app, *, path: str | Path | None = None) -> None:
     profit.register_jobs()
 
     guard = require_module(profit.MODULE, path=path)
+    # Ввод дат приходит текстом, мимо кнопки, поэтому доступ к модулю
+    # проверяется и на нём той же обёрткой.
+    period.set_owner(profit.MODULE, guard(functools.partial(dates_chosen, path=path)))
     app.add_handler(
         CommandHandler("profit", guard(functools.partial(profit_command, path=path)))
     )
