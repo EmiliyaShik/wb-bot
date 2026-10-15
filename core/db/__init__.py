@@ -555,9 +555,19 @@ class AdminRepo:
         return int(cursor.lastrowid or 0)
 
     def events(
-        self, limit: int = 50, level: str | None = None, kind: str | None = None
+        self,
+        limit: int = 50,
+        level: str | None = None,
+        kind: str | None = None,
+        exclude_kind: str | None = None,
     ) -> list[sqlite3.Row]:
-        """Последние записи журнала, свежие сверху. Для владельца."""
+        """Последние записи журнала, свежие сверху. Для владельца.
+
+        `exclude_kind` отсекает вид события до среза по последним N, а не
+        после: место ошибки лежит в журнале своим видом, и отбрасывать его
+        после выборки значило бы, что десять стеков подряд оставят владельца
+        вообще без списка ошибок.
+        """
         sql = "SELECT * FROM events"
         where: list[str] = []
         params: list[Any] = []
@@ -567,6 +577,9 @@ class AdminRepo:
         if kind:
             where.append("kind = ?")
             params.append(kind)
+        if exclude_kind:
+            where.append("kind <> ?")
+            params.append(exclude_kind)
         if where:
             sql += " WHERE " + " AND ".join(where)
         params.append(int(limit))

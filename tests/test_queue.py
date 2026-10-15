@@ -575,8 +575,11 @@ async def test_ten_broken_tasks_do_not_turn_into_ten_messages(db_path, client):
         assert await queue.run_once(path=db_path) is True
 
     assert len(_client_said(messages, client)) == 1
-    # Промолчали, но не забыли: каждый сбой лежит в журнале.
-    journal = audit.recent(limit=50, level="error", path=db_path)
+    # Промолчали, но не забыли: каждый сбой лежит в журнале. Место ошибки
+    # считается отдельно: у каждого сбоя оно своё, и в этот счёт не идёт.
+    journal = audit.recent(
+        limit=100, level="error", path=db_path, exclude_kind=audit.TRACE_KIND
+    )
     assert len([r for r in journal if "finance_report" in r["message"]]) == 10
     assert len(db.admin_repo(db_path).tasks(state=queue.FAILED, limit=50)) == 10
 
@@ -793,3 +796,108 @@ async def test_many_places_keep_dedup_retries_and_the_word_about_failure(db_path
     # А про сбор, которого никто не заказывал, узнал владелец.
     owner = _owner_said(messages)
     assert len(owner) == 1 and "ads_collect_client" in owner[0]
+
+
+# --- место ошибки сорвавшейся задачи ---
+
+
+@pytest.mark.asyncio
+async def test_failed_task_leaves_the_place_of_the_error_in_the_journal(db_path, client):
+    """Одной строки не хватало: «неизвестный период: dates» и больше ничего.
+
+    Задача потом прошла целиком, воспроизвести было нечем, и час ушёл на то,
+    чтобы понять, откуда она взялась.
+    """
+
+    def handler(task):
+        raise ValueError("неизвестный период: dates")
+
+    queue.register("finance_report", handler, title="разбор недели")
+    task_id = queue.enqueue(client, "finance_report", {"period": "dates"}, path=db_path)
+
+    await queue.run_once(path=db_path)
+
+    place = [
+        row["message"]
+        for row in audit.recent(limit=20, path=db_path)
+        if row["kind"] == audit.TRACE_KIND
+    ]
+    assert place, "при сбое задачи место ошибки обязано остаться в журнале"
+    assert "неизвестный период: dates" in place[0]
+    assert "handler" in place[0], "видно, в какой функции упало"
+    assert f"#{task_id}" in place[0], "видно, какая это была задача"
+
+
+@pytest.mark.asyncio
+async def test_last_error_stays_one_line_for_the_owner(db_path, client):
+    """Стек уходит в журнал, а не в last_error: /tasks владелец читает с телефона."""
+
+    def handler(task):
+        raise ValueError("неизвестный период: dates")
+
+    queue.register("finance_report", handler)
+    task_id = queue.enqueue(client, "finance_report", {"period": "dates"}, path=db_path)
+
+    await queue.run_once(path=db_path)
+
+    row = db.admin_repo(db_path).task(task_id)
+    assert row["last_error"] == "неизвестный период: dates"
+    assert "\n" not in row["last_error"]
+    assert "Traceback" not in row["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_wildberries_refusal_does_not_drag_a_stack_along(db_path, client):
+    """Отказ Wildberries своё место называет сам, и стек журналу не нужен."""
+
+    def handler(task):
+        raise WBUnavailable("Wildberries не ответил")
+
+    queue.register("finance_report", handler, title="разбор недели")
+    queue.enqueue(client, "finance_report", {"period": "dates"}, path=db_path)
+
+    for _ in range(queue.max_attempts()):
+        await queue.run_once(path=db_path)
+        rows = db.admin_repo(db_path).tasks(limit=5)
+        _move_into_past(db_path, int(rows[0]["id"]))
+
+    kinds = [row["kind"] for row in audit.recent(limit=20, path=db_path)]
+    assert audit.TRACE_KIND not in kinds
+
+
+@pytest.mark.asyncio
+async def test_journal_does_not_swell_from_one_long_stack(db_path, client):
+    """Предел длины стоит на месте: иначе глубокий стек раздувает базу.
+
+    Кадры тут нарочно разные: одинаковые подряд идущие Python сворачивает сам
+    в «Previous line repeated», и такой стек коротким вышел бы и без нас.
+    """
+
+    def handler(task):
+        def here(level):
+            if level:
+                there(level - 1)
+                return
+            raise ValueError("упало глубоко: " + "длинный ответ " * 500)
+
+        def there(level):
+            here(level)
+
+        here(80)
+
+    queue.register("finance_report", handler)
+    queue.enqueue(client, "finance_report", {"period": "dates"}, path=db_path)
+
+    await queue.run_once(path=db_path)
+
+    place = next(
+        row["message"]
+        for row in audit.recent(limit=20, path=db_path)
+        if row["kind"] == audit.TRACE_KIND
+    )
+    # Предел считается по стеку, к нему добавляется одна строка ссылки на само
+    # событие. Больше в этой записи не бывает ничего.
+    assert len(place) <= audit.trace_max_chars() + audit.TRACE_LINE_CHARS + 2
+    assert audit.TRACE_CUT in place, "длинный стек обрезан и помечен"
+    assert "finance_report" in place, "видно, к какому сбою этот стек"
+    assert place.count("длинный ответ ") < 50, "тысячи знаков ошибки в стек не идут"

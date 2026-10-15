@@ -120,6 +120,60 @@ def test_token_rejected_while_polling_is_also_explained(monkeypatch, tmp_path):
     assert "BotFather" in message
 
 
+def test_no_link_at_startup_is_a_pause_not_a_crash(monkeypatch, tmp_path):
+    """Обрыв связи в момент запуска: бот ждёт и пробует сам, без человека.
+
+    Это не bootstrap_retries: до него дело не доходит. Токен библиотека
+    проверяет вызовом getMe внутри initialize(), повторов там нет никаких, и
+    деплой во время помех у провайдера кончался трассировкой и выходом.
+    """
+    from telegram.error import NetworkError
+
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    waited: list[float] = []
+    monkeypatch.setattr(bot_app.time, "sleep", waited.append)
+
+    attempts: list[int] = []
+
+    class Launch:
+        def run_polling(self, **kwargs):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) < 3:
+                raise NetworkError("httpx.ConnectError: ")
+            return None  # связь вернулась, бот работает и потом погашен
+
+        def __init__(self):
+            pass
+
+    monkeypatch.setattr(bot_app, "build_app", lambda token: Launch())
+    bot_app.run("123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    db.close_all()
+
+    assert attempts == [1, 2, 3], "после обрыва запуск повторяется сам"
+    assert len(waited) == 2
+    assert waited == sorted(waited) and waited[0] > 0, "пауза растёт, а не долбит сеть"
+    outage = [
+        row["message"] for row in audit.recent(limit=20) if "Запуск не удался" in row["message"]
+    ]
+    assert len(outage) == 2, "каждая неудача запуска остаётся в журнале"
+
+
+def test_polling_is_told_never_to_give_up_on_the_handshake(monkeypatch, tmp_path):
+    """bootstrap_retries = -1 это «бесконечно»: ноль по умолчанию ронял процесс."""
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    seen: dict = {}
+
+    class Launch:
+        def run_polling(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(bot_app, "build_app", lambda token: Launch())
+    bot_app.run("123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    db.close_all()
+
+    assert seen["bootstrap_retries"] == bot_app.BOOTSTRAP_RETRIES_FOREVER < 0
+
+
 def test_startup_does_not_run_without_a_token(monkeypatch, tmp_path):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     with pytest.raises(SystemExit):

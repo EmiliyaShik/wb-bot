@@ -4,7 +4,7 @@
 настоящего ИНН, ОГРНИП или счёта. Репозиторий публичный.
 """
 
-from core import audit, db
+from core import audit, config, db
 
 FAKE_INN = "1111111111"
 FAKE_INN_12 = "111111111111"
@@ -84,3 +84,104 @@ def test_logging_failure_does_not_break_the_bot(monkeypatch, db_path):
 
     monkeypatch.setattr(db, "admin_repo", boom)
     audit.log("system", None, "старт бота", path=db_path)  # не должно падать
+
+
+# --- место ошибки: где упало, без воспроизведения ---
+
+
+def _fallen(depth: int = 0, secret: str = "") -> BaseException:
+    """Настоящий сбой с настоящим стеком. Выдуманный стек ничего не доказывает."""
+
+    def inner(level: int) -> None:
+        if level:
+            inner(level - 1)
+            return
+        payload = f"период dates, токен {secret}" if secret else "неизвестный период: dates"
+        raise ValueError(payload)
+
+    try:
+        inner(depth)
+    except ValueError as error:
+        return error
+    raise AssertionError("сбой обязан был случиться")
+
+
+def test_place_of_error_names_the_function_and_the_line():
+    place = audit.place_of(_fallen())
+
+    assert "ValueError" in place
+    assert "неизвестный период: dates" in place
+    assert "inner" in place, "видно, в какой функции упало"
+    assert "test_audit.py" in place, "видно, в каком файле упало"
+
+
+def test_place_of_error_is_empty_without_an_error():
+    assert audit.place_of(None) == ""
+
+
+def test_place_of_error_hides_secrets():
+    """В кадрах стека лежат значения переменных, и токен встречается именно там."""
+    place = audit.place_of(_fallen(secret=FAKE_JWT))
+
+    assert FAKE_JWT not in place
+    assert "eyJ" not in place
+    assert audit.HIDDEN in place
+    assert "период dates" in place, "сам сбой по-прежнему виден"
+
+
+def test_place_of_error_does_not_grow_past_the_limit():
+    """Журнал лежит в той же базе, что данные кабинетов: стек обязан быть с краю."""
+    place = audit.place_of(_fallen(depth=200), limit=400)
+
+    assert 0 < len(place) <= 400
+    assert audit.TRACE_CUT in place, "обрезок обязан быть помечен"
+    assert "ValueError" in place, "конец стека оставлен: упало там"
+
+
+def test_place_of_error_limit_comes_from_the_config():
+    """В config.toml секция [audit], ключ trace_max_chars."""
+    assert audit.trace_max_chars() == int(
+        config.settings()["audit"]["trace_max_chars"]
+    )
+    place = audit.place_of(_fallen(depth=500))
+    assert len(place) <= audit.trace_max_chars()
+
+
+def test_place_of_error_is_off_at_zero():
+    assert audit.place_of(_fallen(), limit=0) == ""
+
+
+def test_log_with_an_error_keeps_the_place_as_its_own_kind(db_path):
+    audit.log("queue", None, "задача упала", level="error", path=db_path, error=_fallen())
+
+    rows = audit.recent(limit=10, path=db_path)
+    kinds = [row["kind"] for row in rows]
+    assert audit.TRACE_KIND in kinds
+    assert "queue" in kinds
+    place = next(row for row in rows if row["kind"] == audit.TRACE_KIND)
+    assert place["level"] == "error", "стек ищут там же, где сам сбой"
+    assert "inner" in place["message"]
+    assert "задача упала" in place["message"], "по стеку видно, к чему он"
+
+
+def test_log_without_an_error_writes_no_place(db_path):
+    audit.log("queue", None, "задача упала", level="error", path=db_path)
+
+    kinds = [row["kind"] for row in audit.recent(limit=10, path=db_path)]
+    assert audit.TRACE_KIND not in kinds
+
+
+def test_recent_can_leave_the_place_out(db_path):
+    audit.log("queue", None, "задача упала", level="error", path=db_path, error=_fallen())
+
+    rows = audit.recent(limit=10, path=db_path, exclude_kind=audit.TRACE_KIND)
+    assert [row["kind"] for row in rows] == ["queue"]
+
+
+def test_place_of_client_error_stays_with_the_client(db_path):
+    client_id = db.admin_repo(db_path).ensure_client(telegram_id=79)
+    audit.log("queue", client_id, "задача упала", level="error", path=db_path, error=_fallen())
+
+    own = db.repo(client_id, db_path).rows("events")
+    assert audit.TRACE_KIND in [row["kind"] for row in own]
+    assert db.repo(client_id, db_path).rows("events", kind=audit.TRACE_KIND)

@@ -714,7 +714,13 @@ async def tasks_command(update, context, *, path: str | Path | None = None) -> N
     admin = db.admin_repo(path)
     running = admin.tasks(state=queue.RUNNING, limit=TASKS_LIMIT)
     failed = admin.tasks(state=queue.FAILED, limit=TASKS_LIMIT)
-    errors = admin.events(limit=EVENTS_LIMIT, level="error")
+    # Место ошибки в журнале есть, но владельцу оно не показывается: стек
+    # вызовов нужен тому, кто разбирает, а здесь он вытеснил бы с экрана сами
+    # ошибки. Отбор идёт запросом, а не фильтром после выборки: иначе пять
+    # последних записей оказались бы пятью стеками одного сбоя.
+    errors = admin.events(
+        limit=EVENTS_LIMIT, level="error", exclude_kind=audit.TRACE_KIND
+    )
     await _reply(update, tasks_text(running, failed, errors), reply_markup=tasks_keyboard(failed))
 
 

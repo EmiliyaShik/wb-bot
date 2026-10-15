@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.error import InvalidToken
+from telegram.error import InvalidToken, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from bot import texts
+from bot import netwatch, texts
 from bot.handlers import menu, register_all
 from core import audit, config, crypto, db, queue, scheduler
 
@@ -29,6 +30,11 @@ logger = logging.getLogger(__name__)
 TOKEN_MISSING = (
     "Не задан TELEGRAM_BOT_TOKEN. Создайте файл .env на основе .env.example "
     "и положите туда токен бота, полученный у @BotFather в Telegram."
+)
+
+START_AGAIN = (
+    "Запуск не удался, связи с Telegram нет ({error}). Подожду {pause} с и "
+    "попробую снова. Настройки тут не при чём: токен на месте, не отвечает сеть."
 )
 
 TOKEN_REJECTED = (
@@ -45,6 +51,14 @@ CONCURRENT_UPDATES = 32
 WORKER_POLL_SEC = 5.0
 # Сколько ждём, пока воркер доработает текущую задачу при выключении.
 WORKER_STOP_TIMEOUT_SEC = 10.0
+
+# Сколько раз пробовать поздороваться с Telegram на запуске. Минус один это
+# «бесконечно», и это не настройка, а правило: обрыв связи в момент запуска не
+# повод не запускаться. По умолчанию библиотека ставит здесь ноль, то есть
+# первая же неудача getMe роняет процесс с трассировкой, а на хостинге это
+# значит «деплой не поднялся из-за помех у провайдера». Паузу между этими
+# попытками библиотека держит сама, секунду.
+BOOTSTRAP_RETRIES_FOREVER = -1
 
 
 def make_notifier(app):
@@ -72,9 +86,25 @@ def make_notifier(app):
     return notify
 
 
+def make_owner_sender(app):
+    """Слово владельцу, которое не прячет отказ отправки.
+
+    `make_notifier` гасит отказ намеренно: очередь не должна падать из-за
+    молчащего Telegram. Присмотру за связью нужно обратное, именно знать, дошло
+    ли слово: не дошло - он повторит его, когда связь вернётся.
+    """
+
+    async def send(text: str) -> None:
+        for chat_id in config.admin_ids():
+            await app.bot.send_message(chat_id=chat_id, text=text)
+
+    return send
+
+
 async def start_background(app) -> None:
     """Поднимает фон: сначала подбираем брошенное, потом расписание, потом воркер."""
     queue.set_notifier(make_notifier(app))
+    netwatch.set_notifier(make_owner_sender(app))
 
     recovered = queue.recover()
     if recovered:
@@ -115,6 +145,8 @@ async def start_background(app) -> None:
 
 async def stop_background(app) -> None:
     """Останавливает воркер без обрыва текущей задачи."""
+    # Говорить владельцу про связь больше некуда: приложение уже погашено.
+    netwatch.set_notifier(None)
     stop = app.bot_data.pop("queue_stop", None)
     worker = app.bot_data.pop("queue_worker", None)
     if stop is not None:
@@ -250,6 +282,18 @@ async def on_error(update: object, context) -> None:
     без строчки в журнале: искать было нечего и негде.
     """
     error = getattr(context, "error", None)
+
+    # Неудачная попытка опроса приезжает сюда без апдейта и без работы
+    # расписания, и своя запись у неё уже есть: bot.netwatch пишет начало
+    # обрыва, его затягивание и возвращение связи. Вторая запись на каждую
+    # попытку превратила бы журнал в поток одинаковых строк и вытеснила бы из
+    # него всё остальное: за одиннадцать минут обрыва это десятки строк.
+    # Спрашиваем присмотр, а не тип ошибки: в этой библиотеке BadRequest тоже
+    # наследник NetworkError, и по типу обрыв связи от испорченного запроса не
+    # отличить.
+    if update is None and getattr(context, "job", None) is None and netwatch.failures():
+        return
+
     logger.exception("сбой в хендлере: %s", error, exc_info=error)
 
     client_id = None
@@ -292,14 +336,21 @@ def build_app(token: str) -> Application:
     # concurrent_updates: иначе бот разбирает строго одно сообщение за раз, и
     # любой хендлер, который чего-то ждёт (поход на витрину WB за карточкой,
     # ответ Telegram), держит очередь для всех остальных клиентов.
+    # get_updates_request: транспорт опроса под присмотром bot.netwatch. Обрыв
+    # связи приходит сюда первым, и только здесь его видно целиком, включая
+    # таймаут, который библиотека повторяет молча и без паузы.
     app = (
         Application.builder()
         .token(token)
         .concurrent_updates(CONCURRENT_UPDATES)
+        .get_updates_request(netwatch.updates_request())
         .post_init(start_background)
         .post_shutdown(stop_background)
         .build()
     )
+    # Признак «опрос ещё идёт» библиотека снимает раньше, чем делает последний
+    # заход за прочитанным, и по нему присмотр отличает обрыв от выключения.
+    netwatch.set_polling(lambda: app.updater is not None and app.updater.running)
 
     names = register_all(app)
     logger.info("Хендлеры модулей: %s", ", ".join(names) if names else "пока нет")
@@ -334,9 +385,49 @@ def run(token: str | None) -> None:
         "включён" if report["tokens_enabled"] else "выключен",
     )
 
+    attempt = 0
+    while True:
+        try:
+            _run_once(token)
+            return
+        except InvalidToken as exc:
+            raise SystemExit(TOKEN_REJECTED) from exc
+        except NetworkError as error:
+            # Обрыв связи в момент запуска это не повод не запускаться. Сюда
+            # приводит getMe внутри initialize(): библиотека зовёт его, чтобы
+            # проверить токен, и повторов на нём не держит никаких, а
+            # bootstrap_retries до этого места не доходит. Без этого цикла
+            # деплой во время помех у провайдера кончался трассировкой.
+            attempt += 1
+            pause = netwatch.pause_sec(attempt)
+            audit.log(
+                "telegram",
+                None,
+                START_AGAIN.format(
+                    error=f"{type(error).__name__}: {error}"[:200], pause=int(pause)
+                ),
+                level="warning",
+            )
+            time.sleep(pause)
+
+
+def _run_once(token: str) -> None:
+    """Одна попытка поднять бота. Возвращается, когда бота погасили.
+
+    Свой цикл событий на попытку, и закрывает его тот же, кто открыл. Иначе
+    второй попытки не было бы вовсе: библиотека берёт текущий цикл, а
+    закрытый цикл падает на первом же ожидании.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         app = build_app(token)
         logger.info("Бот запущен")
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-    except InvalidToken as exc:
-        raise SystemExit(TOKEN_REJECTED) from exc
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            bootstrap_retries=BOOTSTRAP_RETRIES_FOREVER,
+            close_loop=False,
+        )
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)

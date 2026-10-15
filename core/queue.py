@@ -396,12 +396,18 @@ async def _execute(task: Task, path: str | Path | None = None) -> None:
             last_error=str(error),
             finished_at=_stamp(_now()),
         )
+        # `error=` добавляет к записи место ошибки отдельным событием журнала.
+        # Зовётся это только здесь, в ветке непредвиденного сбоя: отказ
+        # Wildberries и непринятый ключ ниже своё место называют сами, а стек
+        # на каждую такую ошибку раздул бы журнал без всякой пользы. В
+        # `last_error` по-прежнему одна строка: её владелец читает в /tasks.
         audit.log(
             "queue",
             None,
             f"задача {task.kind} #{task.id} клиента {task.client_id} сорвалась: {error}",
             level="error",
             path=path,
+            error=error,
         )
         await _tell_about_failure(task, path)
     else:

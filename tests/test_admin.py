@@ -684,6 +684,37 @@ async def test_the_error_text_reaches_the_owner_cleaned_of_tokens(db_path, busin
     assert "401 от WB" in message.last  # сама ошибка при этом видна
 
 
+@pytest.mark.asyncio
+async def test_tasks_does_not_show_the_owner_the_stack(db_path, business, owner):
+    """Место ошибки в журнале есть, а в /tasks его нет: владелец не программист.
+
+    Стек нужен тому, кто будет разбирать, и лежит он в журнале своим видом
+    события. На экране владельца он вытеснил бы сами ошибки.
+    """
+    first, _ = business
+    try:
+        raise ValueError("неизвестный период: dates")
+    except ValueError as error:
+        audit.log(
+            "queue",
+            None,
+            "задача finance_report #7 сорвалась: неизвестный период: dates",
+            level="error",
+            path=db_path,
+            error=error,
+        )
+    message = FakeMessage()
+
+    await admin.tasks_command(FakeUpdate(OWNER, message), context(), path=db_path)
+
+    assert "неизвестный период: dates" in message.last, "сам сбой владелец видит"
+    assert "Traceback" not in message.last
+    assert "test_admin.py" not in message.last
+    # А в журнале стек на месте, и найти его можно по виду события.
+    place = db.admin_repo(db_path).events(limit=10, kind=audit.TRACE_KIND)
+    assert place and "Traceback" in place[0]["message"]
+
+
 # --- чужой текст в сообщении владельцу ---
 #
 # Сообщения владельцу уходят с ParseMode.HTML, а внутрь попадает то, что
