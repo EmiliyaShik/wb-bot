@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import time
+import traceback
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -193,6 +194,46 @@ def hush_url_logging() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+class SecretsHidden(logging.Filter):
+    """Сторож вывода: из каждой строчки логов вычищаются секреты.
+
+    Порог болтливым библиотекам закрывает обычный путь, но не ошибки. Текст
+    исключения и кадры стека пишутся как есть, а адрес запроса к Telegram
+    содержит токен бота целиком; на хостинге этот вывод хранится и читается
+    не только владельцем. Один раз бот уже напечатал туда свой токен.
+
+    Чистка та же, что у журнала (`core.audit.redact`), второй её в проекте
+    нет. Сам сторож не роняет ничего: сбой чистки оставляет строку как была,
+    потому что потерянная запись хуже неидеальной.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = audit.redact(record.getMessage())
+            record.args = ()
+            if record.exc_info:
+                text = record.exc_text or "".join(
+                    traceback.format_exception(*record.exc_info)
+                )
+                record.exc_text = audit.redact(text)
+        except Exception:  # noqa: BLE001 - сторож логов не ломает то, что пишет
+            return True
+        return True
+
+
+def hide_secrets_in_logs() -> None:
+    """Вешает сторож на вывод. Повторный вызов ничего не удваивает.
+
+    Фильтр нужен и на обработчиках, и на корневом журнале: записи дочерних
+    журналов проходят через обработчики корня, а записи самого корня через
+    его собственные фильтры.
+    """
+    root = logging.getLogger()
+    for target in (root, *root.handlers):
+        if not any(isinstance(one, SecretsHidden) for one in target.filters):
+            target.addFilter(SecretsHidden())
+
+
 def startup() -> dict:
     """Готовит бота к работе: папка данных, миграции, честный отчёт о ключах.
 
@@ -200,6 +241,7 @@ def startup() -> dict:
     просто часть возможностей выключена, и об этом написано в журнале.
     """
     hush_url_logging()
+    hide_secrets_in_logs()
     config.data_dir().mkdir(parents=True, exist_ok=True)
     version = db.migrate()
 
@@ -450,6 +492,7 @@ def main() -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.INFO,
     )
+    hide_secrets_in_logs()
     run(os.getenv("TELEGRAM_BOT_TOKEN"))
 
 
