@@ -53,7 +53,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
-from agents import finance, profit
+from agents import finance, profit, storage
 from core import queue
 from core import tax as tax_module
 from bot.handlers import period
@@ -180,6 +180,48 @@ AD_DEDUCTION_REST = (
 AD_DEDUCTION_WHOLE = (
     " Счёт сошёлся со статистикой целиком, поэтому второй раз в расходы он не "
     "идёт: реклама вычтена один раз, расходом по товарам."
+)
+
+# Хранение и приёмка по товарам. Это второй отчёт Wildberries, и молчать о
+# том, что он другой, нельзя: селлер сложит столбец, сверит с /finance и не
+# получит того же числа. Поэтому названы оба числа, разница и источник.
+REPORT_SOURCE = (
+    "\n\n📦 {title} по товарам: {amount}. Это {source}, отдельный отчёт "
+    "Wildberries: в нём сумма стоит по каждому товару и по каждым суткам, "
+    "поэтому в файле есть колонка «{column}». В отчёте о реализации та же "
+    "статья приходит общей суммой по кабинету, и за период это {billed}."
+)
+
+REPORT_GAP = (
+    " Разница {gap}: два отчёта сойтись не обязаны, Wildberries этого и не "
+    "обещает. Причины он называет сам: перерасчёты задним числом, сутки против "
+    "недель отчёта о реализации, скидка лояльности отдельным полем и разные "
+    "сервисы за двумя отчётами. Ту же разницу показывают сверка /finance и две "
+    "цифры расхода /ads."
+)
+
+REPORT_MATCH = " Разница в пределах рубля, то есть два отчёта сошлись."
+
+REPORT_PARTIAL = (
+    " Суток периода собрано {days} из {total}: окно одного запроса у этого "
+    "отчёта короткое, историю я добираю по ночам. Несобранные сутки уже "
+    "ставлю в работу, в следующем отчёте за этот период они будут."
+)
+
+REPORT_REST = (
+    " Из статьи отчёта о реализации по товарам вычтено {covered}, а остаток "
+    "{rest} вычтен вместе с расходами без артикула: эти деньги Wildberries "
+    "правда удержал. Дважды не вычитается ничего."
+)
+
+REPORT_WHOLE = (
+    " Второй отчёт объяснил статью целиком, поэтому второй раз в расходы она "
+    "не идёт."
+)
+
+REPORT_FINANCE = (
+    " В /finance ничего не подменено: там стоит сумма из отчёта о реализации, "
+    "по нему вы сверяетесь с Wildberries."
 )
 
 FACELESS = "\n\n🧾 Расходы без артикула (обезличка): {amount}."
@@ -488,6 +530,61 @@ def _faceless_parts(report: Any) -> Safe:
     return Safe(text)
 
 
+def report_sources_block(report: Any) -> Safe:
+    """Хранение и приёмка по товарам: два числа про одни деньги и разница.
+
+    Молчать здесь нельзя. Селлер сложит колонку в файле, сверит её с /finance
+    и получит другое число: если бот об этом не сказал, он решит, что одна из
+    цифр выдумана. Поэтому названы оба числа, разница, источник и то, что в
+    /finance не подменено ничего.
+    """
+    text = Safe("")
+    for source in report.report_sources:
+        # Денег нет ни в одном из двух источников: абзац про ноль рублей в
+        # сводке с телефона стоит дороже самого нуля. Колонка в книге при этом
+        # остаётся: настоящий ноль это ответ.
+        if not source.notable:
+            continue
+        text = Safe(
+            text
+            + fill(
+                REPORT_SOURCE,
+                title=source.title,
+                amount=_money(source.total),
+                source=source.source,
+                column=source.column,
+                billed=_money(source.billed),
+            )
+        )
+        text = Safe(
+            text
+            + (
+                REPORT_MATCH
+                if source.matches
+                else fill(REPORT_GAP, gap=_money(source.gap))
+            )
+        )
+        if not source.complete:
+            text = Safe(
+                text
+                + fill(REPORT_PARTIAL, days=source.days, total=source.days_total)
+            )
+        rest = source.uncovered
+        if rest > 0:
+            text = Safe(
+                text
+                + fill(
+                    REPORT_REST,
+                    covered=_money(source.replaced),
+                    rest=_money(rest),
+                )
+            )
+        elif rest == 0:
+            text = Safe(text + REPORT_WHOLE)
+        text = Safe(text + REPORT_FINANCE)
+    return text
+
+
 def tax_block(report: Any) -> Safe:
     """Налог словами: база, сумма и прибыль после него.
 
@@ -619,6 +716,10 @@ def summary_text(report: Any) -> Safe:
                     COMPENSATION_COST, amount=_money(report.total_compensation_cost)
                 )
             )
+    # Хранение и приёмка по своим отчётам стоят до разговора об обезличке: это
+    # те самые деньги, которые раньше целиком лежали в ней, и читать про
+    # остаток удобнее уже зная, откуда он взялся.
+    text = Safe(text + report_sources_block(report))
     if report.ad_deductions != 0 and not report.ad_deductions_counted:
         text = Safe(
             text
@@ -823,6 +924,10 @@ def register(app, *, path: str | Path | None = None) -> None:
     """Хендлер ставит себя сам: bot/app.py никто не трогает."""
     profit.set_sender(make_sender(app, path))
     profit.register_jobs()
+    # Хранение и приёмку по товарам копит агент 8, своей команды у него нет:
+    # его данные это колонки в этой книге. Поэтому его работы ставит тот
+    # хендлер, которому они нужны.
+    storage.register_jobs()
 
     guard = require_module(profit.MODULE, path=path)
     # Ввод дат приходит текстом, мимо кнопки, поэтому доступ к модулю

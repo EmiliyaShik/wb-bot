@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable, Sequence
 
@@ -80,6 +80,26 @@ UPD_MAX_DAYS = 31
 FUNNEL_HISTORY_MAX_IDS = 20
 # Поисковый отчёт: limit это число групп товаров в ответе, максимум 1000.
 SEARCH_REPORT_MAX_GROUPS = 1000
+# Отчёты с заданием. Окно одного задания это предел самого Wildberries: у
+# платного хранения 8 дней (ошибка 400 с текстом про 8 дней лежит прямо в
+# спецификации), у приёмки 31 день.
+PAID_STORAGE_MAX_DAYS = 8
+ACCEPTANCE_MAX_DAYS = 31
+# Сколько раз спросить про готовность задания, прежде чем сдаться. Сколько
+# отчёт готовится, Wildberries не говорит нигде; известно только, что готовый
+# живёт два часа, а статус разрешено спрашивать раз в пять секунд. Шестьдесят
+# опросов это пять минут ожидания: пауза между ними не своя, её держит
+# ограничитель частоты той же дорожки. Не дождались - это не «данных нет», а
+# «Wildberries не успел», и повтор делает очередь.
+REPORT_WAIT_POLLS = 60
+
+# Состояния задания, дословно из документации.
+REPORT_NEW = "new"
+REPORT_PROCESSING = "processing"
+REPORT_DONE = "done"
+REPORT_PURGED = "purged"
+REPORT_CANCELED = "canceled"
+
 REPORT_PAGE = 1000
 CARDS_PAGE = 100
 ANALYTICS_PAGE = 1000
@@ -143,6 +163,11 @@ class Endpoint:
     host: str
     path: str
     lane: str
+    # Чем метод назван в журнале вызовов, если путь пришлось подставить. У
+    # отчётов с заданием в пути стоит номер задания, и без этого поля каждый
+    # вызов попадал бы в `api_calls` под своим именем: сложить расход по
+    # методу стало бы нечем.
+    label_path: str = ""
 
     @property
     def url(self) -> str:
@@ -154,7 +179,17 @@ class Endpoint:
 
     @property
     def label(self) -> str:
-        return f"{self.verb} {self.path}"
+        return f"{self.verb} {self.label_path or self.path}"
+
+    def at(self, **parts: Any) -> "Endpoint":
+        """Тот же метод с подставленными частями пути.
+
+        Имя для журнала остаётся шаблонным: номер задания в нём не нужен
+        никому, а сложить вызовы по методу нужно владельцу.
+        """
+        return replace(
+            self, path=self.path.format(**parts), label_path=self.label_path or self.path
+        )
 
 
 ENDPOINTS: dict[str, Endpoint] = {
@@ -189,6 +224,40 @@ ENDPOINTS: dict[str, Endpoint] = {
         HOSTS["analytics"],
         "/api/analytics/v1/stocks-report/wb-warehouses",
         "analytics-stocks",
+    ),
+    # Платное хранение по товарам и суткам. Отчёт с заданием: три метода на
+    # один ответ, и дорожка у каждого своя, потому что лимиты Wildberries
+    # считает по методам, а не по отчёту.
+    "paid_storage_create": Endpoint(
+        "GET", HOSTS["analytics"], "/api/v1/paid_storage", "analytics-storage"
+    ),
+    "paid_storage_status": Endpoint(
+        "GET",
+        HOSTS["analytics"],
+        "/api/v1/paid_storage/tasks/{task_id}/status",
+        "analytics-storage-status",
+    ),
+    "paid_storage_download": Endpoint(
+        "GET",
+        HOSTS["analytics"],
+        "/api/v1/paid_storage/tasks/{task_id}/download",
+        "analytics-storage-download",
+    ),
+    # Приёмка по товарам. Устройство то же, окно шире: 31 день против восьми.
+    "acceptance_create": Endpoint(
+        "GET", HOSTS["analytics"], "/api/v1/acceptance_report", "analytics-acceptance"
+    ),
+    "acceptance_status": Endpoint(
+        "GET",
+        HOSTS["analytics"],
+        "/api/v1/acceptance_report/tasks/{task_id}/status",
+        "analytics-acceptance-status",
+    ),
+    "acceptance_download": Endpoint(
+        "GET",
+        HOSTS["analytics"],
+        "/api/v1/acceptance_report/tasks/{task_id}/download",
+        "analytics-acceptance-download",
     ),
     "cards_list": Endpoint(
         "POST", HOSTS["content"], "/content/v2/get/cards/list", "content-cards"
@@ -904,6 +973,126 @@ class WBClient:
                 break
             offset += int(limit)
         return found
+
+    # --- отчёты с заданием: хранение и приёмка ---
+
+    async def _task_report(
+        self,
+        create: str,
+        status: str,
+        download: str,
+        *,
+        params: dict,
+        polls: int = REPORT_WAIT_POLLS,
+    ) -> list[dict]:
+        """Отчёт, который Wildberries готовит не сразу: заказать, дождаться, забрать.
+
+        Три метода на один ответ. Ожидание живёт здесь, а не в очереди, и это
+        решение: готовый отчёт Wildberries хранит два часа, поэтому заказать
+        сегодня и забрать завтра нельзя, а задание, брошенное на три часа,
+        придётся заказывать заново. Значит, все три шага обязаны уложиться в
+        одну работу.
+
+        Своей паузы между опросами здесь нет. Пауза это лимит метода (1 запрос
+        в 5 секунд), и держит её ограничитель частоты той же дорожки: второе
+        место, где живёт та же пауза, разошлось бы с первым молча. Повторов
+        после отказа тут тоже нет, как и у всех остальных методов: они живут
+        в очереди.
+
+        Состояния задания разные по смыслу, и смешивать их нельзя. `done` это
+        «забирай». `new` и `processing` это «ещё готовится». `purged` это
+        «отчёт удалён», `canceled` это «задание отклонено»: оба означают, что
+        ждать больше нечего и заказывать надо заново, поэтому наружу они летят
+        ошибкой с именем состояния, а не пустым списком. Пустой список
+        означает ровно одно: Wildberries сказал, что данных нет (код 204).
+        """
+        answer = unwrap(await self.request(create, params=params))
+        task_id = str((answer or {}).get("taskId") or "").strip()
+        if not task_id:
+            raise WBApiError(
+                "Wildberries не выдал номер задания на отчёт.",
+                path=ENDPOINTS[create].label,
+            )
+        spot = ENDPOINTS[status].at(task_id=task_id)
+        state = ""
+        for _ in range(max(1, int(polls))):
+            body = unwrap(await self.request_endpoint(spot))
+            state = str((body or {}).get("status") or "").strip().lower()
+            if state == REPORT_DONE:
+                break
+            if state in (REPORT_PURGED, REPORT_CANCELED):
+                raise WBApiError(
+                    f"Wildberries не отдал отчёт: задание в состоянии «{state}».",
+                    path=spot.label,
+                )
+        else:
+            raise WBUnavailable(
+                "Wildberries готовит отчёт дольше, чем мы его ждём "
+                f"(последнее состояние «{state or 'неизвестно'}»).",
+                path=spot.label,
+            )
+        return _listify(
+            await self.request_endpoint(ENDPOINTS[download].at(task_id=task_id)),
+            "rows",
+            "items",
+        )
+
+    async def paid_storage(
+        self,
+        date_from: date | datetime | str,
+        date_to: date | datetime | str,
+        *,
+        polls: int = REPORT_WAIT_POLLS,
+    ) -> list[dict]:
+        """Отчёт о платном хранении: сумма по артикулу и по суткам.
+
+        Это второй источник тех же денег, что лежат в `paidStorage` отчёта о
+        реализации, и совпадения Wildberries нигде не обещает: причины
+        названы в `docs/wb-api-storage.md`. Поэтому метод отдаёт строки как
+        есть, а решает, что с двумя числами делать, тот, кто их показывает.
+
+        Окно одного задания восемь дней, и режется период здесь: помнить это
+        ограничение каждому вызывающему незачем. Фильтра по артикулу у метода
+        нет вовсе, отчёт приходит на весь кабинет.
+        """
+        collected: list[dict] = []
+        for window in date_windows(date_from, date_to, PAID_STORAGE_MAX_DAYS):
+            collected.extend(
+                await self._task_report(
+                    "paid_storage_create",
+                    "paid_storage_status",
+                    "paid_storage_download",
+                    params={"dateFrom": day(window[0]), "dateTo": day(window[1])},
+                    polls=polls,
+                )
+            )
+        return collected
+
+    async def acceptance_report(
+        self,
+        date_from: date | datetime | str,
+        date_to: date | datetime | str,
+        *,
+        polls: int = REPORT_WAIT_POLLS,
+    ) -> list[dict]:
+        """Отчёт о приёмке: стоимость приёмки по артикулу и дате поставки.
+
+        Устроен так же, как хранение, но окно шире: 31 день за задание.
+        Артикул здесь называется `nmID`, с заглавной D, а не `nmId`, как в
+        хранении: это факт про Wildberries, а не опечатка.
+        """
+        collected: list[dict] = []
+        for window in date_windows(date_from, date_to, ACCEPTANCE_MAX_DAYS):
+            collected.extend(
+                await self._task_report(
+                    "acceptance_create",
+                    "acceptance_status",
+                    "acceptance_download",
+                    params={"dateFrom": day(window[0]), "dateTo": day(window[1])},
+                    polls=polls,
+                )
+            )
+        return collected
 
     # --- карточки товаров ---
 

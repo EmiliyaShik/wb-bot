@@ -608,6 +608,12 @@ def test_only_reading_methods_have_wrappers():
         "sales_funnel_history",
         "search_report",
         "stocks_wb_warehouses",
+        "paid_storage_create",
+        "paid_storage_status",
+        "paid_storage_download",
+        "acceptance_create",
+        "acceptance_status",
+        "acceptance_download",
         "cards_list",
         "seller_info",
     }

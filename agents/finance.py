@@ -84,6 +84,7 @@ __all__ = [
     "UNKNOWN",
     "doc_kind",
     "row_kind",
+    "title_of",
     "AD_DEDUCTION_MARK",
     "is_ad_deduction",
     "Amounts",
@@ -291,6 +292,28 @@ def _day(value: Any) -> str:
     """Дата WB в вид ГГГГ-ММ-ДД. В базе всё без часовых поясов и в UTC."""
     text = str(value or "")
     return text[:10]
+
+
+def title_of(row: Any) -> str:
+    """Название товара одной строки `fin_rows`: поле `title` из `raw`.
+
+    Название в отчёте о реализации есть, и приходит оно вместе с деньгами.
+    Отдельной колонки под него в схеме нет, поэтому берётся оно оттуда же,
+    откуда комиссия: из сохранённой целиком строки WB.
+
+    Пустая строка значит «в этой строке названия нет». Так приходят
+    служебные строки отчёта (хранение, логистика, удержания): у них нет ни
+    артикула, ни названия, и названию там взяться негде. На живом кабинете
+    владельца (28 968 строк) пустое название не встретилось ни в одной
+    строке с артикулом.
+    """
+    raw = row["raw"] if "raw" in row.keys() else None
+    if not raw:
+        return ""
+    try:
+        return str(json.loads(raw).get("title") or "").strip()
+    except (TypeError, ValueError):
+        return ""
 
 
 def vw_of(row: Any) -> Decimal:
@@ -606,6 +629,11 @@ class Article:
     nm_id: int | None
     vendor_code: str = ""
     subject: str = ""
+    # Название товара из отчёта о реализации (поле `title`). Пустое значит
+    # «в строках этого артикула названия не было»: так бывает у строк без
+    # `raw`, записанных прежней версией бота. Тогда название ищется в
+    # справочнике карточек, см. `agents.profit`.
+    title: str = ""
     quantity: int = 0
     amounts: Amounts = Amounts()
     # Чем Wildberries обосновал компенсацию (`sellerOperName`), в порядке
@@ -1456,8 +1484,22 @@ def articles_of(
                     # Словарь, а не множество: порядок появления сохраняется,
                     # повторы гасятся.
                     "reasons": {},
+                    "title": "",
+                    "title_day": "",
                 },
             )
+            # Название берётся из самой поздней строки артикула. Товар могли
+            # переименовать (на живом кабинете так и есть у одного из десяти),
+            # и тогда в отчёте за год лежат два названия одного артикула.
+            # Нынешнее имя это то, под которым товар продаётся сейчас: именно
+            # его селлер видит в кабинете и его же отдал бы справочник
+            # карточек. Выбирать «первое встретившееся» значило бы называть
+            # товар именем, которого у него уже нет.
+            title = title_of(row)
+            day = str(row["rr_dt"] or "")[:10]
+            if title and day >= bucket["title_day"]:
+                bucket["title"] = title
+                bucket["title_day"] = day
             kind, piece = row_amounts(row)
             # «Штук» в книге это проданное плюс возвращённое. Служебная строка
             # артикула тоже касается (логистика и хранение приходят по
@@ -1473,6 +1515,7 @@ def articles_of(
             nm_id=nm_id,
             vendor_code=bucket["vendor_code"],
             subject=bucket["subject"],
+            title=bucket["title"],
             quantity=bucket["quantity"],
             amounts=bucket["amounts"],
             compensation_reasons=tuple(name for name in bucket["reasons"] if name),

@@ -42,6 +42,8 @@ CLIENT_TABLES: frozenset[str] = frozenset(
         "ad_nm_daily",
         "ad_upd",
         "funnel_visibility",
+        "expense_daily",
+        "expense_days",
         "plans",
         "tasks",
         "api_calls",

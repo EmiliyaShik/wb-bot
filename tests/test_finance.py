@@ -1322,3 +1322,41 @@ async def test_a_week_name_from_wildberries_does_not_become_markup(cabinet, db_p
     assert "<a href" not in text
     assert "&lt;a href=&quot;" in text
     assert "<b>" in text  # разметка самого бота при этом на месте
+
+
+# --- название товара в самом отчёте о реализации ---
+#
+# Поле `title` у Wildberries есть, и приходит оно вместе с деньгами. Проверено
+# на живом кабинете владельца: во всех 28 968 строках поле присутствует, а
+# пустое оно только там, где нет артикула, то есть в служебных строках.
+
+
+def test_title_comes_from_the_report_row_and_a_service_row_has_none(db_path):
+    """Название берётся из сохранённой строки WB, как и комиссия.
+
+    Отдельной колонки под него в схеме нет и не нужно: строка отчёта лежит в
+    `raw` целиком ровно затем, чтобы миграция не понадобилась.
+    """
+    client_id = db.admin_repo(db_path).ensure_client(3131)
+    finance.save_rows(
+        client_id,
+        [
+            {
+                "reportId": 1,
+                "rrdId": 1,
+                "nmId": 111,
+                "docTypeName": "Продажа",
+                "title": "Кружка с котом",
+                "retailAmount": 1000,
+                "quantity": 1,
+            },
+            # Служебная строка: ни артикула, ни названия. Пустое название тут
+            # это не потеря данных, а «названию взяться негде».
+            {"reportId": 1, "rrdId": 2, "docTypeName": "", "paidStorage": 50},
+        ],
+        path=db_path,
+    )
+    rows = {row["rrd_id"]: row for row in db.repo(client_id, db_path).rows("fin_rows")}
+
+    assert finance.title_of(rows[1]) == "Кружка с котом"
+    assert finance.title_of(rows[2]) == ""

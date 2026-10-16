@@ -371,8 +371,20 @@ class FakeApp:
 @pytest.mark.asyncio
 async def test_answer_names_the_deadline_the_gap_and_the_modules(db_path, ready, wb):
     clients.record_consent(ready, now=NOW, path=db_path)
+    # Доступ выдаётся от настоящего «сейчас», а не от NOW этого файла. Состояние
+    # модулей в ответе хендлер считает по настоящим часам, и тридцать дней от
+    # записанной даты однажды кончились: тест ждал «активен до», а доступ к тому
+    # дню уже истёк. Проверять он должен подпись состояния, а не то, какое
+    # сегодня число.
     access.grant_access(
-        ready, "finance", 30, "WBR-2026-0004", "invoice", "owner", now=NOW, path=db_path
+        ready,
+        "finance",
+        30,
+        "WBR-2026-0004",
+        "invoice",
+        "owner",
+        now=datetime.now(timezone.utc),
+        path=db_path,
     )
     # Токен без категории Финансы и без галочки «Только на чтение».
     token = make_token(s=MASK_FIVE ^ (1 << 13))

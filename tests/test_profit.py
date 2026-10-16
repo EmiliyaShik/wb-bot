@@ -791,6 +791,102 @@ async def test_refusal_of_wildberries_does_not_look_like_a_missing_card(
     assert 999 not in profit.names_of(cabinet, path=db_path)
 
 
+# Та же неделя, но строки с названием товара: Wildberries присылает его полем
+# `title` в самом отчёте о реализации. На живом кабинете владельца это поле
+# заполнено во всех 22 088 строках, у которых есть артикул, и пусто только в
+# служебных, где артикула нет вовсе.
+NAMED_ROWS = [
+    dict(row, title=f"Товар {row['nmId']}") if row.get("nmId") else dict(row)
+    for row in ROWS
+]
+
+
+def test_the_name_comes_with_the_money_and_not_from_the_catalogue(db_path):
+    """Название берётся из отчёта о реализации, а справочник не нужен вовсе.
+
+    Раньше за именем товара бот ходил в каталог карточек отдельным методом, и
+    это был лишний поход в Wildberries у каждого клиента на каждом отчёте.
+    Имя приезжает вместе с деньгами, той же строкой.
+    """
+    client_id = seed(db_path, NAMED_ROWS, {111: Decimal("500")}, telegram_id=6161)
+
+    report = report_of(client_id, db_path)
+
+    assert profit.names_of(client_id, path=db_path) == {}
+    assert article(report, 111).title == "Товар 111"
+    assert article(report, 222).title == "Товар 222"
+    assert article(report, 111).display_name == "Товар 111"
+
+
+def test_a_renamed_product_keeps_the_name_it_sells_under_now(db_path):
+    """Товар переименовали - в книге стоит нынешнее имя, а не первое.
+
+    На живом кабинете владельца так и есть у одного артикула из десяти: в
+    отчёте за год лежат два названия. Нынешнее это то, под которым товар
+    продаётся сейчас, и именно его селлер видит в кабинете.
+    """
+    # Новое имя лежит в строке с меньшим номером: так проверяется, что решает
+    # дата операции, а не порядок строк в базе.
+    new = dict(ROWS[0], rrdId=71, rrDate="2026-09-05", title="Новое имя")
+    old = dict(ROWS[0], rrdId=72, rrDate="2026-09-02", title="Старое имя")
+    client_id = seed(db_path, [new, old], {111: Decimal("500")}, telegram_id=6262)
+
+    report = report_of(client_id, db_path)
+
+    assert article(report, 111).title == "Новое имя"
+
+
+@pytest.mark.asyncio
+async def test_only_the_unnamed_articles_send_the_bot_to_the_catalogue(
+    cabinet, db_path
+):
+    """В каталог карточек бот идёт только за безымянным артикулом.
+
+    Так работает обработчик задачи: он спрашивает названия ровно по тем
+    артикулам, которых отчёт о реализации не назвал. Названия есть у всех -
+    похода в Wildberries нет вовсе, и категория токена «Контент» для отчёта
+    больше не нужна.
+    """
+    finance.save_rows(cabinet, NAMED_ROWS, path=db_path)
+    for week in finance.aggregate(NAMED_ROWS).values():
+        finance.save_week(cabinet, week, path=db_path)
+    report = report_of(cabinet, db_path)
+    http, seen = counting_http({CARDS_PATH: CARDS})
+
+    unnamed = [item.nm_id for item in report.articles if not item.title]
+    names = await names_for(cabinet, db_path, unnamed, http)
+
+    assert unnamed == []
+    assert names == {}
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_a_row_without_the_name_still_goes_to_the_catalogue(cabinet, db_path):
+    """Строка без названия оставляет справочник запасным путём.
+
+    Так лежат строки, записанные прежней версией бота: `raw` у них нет, и
+    названия взять негде. Отнять у таких артикулов имя значило бы испортить
+    уже выданные отчёты ради чистоты.
+    """
+    finance.save_rows(cabinet, ROWS, path=db_path)
+    for week in finance.aggregate(ROWS).values():
+        finance.save_week(cabinet, week, path=db_path)
+    report = report_of(cabinet, db_path)
+    http, seen = counting_http({CARDS_PATH: CARDS})
+
+    unnamed = [item.nm_id for item in report.articles if not item.title]
+    names = await names_for(cabinet, db_path, unnamed, http)
+
+    assert sorted(unnamed) == [111, 222]
+    assert names == {111: "Наматрасник на резинке 160х200", 222: ""}
+    assert seen == [CARDS_PATH]
+    # И это имя доезжает до книги тем же путём, что и раньше.
+    assert article(profit.with_names(report, names), 111).title == (
+        "Наматрасник на резинке 160х200"
+    )
+
+
 # --- компенсация Wildberries ---
 #
 # Кабинет владельца в миниатюре. Товар «Свечи новогодние» стоял в отчёте как

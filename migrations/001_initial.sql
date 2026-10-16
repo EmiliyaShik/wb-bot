@@ -103,11 +103,11 @@ CREATE TABLE IF NOT EXISTS costs (
     PRIMARY KEY (client_id, nm_id)
 );
 
--- Названия карточек товаров. В отчёте о реализации названия нет вовсе: там
--- nmId, vendorCode, brandName и subjectName, а subjectName это предмет, то
--- есть категория («Наматрасник»), а не название карточки. Название живёт в
--- другом методе (карточки товаров, категория токена «Контент»), и держать его
--- здесь нужно затем, чтобы не ходить в WB на каждый отчёт.
+-- Названия карточек товаров. Запасной путь, а не основной: название товара
+-- приходит в самом отчёте о реализации, полем title, и у каждой строки с
+-- артикулом оно заполнено. Справочник нужен тем артикулам, которым название
+-- взять больше негде: строки, записанные прежней версией бота без raw, и
+-- кабинет, которому Wildberries название в отчёте не прислал.
 --
 -- Пустой title это не «не спрашивали», а «спросили, и карточки у WB нет»:
 -- товар могли удалить из кабинета. Разница важна, потому что именно по ней
@@ -319,6 +319,59 @@ CREATE TABLE IF NOT EXISTS funnel_visibility (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (client_id, date_from, date_to, nm_id)
 );
+
+-- Расход Wildberries по товару за сутки из отчёта-задания. Сейчас таких
+-- отчётов два: платное хранение (kind = 'storage') и приёмка
+-- (kind = 'acceptance'). Устройство у них одинаковое до буквы: три шага с
+-- ожиданием готовности, сумма в рублях, артикул и дата в каждой строке.
+-- Поэтому таблица одна, а источник стоит колонкой: две таблицы-близнеца
+-- означали бы две копии сборщика и читателя, которые разошлись бы молча.
+--
+-- Это ВТОРОЙ источник тех же денег, что лежат в полях paidStorage и
+-- paidAcceptance отчёта о реализации, и совпадения с ними Wildberries нигде
+-- не обещает: перерасчёты задним числом, сутки против недель, скидка
+-- лояльности отдельным полем и разные сервисы. Поэтому в финансовой
+-- раскладке эти цифры ничего не подменяют, а в отчёте о прибыли колонка
+-- названа своим источником, и разница между двумя числами показывается.
+--
+-- Строка отчёта WB это сутки плюс поставка плюс размер, поэтому здесь они
+-- уже сложены по артикулу и дате: rows говорит, из скольких строк.
+CREATE TABLE IF NOT EXISTS expense_daily (
+    client_id    INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL,
+    date         TEXT NOT NULL,
+    nm_id        INTEGER NOT NULL,
+    amount_kop   INTEGER NOT NULL DEFAULT 0,
+    -- Скидка программы лояльности, отдельное поле отчёта о хранении. Вычтена
+    -- ли она из суммы хранения, в документации Wildberries не сказано, и
+    -- поэтому она лежит рядом, а не внутри: сложить её с суммой самим значит
+    -- придумать правило, которого у WB нет. У приёмки такого поля нет вовсе.
+    discount_kop INTEGER NOT NULL DEFAULT 0,
+    -- Штуки: у хранения это barcodesCount (сколько единиц тарифицировалось за
+    -- сутки), у приёмки count (сколько товаров приняли).
+    units        INTEGER NOT NULL DEFAULT 0,
+    rows         INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (client_id, kind, date, nm_id)
+);
+CREATE INDEX IF NOT EXISTS idx_expense_daily_date ON expense_daily(client_id, kind, date);
+
+-- Какие сутки по этому отчёту уже собраны. Без этой таблицы «сутки без
+-- расхода» и «сутки, которые не собирали» выглядят одинаково: в обоих
+-- случаях строк в expense_daily нет. А разница важнее всего: по ней отчёт
+-- говорит, за сколько суток периода хранение по товарам у него есть, и
+-- только поэтому сумму столбца можно честно сравнивать с отчётом о
+-- реализации.
+CREATE TABLE IF NOT EXISTS expense_days (
+    client_id  INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    amount_kop INTEGER NOT NULL DEFAULT 0,
+    rows       INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (client_id, kind, date)
+);
+CREATE INDEX IF NOT EXISTS idx_expense_days_date ON expense_days(client_id, kind, date);
 
 CREATE TABLE IF NOT EXISTS plans (
     client_id          INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,

@@ -11,14 +11,20 @@
    `days[] -> apps[] -> nms[].sum`. Это единственный поход в WB, и он идёт
    через очередь: повтор при недоступности живёт только там.
 
-Четвёртый источник не обязателен и на цифры не влияет: названия карточек
-(`POST /content/v2/get/cards/list`, категория токена «Контент»). В отчёте о
-реализации названия нет вовсе, там только артикулы, бренд и предмет, а
-предмет это категория («Наматрасник»), а не название товара. Названия лежат
-в `card_names` и обновляются в двух случаях: в периоде появился артикул, о
-котором мы ещё не спрашивали, или известное название протухло по сроку из
-`config.toml` (секция `[cards]`). Без срока переименование карточки в
-кабинете не доехало бы до отчёта никогда.
+Названия товаров приходят вместе с деньгами: в отчёте о реализации есть поле
+`title`, и у каждой строки с артикулом оно заполнено (проверено на живом
+кабинете, 28 968 строк, пустое название встречается только в строках без
+артикула, то есть в служебных). Поэтому название берётся из той же строки,
+что и комиссия, и за ним никуда не ходят.
+
+Справочник карточек (`POST /content/v2/get/cards/list`, категория токена
+«Контент», таблица `card_names`) остался запасным путём, а не привычкой: в
+WB за ним идут только тогда, когда артикул остался безымянным. Так бывает у
+строк, записанных прежней версией бота без `raw`. Срок жизни названия
+(`config.toml`, секция `[cards]`) при этом остался при справочнике: он решает,
+когда переспросить каталог про те артикулы, чьё имя известно только из него.
+Товар, переименованный в кабинете, доезжает до отчёта сам, со следующей
+неделей отчёта о реализации.
 
 Два случая нехватки данных штатные, а не ошибки, и оба видны в отчёте.
 
@@ -81,6 +87,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from agents import finance
+
+# Второе исключение из правила «агент не знает про агента», и оно названо,
+# как и первое. Хранение и приёмку по товарам Wildberries отдаёт отдельными
+# отчётами, собирает их агент 8 (`agents/storage.py`), и колонки этих отчётов
+# живут только здесь: отдельной команды у них нет. Брать их больше негде, а
+# копия сборщика в этом файле означала бы второй поход в WB за теми же
+# деньгами.
+from agents import storage as storage_module
 from core import costs as costs_module
 from core import tax as tax_module
 from core import audit, config, db, queue, wbapi
@@ -123,6 +137,7 @@ __all__ = [
     "AdSpend",
     "ArticleProfit",
     "CostItem",
+    "ReportSpend",
     "ProfitReport",
     "Totals",
     "margin",
@@ -130,6 +145,7 @@ __all__ = [
     "spread",
     "ad_totals",
     "ad_replaced_by_stats",
+    "replaced_by_report",
     "collect_ads",
     "card_titles",
     "names_of",
@@ -558,6 +574,19 @@ class ArticleProfit:
     logistics: Decimal = ZERO
     storage: Decimal = ZERO
     acceptance: Decimal = ZERO
+    # Хранение и приёмка по отдельным отчётам Wildberries (агент 8). `None`
+    # значит «этих суток мы не собирали», а не «расхода не было»: нулём мы
+    # приписали бы селлеру прибыль, которой у него может и не быть. Когда
+    # число есть, в прибыль идёт оно, а статья из отчёта о реализации
+    # вычитается уже не здесь, см. `storage_counted`.
+    storage_report: Decimal | None = None
+    acceptance_report: Decimal | None = None
+    # Статья из отчёта о реализации вычтена сама, как раньше. Ложь ровно
+    # тогда, когда у статьи есть второй источник по товарам: тогда её деньги
+    # разобраны на заменённую часть (она вычтена колонкой второго отчёта) и
+    # остаток (он ушёл в обезличку), и дважды не вычитается ничего.
+    storage_counted: bool = True
+    acceptance_counted: bool = True
     penalties: Decimal = ZERO
     # Удержания без рекламной части: счёт рекламного кабинета вычитается не
     # здесь, а рядом. Почему так - в `METHODOLOGY`.
@@ -612,6 +641,10 @@ class ArticleProfit:
         при известном расходе по товарам реклама стоит в `ad_spend`, и второй
         раз её здесь быть не должно. Сумма этого свойства и есть то, что
         вычиталось, иначе проверять ей было бы нечего.
+
+        Хранение и приёмка живут по тому же правилу: пока второго источника
+        нет, они стоят здесь, а как только появился, их место занимают
+        `storage_report` и `acceptance_report`.
         """
         if self.commission is None:
             return None
@@ -619,8 +652,8 @@ class ArticleProfit:
             self.commission
             + self.acquiring
             + self.logistics
-            + self.storage
-            + self.acceptance
+            + (self.storage if self.storage_counted else ZERO)
+            + (self.acceptance if self.acceptance_counted else ZERO)
             + self.penalties
             + self.deductions
             + (self.ad_deductions if self.ad_deductions_counted else ZERO)
@@ -646,6 +679,29 @@ class ArticleProfit:
 AD_DEDUCTIONS_KEY = "ad_deductions"
 
 
+def replaced_by_report(billed: Decimal, by_article: Decimal | None) -> Decimal:
+    """Сколько статьи из отчёта о реализации заменил второй отчёт по товарам.
+
+    Правило одно на все такие статьи, и живёт оно здесь. Деньги приходят в
+    отчёт двумя путями: отчётом о реализации (документ взаиморасчётов, часто
+    без артикула) и отдельным отчётом Wildberries, где та же сумма разнесена
+    по товарам и суткам. Вычесть оба раза значит отнять у селлера прибыль,
+    которой он не терял; вычесть только второй значит выбросить из расходов
+    настоящие деньги в той части, которую второй отчёт не объяснил.
+
+    Поэтому заменённым считается наименьшее из двух: больше, чем сам второй
+    отчёт, он объяснить не может, а больше, чем выставлено, заменять нечего.
+    Остаток остаётся расходом и назван в отчёте словами. Так в расходах
+    всегда ровно столько денег, сколько их в большем из двух источников: один
+    раз и не меньше одного раза.
+
+    `None` во втором источнике это «его нет вовсе»: заменять нечем.
+    """
+    if by_article is None or billed <= ZERO or by_article <= ZERO:
+        return ZERO
+    return min(billed, by_article)
+
+
 def ad_replaced_by_stats(
     ad_deductions: Decimal, ad_spend: Decimal | None
 ) -> Decimal:
@@ -666,10 +722,11 @@ def ad_replaced_by_stats(
 
     `None` в расходе по товарам это «статистики нет вовсе»: заменять нечем, и
     счёт вычитается сам.
+
+    Само правило общее и живёт в `replaced_by_report`: у хранения и приёмки
+    та же развилка, и вторая её копия разошлась бы с первой молча.
     """
-    if ad_spend is None or ad_deductions <= ZERO or ad_spend <= ZERO:
-        return ZERO
-    return min(ad_deductions, ad_spend)
+    return replaced_by_report(ad_deductions, ad_spend)
 
 # Статьи расходов Wildberries. Ключ это поле или свойство `finance.Amounts`,
 # название то же, что в заголовке колонки. Порядок тот же, что в книге.
@@ -699,6 +756,10 @@ class CostItem:
     title: str
     by_article: Decimal = ZERO
     faceless: Decimal = ZERO
+    # Чем статья объяснена со второй стороны, словами: «отчёт WB о платном
+    # хранении», «отчёт WB о приёмке». Пусто у статей без второго источника, и
+    # тогда разговора о замене нет вовсе.
+    source: str = ""
     # Сколько из безартикульной части статьи вошло в обезличку, то есть
     # разносится по товарам. `None` значит «вся», и так у всех статей, кроме
     # одной: у рекламного удержания в обезличке остаётся только та часть
@@ -740,6 +801,122 @@ class CostItem:
 
 
 @dataclass(frozen=True)
+class ReportSpend:
+    """Статья, у которой есть второй источник: отдельный отчёт WB по товарам.
+
+    Сейчас таких две: хранение и приёмка. В отчёте о реализации они приходят
+    без артикула (хранение всегда, и это проверено живым кабинетом), а в своих
+    отчётах Wildberries разносит их по товарам и суткам.
+
+    Два числа под одним названием это главная опасность такой пары, поэтому
+    здесь лежат оба: `billed` это статья отчёта о реализации, `by_article` это
+    сумма второго отчёта по тем товарам, которые в прибыль и вошли. Разницу
+    между ними отчёт называет вслух, а не прячет: именно она показывает
+    перерасчёты, которых иначе не видно.
+    """
+
+    # Ключ статьи `finance.Amounts` (он же ключ колонки в книге) и источник
+    # второго отчёта (`agents.storage`). Имена разные нарочно: первое это
+    # наша раскладка, второе это отчёт Wildberries.
+    key: str
+    kind: str
+    spend: Any
+    billed: Decimal = ZERO
+    by_article: Decimal = ZERO
+
+    @property
+    def available(self) -> bool:
+        """Второй источник есть хоть за часть суток периода."""
+        return bool(self.spend is not None and self.spend.available)
+
+    @property
+    def title(self) -> str:
+        """Чем статья названа в книге: «Хранение», «Приёмка»."""
+        return dict(COST_ITEMS).get(self.key, self.key)
+
+    @property
+    def source(self) -> str:
+        return storage_module.SOURCE_TITLES.get(self.kind, self.kind)
+
+    @property
+    def column(self) -> str:
+        return storage_module.COLUMN_TITLES.get(self.kind, self.kind)
+
+    @property
+    def column_key(self) -> str:
+        """Ключ колонки книги, в которой стоит число второго отчёта."""
+        return f"{self.key}_report"
+
+    @property
+    def counted(self) -> bool:
+        """Статья отчёта о реализации вычитается сама, как до второго отчёта."""
+        return not self.available
+
+    @property
+    def replaced(self) -> Decimal:
+        """Часть статьи, которую объяснил второй отчёт. Правило общее на проект."""
+        return replaced_by_report(
+            self.billed, self.by_article if self.available else None
+        )
+
+    @property
+    def uncovered(self) -> Decimal:
+        """Остаток статьи, который остался расходом и ушёл в обезличку.
+
+        Второго источника нет вовсе - ноль: тогда статья и так вычтена
+        строками отчёта, и прибавлять её второй раз нельзя.
+        """
+        return ZERO if not self.available else self.billed - self.replaced
+
+    @property
+    def total(self) -> Decimal | None:
+        """Сумма по товарам из второго отчёта или None, если его нет."""
+        return self.by_article if self.available else None
+
+    @property
+    def gap(self) -> Decimal:
+        """Насколько второй отчёт разошёлся с отчётом о реализации."""
+        return self.by_article - self.billed
+
+    @property
+    def matches(self) -> bool:
+        """Разница в пределах рубля: тот же порог, что в сверке `/finance`."""
+        return abs(self.gap) <= finance.TOLERANCE
+
+    @property
+    def notable(self) -> bool:
+        """Есть ли о чём говорить: хоть в одном из двух источников есть деньги.
+
+        У кабинета владельца приёмка нулевая и там, и там. Абзац про ноль
+        рублей в сводке, которую читают с телефона, стоит дороже самого нуля:
+        колонка в книге остаётся (настоящий ноль это ответ, а не пробел), а
+        разговор о разнице двух нулей не нужен никому.
+        """
+        return self.billed != ZERO or self.by_article != ZERO
+
+    @property
+    def days(self) -> int:
+        return 0 if self.spend is None else int(self.spend.days)
+
+    @property
+    def days_total(self) -> int:
+        return 0 if self.spend is None else int(self.spend.days_total)
+
+    @property
+    def complete(self) -> bool:
+        """Второй отчёт собран за все сутки периода."""
+        return bool(self.spend is not None and self.spend.complete)
+
+    @property
+    def collected(self) -> Decimal:
+        """Весь расход собранных суток, включая строки без артикула."""
+        return ZERO if self.spend is None else self.spend.collected
+
+    def of(self, nm_id: int | None) -> Decimal | None:
+        return None if self.spend is None else self.spend.of(nm_id)
+
+
+@dataclass(frozen=True)
 class Totals:
     """Итог по кабинету. Складывается только то, что складывается.
 
@@ -770,6 +947,10 @@ class Totals:
     logistics: Decimal = ZERO
     storage: Decimal = ZERO
     acceptance: Decimal = ZERO
+    # Итоги колонок второго отчёта. `None` значит «этих суток не собирали»:
+    # в клетке итога будет «нет данных», а не ноль.
+    storage_report: Decimal | None = None
+    acceptance_report: Decimal | None = None
     penalties: Decimal = ZERO
     deductions: Decimal = ZERO
     ad_spend: Decimal | None = None
@@ -820,6 +1001,10 @@ class ProfitReport:
     # Из чего состоят расходы периода: по каждой статье отдельно то, что
     # Wildberries разнёс по товарам, и то, что отдал общей строкой.
     costs_breakdown: tuple[CostItem, ...] = ()
+    # Статьи, у которых есть второй источник по товарам: хранение и приёмка.
+    # Пусто значит «в этом отчёте их нет вовсе», и тогда всё считается ровно
+    # как раньше.
+    reports: tuple[ReportSpend, ...] = ()
     ads: AdSpend = None  # type: ignore[assignment]
     weeks: tuple[Any, ...] = ()
     # Период считан по датам операций, а не целыми неделями Wildberries.
@@ -921,6 +1106,27 @@ class ProfitReport:
         return ad_replaced_by_stats(self.ad_deductions, self.total_ad_spend)
 
     @property
+    def report_sources(self) -> tuple[ReportSpend, ...]:
+        """Статьи со вторым источником, у которых он правда есть.
+
+        По ним и строятся колонки книги, блок в листе проблем и разговор о
+        разнице двух чисел. Источник, которого нет (сутки не собирали, нет
+        категории токена «Аналитика»), в этом списке не стоит: колонка, в
+        которой нечему появиться, хуже отсутствующей.
+        """
+        return tuple(item for item in self.reports if item.available)
+
+    @property
+    def partial_sources(self) -> tuple[ReportSpend, ...]:
+        """Источники, собранные не за все сутки периода.
+
+        Такой столбец занижен по сравнению с отчётом о реализации ровно на
+        несобранные сутки, и это надо сказать числом, а не оставить селлеру
+        на догадки.
+        """
+        return tuple(item for item in self.report_sources if not item.complete)
+
+    @property
     def ad_uncovered(self) -> Decimal:
         """Часть рекламного счёта, которая осталась расходом как удержание.
 
@@ -999,6 +1205,8 @@ class ProfitReport:
             logistics=money("logistics"),
             storage=money("storage"),
             acceptance=money("acceptance"),
+            storage_report=self.report_total(storage_module.STORAGE),
+            acceptance_report=self.report_total(storage_module.ACCEPTANCE),
             penalties=money("penalties"),
             deductions=money("deductions"),
             ad_spend=self.total_ad_spend,
@@ -1008,6 +1216,23 @@ class ProfitReport:
             profit=profit_total,
             margin=margin(profit_total, counted_revenue),
         )
+
+    def report_of(self, kind: str) -> ReportSpend | None:
+        """Статья со вторым источником по его имени или None."""
+        for item in self.reports:
+            if item.kind == kind:
+                return item
+        return None
+
+    def report_total(self, kind: str) -> Decimal | None:
+        """Итог колонки второго отчёта или None, если источника нет.
+
+        Сумма берётся та же, что вычтена по товарам: расход товара, которого
+        в периоде не продавали, в прибыли не стоит нигде, и в итог колонки он
+        тоже не идёт.
+        """
+        found = self.report_of(kind)
+        return None if found is None else found.total
 
     @property
     def total_profit(self) -> Decimal:
@@ -1087,6 +1312,19 @@ class ProfitReport:
                 + totals.cost
                 + (ad_spend if ad_spend is not None else ZERO)
             )
+            # Та же развилка у хранения и приёмки, и ошибка была бы та же:
+            # удержанное Wildberries уже стоит в `amounts.costs`, а колонка
+            # второго отчёта прибавляется рядом. Вычитается не вся статья, а
+            # только заменённая её часть, то есть в базе остаётся большее из
+            # двух чисел. Дважды принятый расход занижает базу и обещает
+            # селлеру налог меньше настоящего, а это хуже, чем завысить.
+            #
+            # Несобранные сутки базу не занижают: пока второй отчёт меньше
+            # удержанного, он вычитается ровно на себя же, и в базе остаётся
+            # вся статья отчёта о реализации. Поэтому оговорки о полноте
+            # второго отчёта здесь нет: оговаривать нечего.
+            for source in self.report_sources:
+                expenses = expenses - source.replaced + (source.total or ZERO)
             if totals.costed < totals.articles:
                 missing.append(tax_module.MISSING_COST)
             if ad_spend is None:
@@ -1331,6 +1569,11 @@ def _articles_without_raw(
 # --- сборка отчёта -----------------------------------------------------------
 
 
+def _source_available(sources: Sequence[ReportSpend], key: str) -> bool:
+    """Есть ли у статьи второй источник. Отвечает на вопрос одной строки."""
+    return any(source.key == key and source.available for source in sources)
+
+
 def build(
     client_id: int,
     period: "str | finance.Period" = "week",
@@ -1419,14 +1662,55 @@ def build(
     # прибавлять его второй раз нельзя.
     ad_uncovered = ZERO if ads_counted else ad_deductions - ad_replaced
 
+    # Хранение и приёмка приходят в отчёт тем же двойным путём, что реклама, и
+    # разбираются тем же правилом. В отчёте о реализации они лежат статьёй
+    # (у хранения всегда без артикула), а в своих отчётах Wildberries разносит
+    # их по товарам и суткам. Собранное лежит в базе, в WB отсюда не ходят.
+    sources = tuple(
+        ReportSpend(
+            key=key,
+            kind=kind,
+            spend=storage_module.spend_of(client_id, kind, date_from, date_to, path=path),
+            billed=sum((getattr(item.amounts, key) for item in pieces), ZERO),
+        )
+        for kind, key in (
+            (storage_module.STORAGE, "storage"),
+            (storage_module.ACCEPTANCE, "acceptance"),
+        )
+    )
+    # Сумма по товарам считается только по артикулам отчёта, как и у рекламы:
+    # расход товара, которого в периоде не продавали, в прибыли не стоит
+    # нигде, и заменять им статью нельзя, иначе эти деньги исчезли бы из
+    # расходов совсем.
+    sources = tuple(
+        replace(
+            source,
+            by_article=sum((source.of(item.nm_id) or ZERO for item in named), ZERO),
+        )
+        for source in sources
+    )
+
     def spent(amounts: Any) -> Decimal:
         """Расходы Wildberries, которые идут в прибыль по этим строкам."""
-        return amounts.costs - (ZERO if ads_counted else amounts.ad_deductions)
+        total = amounts.costs - (ZERO if ads_counted else amounts.ad_deductions)
+        for source in sources:
+            # У статьи есть второй источник: её деньги разобраны отдельно, на
+            # заменённую часть и остаток, и в расходах строки им места нет.
+            if source.available:
+                total -= getattr(amounts, source.key)
+        return total
 
     # Обезличка: расходы строк без артикула. Разносим пропорционально выручке,
     # потому что другого честного признака у этих строк нет. Правило названо
     # на листе «Методология», а не спрятано здесь.
-    unallocated = sum((spent(item.amounts) for item in faceless), ZERO) + ad_uncovered
+    # Неразобранные остатки статей со вторым источником ложатся в обезличку
+    # ровно так же, как остаток рекламного счёта: эти деньги Wildberries
+    # правда удержал, а товара за ними не стоит.
+    unallocated = (
+        sum((spent(item.amounts) for item in faceless), ZERO)
+        + ad_uncovered
+        + sum((source.uncovered for source in sources), ZERO)
+    )
     weights = {
         item.nm_id: item.amounts.revenue - item.amounts.returns_amount for item in named
     }
@@ -1434,8 +1718,12 @@ def build(
     left = unallocated.quantize(CENT, rounding=ROUND_HALF_UP) - sum(parts.values(), ZERO)
 
     known = costs_module.costs_for(client_id, nm_ids=list(weights), path=path)
-    # Названия читаются из базы: за ними ходит обработчик очереди, а расчёт в
-    # WB не ходит вовсе. Нет названия - в книге останется артикул.
+    # Названия приходят вместе с деньгами: в отчёте о реализации есть поле
+    # `title`, и у каждой строки с артикулом оно заполнено. Справочник
+    # карточек остаётся запасным путём и читается здесь же, из базы: он
+    # нужен строкам, записанным прежней версией бота без `raw`, и кабинету,
+    # у которого Wildberries названия в отчёте не прислал. В WB из расчёта
+    # не ходят вовсе.
     titles = names_of(client_id, list(weights), path=path)
 
     rows: list[ArticleProfit] = []
@@ -1465,17 +1753,29 @@ def build(
         ad = ads.of(item.nm_id)
         piece = parts.get(item.nm_id, ZERO)
         net_revenue = amounts.revenue - amounts.returns_amount
+        # Хранение и приёмка по товару из своих отчётов Wildberries. `None`
+        # значит «источника нет», и тогда статья вычтена в `spent`, как
+        # раньше: двух путей у одних денег не остаётся ни в одном случае.
+        by_report = {source.key: source.of(item.nm_id) for source in sources}
         value = None
         if cost is not None and known_commission:
-            value = (net_revenue - cost - spent(amounts) - (ad or ZERO) - piece).quantize(
-                CENT, rounding=ROUND_HALF_UP
-            )
+            value = (
+                net_revenue
+                - cost
+                - spent(amounts)
+                - (ad or ZERO)
+                - sum((value or ZERO for value in by_report.values()), ZERO)
+                - piece
+            ).quantize(CENT, rounding=ROUND_HALF_UP)
         rows.append(
             ArticleProfit(
                 nm_id=item.nm_id,
                 vendor_code=item.vendor_code,
                 subject=item.subject,
-                title=titles.get(item.nm_id, ""),
+                # Название из отчёта о реализации сильнее справочника: оно
+                # приехало вместе с деньгами этого самого периода, а в
+                # справочнике лежит имя на день последнего похода в каталог.
+                title=item.title or titles.get(item.nm_id, ""),
                 units=amounts.sales_count,
                 returns_count=amounts.returns_count,
                 revenue=amounts.revenue,
@@ -1488,6 +1788,10 @@ def build(
                 logistics=amounts.logistics,
                 storage=amounts.storage,
                 acceptance=amounts.acceptance,
+                storage_report=by_report.get("storage"),
+                acceptance_report=by_report.get("acceptance"),
+                storage_counted=not _source_available(sources, "storage"),
+                acceptance_counted=not _source_available(sources, "acceptance"),
                 penalties=amounts.penalties,
                 deductions=amounts.other_deductions,
                 ad_deductions=amounts.ad_deductions,
@@ -1515,18 +1819,28 @@ def build(
     # и отвечает на вопрос «где мои деньги за хранение»: сумма по статьям,
     # пришедшим без артикула, сходится с обезличкой копейка в копейку, потому
     # что обезличка и есть сумма этих же статей.
+    #
+    # У статей с двумя источниками в обезличку идёт не вся статья, а только
+    # неразобранный её остаток: заменённая часть вычтена колонкой второго
+    # отчёта. Покажи здесь всю статью, и расшифровка обещала бы селлеру
+    # деньги, которых в колонке «Расходы без артикула, ₽» нет, и перестала бы
+    # с ней сходиться.
+    pooled_parts: dict[str, Decimal] = {
+        source.key: source.uncovered for source in sources if source.available
+    }
+    if not ads_counted:
+        pooled_parts[AD_DEDUCTIONS_KEY] = ad_uncovered
+    sources_by_key = {source.key: source.source for source in sources if source.available}
     breakdown = tuple(
         CostItem(
             key=key,
             title=title,
             by_article=sum((getattr(item.amounts, key) for item in named), ZERO),
             faceless=sum((getattr(item.amounts, key) for item in faceless), ZERO),
-            # В обезличке у рекламного удержания стоит не весь счёт, а только
-            # неразобранный его остаток: заменённая часть вычтена расходом по
-            # товарам, и покажи здесь весь счёт - расшифровка обещала бы
-            # селлеру деньги, которых в колонке «Расходы без артикула, ₽» нет,
-            # и перестала бы с ней сходиться.
-            pooled=None if key != AD_DEDUCTIONS_KEY or ads_counted else ad_uncovered,
+            # Чем статья объяснена со второй стороны. Пусто у тех статей, у
+            # которых второго источника нет вовсе.
+            source=sources_by_key.get(key, ""),
+            pooled=pooled_parts.get(key),
         )
         for key, title in COST_ITEMS
     )
@@ -1541,6 +1855,7 @@ def build(
         unallocated_left=left,
         ad_deductions=ad_deductions,
         costs_breakdown=breakdown,
+        reports=sources,
         ads=ads,
         weeks=tuple(weeks),
         # Режим налога читается из настроек селлера ровно так же, как
@@ -1635,7 +1950,12 @@ ARTICLE_COLUMNS: tuple[tuple[str, str | None], ...] = (
     ("Эквайринг, ₽", "acquiring"),
     ("Логистика, ₽", "logistics"),
     ("Хранение, ₽", "storage"),
+    # Колонка второго отчёта стоит рядом со статьёй отчёта о реализации, а не
+    # вместо неё: в книге всегда видна ровно одна из двух (см.
+    # `_hidden_columns`), и читается она там, где селлер её и ищет.
+    (storage_module.COLUMN_TITLES[storage_module.STORAGE], "storage_report"),
     ("Приёмка, ₽", "acceptance"),
+    (storage_module.COLUMN_TITLES[storage_module.ACCEPTANCE], "acceptance_report"),
     ("Штрафы, ₽", "penalties"),
     ("Прочие удержания, ₽", "other_deductions"),
     ("Реклама, ₽", None),
@@ -1715,14 +2035,16 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
     ),
     (
         "Название товара",
-        "карточки товаров, категория токена «Контент»",
-        "-",
-        "В отчёте о реализации Wildberries названия нет вовсе: там артикул WB, "
-        "артикул продавца, бренд и предмет, а предмет это категория "
-        "(«Наматрасник»), а не название карточки. Название берётся из карточек "
-        "товаров и хранится у нас, чтобы не дёргать Wildberries на каждый "
-        "отчёт. Если товар удалён из кабинета, названия взять негде, и в "
-        "колонке остаётся артикул WB.",
+        "поле title строки отчёта о реализации",
+        "название из самой поздней строки артикула",
+        "Название приходит вместе с деньгами, той же строкой отчёта. Если "
+        "товар переименовали, в отчёте за длинный период лежат оба имени, и в "
+        "книгу идёт то, под которым товар продавался последним: именно его "
+        "селлер видит в кабинете сейчас. Справочник карточек товаров "
+        "(категория токена «Контент») остался запасным путём: в Wildberries за "
+        "названием бот идёт только тогда, когда в строках отчёта его не "
+        "оказалось. Если названия нет нигде, в колонке остаётся артикул WB: "
+        "выдуманное имя было бы хуже.",
     ),
     (
         "Статьи без разреза по товарам",
@@ -1733,7 +2055,11 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
         "удержания. Колонки под такую статью в листе «Прибыль по артикулам» "
         "нет: ноль в каждой строке читался бы как «не платили». Эти деньги "
         "расшифрованы в листе «Убыточные и без данных» и разнесены по товарам "
-        "в колонке «Расходы без артикула, ₽».",
+        "в колонке «Расходы без артикула, ₽». У хранения и приёмки есть "
+        "второй путь: отдельные отчёты Wildberries, где та же сумма стоит по "
+        "товарам и по суткам. Когда он собран, колонка берётся оттуда и "
+        "названа своим источником, а в пропорции от выручки остаётся только "
+        "неразобранный остаток статьи.",
     ),
     (
         "Итого по кабинету",
@@ -1837,7 +2163,10 @@ METHODOLOGY: tuple[tuple[str, str, str, str], ...] = (
         "штрафы и прочие удержания. Заменённой расходом по товарам части "
         "рекламного счёта среди них нет: эта реклама вычитается строкой "
         "«Реклама, ₽», и вычитается один раз. Неразобранный остаток счёта "
-        "стоит в «Расходах без артикула, ₽», и вычитается тоже один раз.",
+        "стоит в «Расходах без артикула, ₽», и вычитается тоже один раз. То же "
+        "правило у хранения и приёмки, когда собран их собственный отчёт: "
+        "вычитается колонка этого отчёта плюс неразобранный остаток статьи, то "
+        "есть ровно столько, сколько денег в большем из двух источников.",
     ),
     (
         "Маржинальность до налога, %",
@@ -2002,8 +2331,22 @@ def _cell(value: Any) -> Any:
 
 
 def _hidden_columns(report: ProfitReport) -> frozenset[str]:
-    """Статьи, под которые колонки в книге не будет."""
-    return frozenset(item.key for item in report.unshared_items)
+    """Статьи, под которые колонки в книге не будет.
+
+    Три повода, и все про одно: колонка, которая никогда не заполнится, хуже
+    отсутствующей. Статью, которую Wildberries по товарам не разнёс, убирает
+    правило `CostItem.only_faceless`. Колонку второго отчёта убирает
+    отсутствие самого отчёта: сутки не собирали, или у токена нет категории
+    «Аналитика». А когда второй отчёт есть, уходит колонка той же статьи из
+    отчёта о реализации: две колонки под одно хранение читались бы как два
+    разных расхода, и сложение строки перестало бы сходиться с прибылью.
+    """
+    hidden = {item.key for item in report.unshared_items}
+    hidden.update({"storage_report", "acceptance_report"})
+    for source in report.report_sources:
+        hidden.discard(source.column_key)
+        hidden.add(source.key)
+    return frozenset(hidden)
 
 
 def article_headers(report: ProfitReport) -> tuple[str, ...]:
@@ -2115,7 +2458,9 @@ def _totals_values(report: ProfitReport, allocation: Any = None) -> list[Any]:
         _cell(totals.acquiring),
         _cell(totals.logistics),
         _cell(totals.storage),
+        _cell(totals.storage_report),
         _cell(totals.acceptance),
+        _cell(totals.acceptance_report),
         _cell(totals.penalties),
         _cell(totals.deductions),
         _cell(totals.ad_spend),
@@ -2211,6 +2556,76 @@ def _ad_deduction_note(report: ProfitReport) -> str:
     return text
 
 
+def _report_note(source: ReportSpend) -> str:
+    """Что означает блок второго отчёта. Главный вопрос здесь «какому верить».
+
+    Поэтому в строке стоят оба числа и разница между ними, а не одно число с
+    обещанием, что оно сойдётся. Wildberries сойтись не обещал: причины
+    расходиться у него в документации названы прямо, и здесь они названы
+    селлеру его словами.
+    """
+    text = (
+        f"Столько {source.title.lower()} насчитал {source.source}: там эта "
+        "сумма стоит по каждому товару и по каждым суткам. Ровно эти числа и "
+        f"стоят в колонке «{source.column}». В отчёте о реализации та же "
+        f"статья за период это {_cell(source.billed)} ₽, и приходит она общей "
+        "суммой по кабинету, без артикула."
+    )
+    if not source.matches:
+        text += (
+            f" Разница {_cell(source.gap)} ₽. Два отчёта и не обязаны сойтись: "
+            "Wildberries этого нигде не обещает, а причины расходиться назвал "
+            "сам. Перерасчёты задним числом (сутки, за которые начислено, и "
+            "сутки первоначального расчёта это разные поля), сутки против "
+            "недель отчёта о реализации, скидка программы лояльности отдельным "
+            "полем и разные сервисы Wildberries за двумя отчётами. Ту же "
+            "разницу бот показывает в сверке /finance и в двух цифрах расхода "
+            "/ads."
+        )
+    else:
+        text += " Разница в пределах рубля, то есть два отчёта сошлись."
+    if not source.complete:
+        text += (
+            f" Суток периода собрано {source.days} из {source.days_total}: "
+            "окно одного запроса у этого отчёта короткое, и история копится "
+            "ночным сбором. Поэтому сумма по товарам за несобранные сутки "
+            "меньше, и разница выше включает их."
+        )
+    if source.collected != source.by_article:
+        text += (
+            f" По всем строкам собранных суток вышло {_cell(source.collected)} ₽, "
+            f"а по товарам отчёта {_cell(source.by_article)} ₽: остальное это "
+            "строки без артикула и товары, которых в этом периоде не "
+            "продавали. В прибыль по товарам идёт только второе: расход "
+            "товара, которого в периоде нет, вычитать не из чего."
+        )
+    rest = source.uncovered.quantize(CENT, rounding=ROUND_HALF_UP)
+    if rest > ZERO:
+        text += (
+            f" Из статьи отчёта о реализации по товарам вычтено "
+            f"{_cell(source.replaced)} ₽, а остаток {_cell(rest)} ₽ остался "
+            "расходом и разнесён вместе с обезличкой: эти деньги Wildberries "
+            "правда удержал. Дважды не вычитается ничего."
+        )
+    elif rest < ZERO:
+        text += (
+            " В отчёте о реализации эта статья за период ушла в минус "
+            "(Wildberries вернул больше, чем удержал), поэтому в расходах она "
+            "стоит возвратом, а по товарам вычтен второй отчёт."
+        )
+    else:
+        text += (
+            " Второй отчёт объяснил статью целиком, поэтому второй раз она в "
+            "расходы не идёт."
+        )
+    text += (
+        " В отчёте /finance ничего не подменено: там стоит сумма из отчёта о "
+        "реализации, это документ взаиморасчётов, и сверка с итогами "
+        "Wildberries стоит на нём."
+    )
+    return text
+
+
 def _faceless_note(item: CostItem) -> str:
     """Что означает строка расшифровки. Читает это селлер, а не программист."""
     if item.key == AD_DEDUCTIONS_KEY and item.in_pool != item.faceless:
@@ -2224,6 +2639,19 @@ def _faceless_note(item: CostItem) -> str:
             "остаток: счёт выставлен одной неделей, а показы были в другие "
             "дни. Весь счёт целиком назван выше, в блоке "
             f"«{AD_DEDUCTION_BLOCK}»."
+        )
+    if item.source and item.in_pool != item.faceless:
+        # Статья с двумя источниками: в обезличке остался только тот её
+        # остаток, который второй отчёт не объяснил. Без этой фразы селлер
+        # сложил бы строку расшифровки с колонкой второго отчёта и решил бы,
+        # что одни деньги посчитаны дважды.
+        return (
+            f"{item.title}: в отчёте о реализации эта статья приходит общей "
+            f"суммой по кабинету, а по товарам её разносит {item.source}. В "
+            "этих деньгах остался только тот остаток, который второй отчёт не "
+            "объяснил: разобранная им часть вычтена по товарам в своей "
+            "колонке. Почему два числа про одни деньги не обязаны сойтись, "
+            f"написано в листе «{METHOD_SHEET}»."
         )
     if item.only_faceless:
         return (
@@ -2610,6 +3038,33 @@ def method_rows(report: ProfitReport) -> list[list[Any]]:
                 "соседнего месяца." + tail,
             ]
         )
+    for source in report.report_sources:
+        # Строка появляется только у того источника, который в этом отчёте
+        # правда есть: правило про колонку, которой нет, читать незачем.
+        rows.append(
+            [
+                source.column,
+                f"{source.source} (категория токена «Аналитика»)",
+                "сумма по артикулу за сутки периода",
+                f"Это ВТОРОЙ источник тех же денег. В отчёте о реализации "
+                f"{source.title.lower()} приходит общей суммой по кабинету "
+                "и по товарам не разносится вовсе, поэтому колонка по товарам "
+                "иначе была бы нашей пропорцией от выручки, а хранение от "
+                "выручки не зависит: оно зависит от объёма товара и времени на "
+                "складе, и крупный медленный товар получал бы копейки. "
+                "Wildberries нигде не обещает, что суммы двух отчётов "
+                "совпадут, и причины расходиться назвал сам: перерасчёты "
+                "задним числом, сутки против недель, скидка программы "
+                "лояльности отдельным полем, разные сервисы. Поэтому колонка "
+                "названа своим источником, а оба числа и разница между ними "
+                f"стоят в листе «{PROBLEMS_SHEET}», блоком "
+                f"«{storage_module.BLOCK_TITLES.get(source.kind, source.kind)}». "
+                "В прибыль деньги идут один раз: статья отчёта о реализации "
+                "заменена на столько, сколько объяснил второй отчёт, а "
+                "неразобранный остаток остался расходом и разнесён вместе с "
+                "обезличкой. В отчёте /finance не подменено ничего.",
+            ]
+        )
     hidden = report.unshared_items
     if hidden:
         names = ", ".join(item.title.lower() for item in hidden)
@@ -2704,7 +3159,9 @@ def excel_sheets(report: ProfitReport) -> list:
                 _cell(item.acquiring),
                 _cell(item.logistics),
                 _cell(item.storage),
+                _cell(item.storage_report),
                 _cell(item.acceptance),
+                _cell(item.acceptance_report),
                 _cell(item.penalties),
                 _cell(item.deductions),
                 _cell(item.ad_spend),
@@ -2772,6 +3229,21 @@ def excel_sheets(report: ProfitReport) -> list:
             _compensation_note(item),
         ]
         for item in report.compensations
+    ]
+    # Хранение и приёмка по своим отчётам. Блок стоит перед обезличкой по той
+    # же причине, что рекламный счёт: в колонке книги стоит число одного
+    # отчёта, в /finance число другого, и селлер обязан найти оба по имени, а
+    # не обнаружить расхождение сам.
+    problems += [
+        [
+            storage_module.BLOCK_TITLES.get(source.kind, source.kind),
+            None,
+            "",
+            _cell(source.total),
+            _report_note(source),
+        ]
+        for source in report.report_sources
+        if source.notable
     ]
     # Рекламный счёт. Стоит перед обезличкой, потому что раньше он лежал
     # внутри неё и вычитался вторым разом: деньги большие, и селлер обязан
@@ -2858,18 +3330,70 @@ def request_report(
     )
 
 
+def _request_missing(
+    client_id: int, window: Any, *, path: str | Path | None = None
+) -> list[Any]:
+    """Просит собрать те сутки периода, которых во втором отчёте нет.
+
+    Окно просьбы ограничено сверху: собирать всё недостающее одной работой
+    значило бы занять кабинет на часы. Сколько окон за раз, решает владелец
+    (`config.toml`, секция `[storage]`), и то же число ночной сбор берёт на
+    догон истории: два места, где это решается, разошлись бы молча.
+    """
+    asked: list[Any] = []
+    limit = storage_module.backfill_windows()
+    if limit <= 0:
+        return asked
+    for kind in storage_module.KINDS:
+        gaps = storage_module.missing_days(
+            client_id, kind, window.date_from, window.date_to, path=path
+        )
+        if not gaps:
+            continue
+        windows = storage_module.windows_for(kind, min(gaps), max(gaps))[:limit]
+        if not windows:
+            continue
+        try:
+            asked.append(
+                storage_module.request_collect(
+                    client_id,
+                    windows[0][0],
+                    windows[-1][1],
+                    kind=kind,
+                    path=path,
+                )
+            )
+        except Exception:  # noqa: BLE001 - отчёт не обязан падать из-за добора
+            logger.exception(
+                "не удалось поставить сбор %s клиента %s", kind, client_id
+            )
+    return asked
+
+
 async def report_task(task: Any, *, path: str | Path | None = None) -> ProfitReport:
     """Обработчик задачи: сходить за рекламой, собрать отчёт, отдать клиенту."""
     client_id = int(task.client_id)
     window = finance.period_of_task(task)
     ads = await collect_ads(client_id, window.date_from, window.date_to, path=path)
     report = build(client_id, window, ads=ads, path=path)
-    # За названиями идём уже зная, какие артикулы в отчёте: спрашивать WB о
-    # каталоге до расчёта незачем, а на цифры названия не влияют.
+    # В каталог карточек идём только за тем, что осталось безымянным. Отчёт о
+    # реализации называет товар сам (поле `title`), и у кабинета владельца
+    # безымянных артикулов не остаётся вовсе: поход в WB за названиями
+    # пропадает целиком. Справочник остаётся запасным путём, а не привычкой.
     names = await collect_names(
-        client_id, [item.nm_id for item in report.articles], path=path
+        client_id,
+        [item.nm_id for item in report.articles if not item.title],
+        path=path,
     )
     report = with_names(report, names)
+    # Дыру в истории хранения и приёмки закрывает отдельная работа, а не этот
+    # отчёт. Собрать год задним числом это 46 заданий по дорожке «1 запрос в
+    # минуту», больше часа, и всё это время у кабинета занято его единственное
+    # место в очереди: селлер, попросивший /finance, ждал бы этот час. Поэтому
+    # отчёт уходит с тем, что собрано, говорит об этом вслух, а дыра начинает
+    # закрываться сама. Повтор той же просьбы ничего не удваивает: одинаковую
+    # задачу очередь дважды не ставит.
+    _request_missing(client_id, window, path=path)
     if _sender is None:
         raise RuntimeError("некому отправить отчёт о прибыли: доставка не подключена")
     result = _sender(client_id, report, excel_bytes(report))
