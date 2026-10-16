@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
 from telegram import Update
@@ -431,3 +432,26 @@ def _run_once(token: str) -> None:
     finally:
         loop.close()
         asyncio.set_event_loop(None)
+
+
+def main() -> None:
+    """Запуск из любой точки входа: `python bot.py` и `python -m bot`.
+
+    Хостинг собирает образ сам и ставит свою команду запуска: Bothost собрал
+    `python -m bot.app`, хотя в Procfile написано `python bot.py`. Модуль без
+    этой пары строк просто импортировался и завершался с кодом ноль, то есть
+    для хостинга «успешно», а бот при этом не поднимался вовсе и сообщения не
+    читал никто. Поэтому запуск умеет оба способа, а живёт он здесь один.
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO,
+    )
+    run(os.getenv("TELEGRAM_BOT_TOKEN"))
+
+
+if __name__ == "__main__":
+    main()

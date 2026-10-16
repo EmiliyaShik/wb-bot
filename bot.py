@@ -20,9 +20,11 @@ logging.basicConfig(
 
 
 def main() -> None:
-    from bot.app import run
+    # Сам запуск живёт в bot.app.main: хостинг может позвать и модуль, и этот
+    # файл, и две копии запуска разошлись бы молча.
+    from bot.app import main as start
 
-    run(os.getenv("TELEGRAM_BOT_TOKEN"))
+    start()
 
 
 if __name__ == "__main__":
