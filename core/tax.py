@@ -267,6 +267,25 @@ def clear_rule(client_id: int, *, path: str | Path | None = None) -> Rule:
     return rule_of(client_id, path=path)
 
 
+# Отметка «про налог спрашивали». Отказ от налога это законный выбор, и
+# отличить его от «ещё не спрашивали» больше нечем: правила в обоих случаях
+# нет. Без отметки отчёт спрашивал бы при каждом запуске того, кто уже
+# ответил, а это и есть навязчивость, из-за которой выключают уведомления.
+ASKED_KEY = "tax_asked"
+
+
+def was_asked(client_id: int, *, path: str | Path | None = None) -> bool:
+    """Спрашивали ли уже у этого селлера про систему налогообложения."""
+    return bool(clients.settings_of(client_id, path=path).get(ASKED_KEY))
+
+
+def mark_asked(client_id: int, *, path: str | Path | None = None) -> None:
+    """Запомнить, что спрашивали. Второй раз сам бот спрашивать не будет."""
+    data = clients.settings_of(client_id, path=path)
+    data[ASKED_KEY] = True
+    clients.save_settings(client_id, data, path=path)
+
+
 # --- оценка -------------------------------------------------------------------
 
 

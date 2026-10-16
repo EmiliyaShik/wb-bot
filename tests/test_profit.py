@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from agents import finance, profit
 from bot.handlers import profit as handlers_profit
 from core import costs as costs_module
-from core import audit, config, crypto, db, queue, wbapi, xlsx
+from core import audit, config, crypto, db, queue, tax, wbapi, xlsx
 
 TODAY = date(2026, 9, 7)
 
@@ -1249,6 +1249,9 @@ async def test_profit_offers_periods_and_only_queues_the_work(seller, db_path):
     """В WB из хендлера никто не ходит: команда ставит задачу и отвечает."""
     queue.reset()
     telegram_id = int(db.admin_repo(db_path).client(seller)["telegram_id"])
+    # Про налог у этого селлера уже спрашивали: вопрос стоит перед периодом,
+    # и без отметки экран периодов до него просто не дошёл бы.
+    tax.mark_asked(seller, path=db_path)
 
     message = FakeMessage()
     await handlers_profit.profit_command(FakeUpdate(telegram_id, message), None, path=db_path)
@@ -1926,3 +1929,99 @@ def test_on_a_long_period_the_statistics_cover_the_invoice_and_it_is_counted_onc
         Decimal("0"),
     )
     assert spent == Decimal("2050")
+
+
+# --- вопрос про налог перед отчётом ---
+
+
+@pytest.mark.asyncio
+async def test_profit_asks_about_tax_before_the_period(seller, db_path):
+    """Режим не выбран: сначала спрашиваем, иначе прибыль выйдет до налога."""
+    telegram_id = int(db.admin_repo(db_path).client(seller)["telegram_id"])
+    message = FakeMessage()
+
+    await handlers_profit.profit_command(
+        FakeUpdate(telegram_id, message), None, path=db_path
+    )
+
+    text, kwargs = message.sent[0]
+    assert "налог" in text.lower()
+    actions = [
+        button.callback_data
+        for row in kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert actions == ["profit:tax:usn_income", "profit:tax:usn_income_minus", "profit:taxoff"]
+
+
+@pytest.mark.asyncio
+async def test_chosen_mode_is_saved_and_the_period_follows(seller, db_path):
+    telegram_id = int(db.admin_repo(db_path).client(seller)["telegram_id"])
+    message = FakeMessage()
+    query = FakeQuery("profit:tax:usn_income", message)
+
+    await handlers_profit.period_chosen(
+        FakeUpdate(telegram_id, message, query), None, path=db_path
+    )
+
+    rule = tax.rule_of(seller, path=db_path)
+    assert rule.known and rule.mode == tax.USN_INCOME
+    text, kwargs = message.sent[-1]
+    assert "период" in text.lower()
+    assert kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "profit:week"
+
+
+@pytest.mark.asyncio
+async def test_refusal_is_remembered_and_asked_only_once(seller, db_path):
+    """Отказ от налога это ответ, а не молчание: второй раз не спрашиваем."""
+    telegram_id = int(db.admin_repo(db_path).client(seller)["telegram_id"])
+    message = FakeMessage()
+    query = FakeQuery("profit:taxoff", message)
+
+    await handlers_profit.period_chosen(
+        FakeUpdate(telegram_id, message, query), None, path=db_path
+    )
+    assert not tax.rule_of(seller, path=db_path).known
+
+    second = FakeMessage()
+    await handlers_profit.profit_command(
+        FakeUpdate(telegram_id, second), None, path=db_path
+    )
+    actions = [
+        button.callback_data
+        for row in second.sent[0][1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert "profit:week" in actions, "про налог спросили второй раз"
+
+
+@pytest.mark.asyncio
+async def test_a_made_up_mode_from_a_button_is_refused(seller, db_path):
+    """`callback_data` приходит от клиента: чужой режим в настройки не ляжет."""
+    telegram_id = int(db.admin_repo(db_path).client(seller)["telegram_id"])
+    message = FakeMessage()
+    query = FakeQuery("profit:tax:osno_vymyshlennaya", message)
+
+    await handlers_profit.period_chosen(
+        FakeUpdate(telegram_id, message, query), None, path=db_path
+    )
+
+    assert not tax.rule_of(seller, path=db_path).known
+    assert not tax.was_asked(seller, path=db_path)
+    assert message.sent == []
+
+
+@pytest.mark.asyncio
+async def test_chosen_mode_stops_the_question(seller, db_path):
+    """Режим выбран в настройках: спрашивать уже нечего."""
+    tax.set_rule(seller, tax.USN_INCOME, path=db_path)
+    telegram_id = int(db.admin_repo(db_path).client(seller)["telegram_id"])
+    message = FakeMessage()
+
+    await handlers_profit.profit_command(
+        FakeUpdate(telegram_id, message), None, path=db_path
+    )
+
+    assert message.sent[0][1]["reply_markup"].inline_keyboard[0][0].callback_data == (
+        "profit:week"
+    )

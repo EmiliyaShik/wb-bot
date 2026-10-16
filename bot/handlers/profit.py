@@ -650,6 +650,65 @@ def tax_block(report: Any) -> Safe:
     return Safe(text + per_article + TAX_NOTE)
 
 
+TAX_PREFIX = f"{PREFIX}tax:"
+TAX_SKIP_DATA = f"{PREFIX}taxoff"
+
+ASK_TAX = (
+    "🧾 <b>Сначала про налог</b>\n\n"
+    "Скажите, на какой системе налогообложения вы работаете, и я посчитаю "
+    "налог по каждому товару. Без этого прибыль в отчёте будет до налога, а "
+    "колонок с налогом в книге не будет вовсе.\n\n"
+    "Спрошу один раз. Поменять режим и ставку можно в любой момент командой "
+    "<code>/settings</code>."
+)
+
+TAX_SET = (
+    "Записал: <b>{mode}</b>, ставка {rate}. Если ставка у вас другая, "
+    "поменяйте её командой <code>/settings</code>, там весь список.\n\n"
+    "Теперь выберите период."
+)
+
+TAX_SKIPPED = (
+    "Хорошо, считаю прибыль до налога. Передумаете, включите налог командой "
+    "<code>/settings</code>.\n\n"
+    "Теперь выберите период."
+)
+
+TAX_SKIP_LABEL = "Без налога, считать до него"
+
+
+def tax_keyboard() -> InlineKeyboardMarkup:
+    """Режимы налога и отказ. Список режимов и названия берутся из `core.tax`.
+
+    Своего списка здесь нет намеренно: он один и лежит там же, где проверка.
+    Разойдись они, кнопка предлагала бы режим, которого расчёт не знает.
+    """
+    rows = [
+        [
+            InlineKeyboardButton(
+                tax_module.MODE_TITLES[mode], callback_data=f"{TAX_PREFIX}{mode}"
+            )
+        ]
+        for mode in tax_module.MODES
+    ]
+    rows.append([InlineKeyboardButton(TAX_SKIP_LABEL, callback_data=TAX_SKIP_DATA)])
+    return InlineKeyboardMarkup(rows)
+
+
+def tax_needed(client_id: int | None, path: Any = None) -> bool:
+    """Спросить ли про налог перед отчётом.
+
+    Спрашиваем один раз и только у того, кто режим не выбирал: отказ это тоже
+    ответ, и переспрашивать его перед каждым отчётом значит навязываться.
+    Выбранный режим виден в `/settings`, и там же он меняется.
+    """
+    if client_id is None:
+        return False
+    if tax_module.rule_of(client_id, path=path).known:
+        return False
+    return not tax_module.was_asked(client_id, path=path)
+
+
 def keyboard(today: Any = None) -> InlineKeyboardMarkup:
     """Кнопки периода: относительные, названные месяцы и свои даты."""
     rows = [
@@ -803,6 +862,14 @@ async def profit_command(
     message = update.effective_message
     if message is None:
         return
+    # Про налог спрашиваем до периода, а не после отчёта: без режима отчёт
+    # считается честно, но до налога, и узнавал об этом селлер, только открыв
+    # книгу и не найдя там колонки.
+    if tax_needed(client_id_of(update, path), path):
+        await message.reply_text(
+            ASK_TAX, parse_mode=ParseMode.HTML, reply_markup=tax_keyboard()
+        )
+        return
     await message.reply_text(ASK_PERIOD, parse_mode=ParseMode.HTML, reply_markup=keyboard())
 
 
@@ -822,6 +889,10 @@ async def period_chosen(
     if query is None:
         return
     tail = str(query.data or "")[len(PREFIX) :]
+
+    if tail == "taxoff" or tail.startswith("tax:"):
+        await _tax_chosen(update, query, tail, path=path)
+        return
 
     if tail == period.CUSTOM:
         await query.answer()
@@ -855,6 +926,38 @@ async def period_chosen(
     await query.answer("Принято" if task.created else queue.ALREADY_QUEUED)
     if _long(window) and query.message is not None:
         await query.message.reply_text(LONG_PERIOD)
+
+
+async def _tax_chosen(update: Update, query: Any, tail: str, *, path: Any = None) -> None:
+    """Ответ про налог, а следом тот же вопрос про период.
+
+    Режим приходит в `callback_data`, то есть от клиента, и проверяет его
+    `core.tax.set_rule`, а не эта кнопка: чужой режим сюда не доедет. Ставка
+    ставится та, что по умолчанию у режима, и сообщение говорит, где её
+    поменять: выбор ставки в этом месте растянул бы разговор на три шага
+    ради числа, которое у большинства и так по умолчанию.
+    """
+    client_id = client_id_of(update, path)
+    if client_id is None:
+        await query.answer()
+        return
+    if tail == "taxoff":
+        tax_module.mark_asked(client_id, path=path)
+        answer = Safe(TAX_SKIPPED)
+    else:
+        try:
+            rule = tax_module.set_rule(client_id, tail[len("tax:"):], path=path)
+        except ValueError:
+            await query.answer()
+            return
+        tax_module.mark_asked(client_id, path=path)
+        answer = fill(TAX_SET, mode=rule.title, rate=rule.rate_text + "%")
+    await query.answer()
+    if query.message is None:
+        return
+    await query.message.reply_text(
+        answer, parse_mode=ParseMode.HTML, reply_markup=keyboard()
+    )
 
 
 def _long(window: Any) -> bool:
