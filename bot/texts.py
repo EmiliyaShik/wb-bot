@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import html
+import re
 from typing import Any
 
 from core import config
@@ -107,6 +108,67 @@ class Safe(str):
     сделать её не из чего, кроме как из наших же заполненных шаблонов, и
     каждое такое место видно в файле глазами.
     """
+
+
+# Предел одного сообщения Telegram. Длиннее он не принимает вовсе: отвечает
+# «Message is too long», и отчёт не доходит целиком, вместо куска сводки
+# клиент получает сообщение о сбое. На живом кабинете за год сводка прибыли
+# подобралась к пределу вплотную, а у кабинета с сотней артикулов перешагнула.
+MESSAGE_LIMIT = 4096
+
+CLIPPED = (
+    "\n\n… дальше в сообщение не поместилось. Весь разбор целиком в файле."
+)
+
+# Парные теги, которыми бот пользуется. Обрезка не должна оставить открытый
+# тег: Telegram отказался бы показывать такое сообщение целиком.
+_PAIRED_TAGS = ("b", "strong", "i", "em", "u", "s", "code", "pre", "a", "blockquote")
+_TAG_RE = re.compile(r"<(/?)([a-zA-Z]+)[^>]*>")
+
+
+def _closed(text: str) -> str:
+    """Дописывает закрывающие теги, которые осталась должна обрезка."""
+    opened: list[str] = []
+    for closing, name in _TAG_RE.findall(text):
+        low = name.lower()
+        if low not in _PAIRED_TAGS:
+            continue
+        if not closing:
+            opened.append(low)
+        elif low in opened:
+            while opened and opened.pop() != low:
+                pass
+    return text + "".join(f"</{name}>" for name in reversed(opened))
+
+
+def clip(text: Any, limit: int = MESSAGE_LIMIT, tail: str = CLIPPED) -> Safe:
+    """Укорачивает сводку до предела Telegram, если она его переросла.
+
+    Режется по целым строкам, а не по знакам: строка это законченная мысль,
+    и половина фразы про налог хуже её отсутствия. Отрезанное не теряется,
+    оно в книге, и сообщение прямо об этом говорит.
+
+    Сам предел не настройка владельца, а свойство Telegram, поэтому живёт
+    здесь, а не в конфиге.
+    """
+    body = str(text)
+    if len(body) <= limit:
+        return Safe(body)
+    # Запас под закрывающие теги, которые допишет `_closed`.
+    room = limit - len(tail) - 64
+    kept: list[str] = []
+    total = 0
+    for line in body.split("\n"):
+        step = len(line) + (1 if kept else 0)
+        if total + step > room:
+            break
+        kept.append(line)
+        total += step
+    cut = "\n".join(kept).rstrip()
+    if not cut:
+        # Одна строка длиннее предела: режем по знакам, выбора нет.
+        cut = body[:room].rstrip()
+    return Safe(_closed(cut) + tail)
 
 
 def fill(template: str, **fields: Any) -> Safe:

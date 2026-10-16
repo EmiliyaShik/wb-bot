@@ -51,6 +51,7 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 from agents import funnel
 from core import queue
 from bot.handlers.tariffs import client_id_of, require_module
+from bot import texts
 from bot.texts import Safe, fill
 
 logger = logging.getLogger(__name__)
@@ -510,7 +511,9 @@ def make_sender(app: Any, path: str | Path | None = None):
             return
         chat_id = int(row["telegram_id"])
         await app.bot.send_message(
-            chat_id=chat_id, text=summary_text(report), parse_mode=ParseMode.HTML
+            chat_id=chat_id,
+            text=texts.clip(summary_text(report)),
+            parse_mode=ParseMode.HTML,
         )
         if not report.empty:
             await app.bot.send_document(

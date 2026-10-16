@@ -34,6 +34,7 @@ from telegram.ext import CommandHandler
 
 from agents import rnp
 from bot.handlers.tariffs import client_id_of, require_module, rubles
+from bot import texts
 from bot.texts import Safe, fill
 from core import db, scheduler
 
@@ -392,7 +393,7 @@ def make_delivery(app: Any, path: str | Path | None = None):
             return
         await app.bot.send_message(
             chat_id=int(row["telegram_id"]),
-            text=report_text(report),
+            text=texts.clip(report_text(report)),
             parse_mode=ParseMode.HTML,
         )
 
