@@ -33,6 +33,7 @@ from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from agents import finance
+from bot import progress
 from bot.handlers import period
 from bot.handlers.tariffs import client_id_of, require_module
 from bot.texts import Safe, fill
@@ -372,6 +373,9 @@ def make_sender(app: Any, path: str | Path | None = None):
 def register(app, *, path: str | Path | None = None) -> None:
     """Хендлер ставит себя сам: bot/app.py никто не трогает."""
     finance.set_sender(make_sender(app, path))
+    # Выгрузка года идёт полтора часа, и всё это время клиент видел только
+    # «принято». Теперь он видит, докуда дошли, одним живым сообщением.
+    finance.set_progress(progress.make_reporter(app, path))
     finance.register_jobs()
 
     guard = require_module(finance.MODULE, path=path)

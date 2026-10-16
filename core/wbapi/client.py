@@ -20,7 +20,7 @@ import logging
 import time
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import httpx
 
@@ -643,6 +643,7 @@ class WBClient:
         limit: int = REPORT_PAGE,
         fields: Sequence[str] | None = None,
         max_pages: int = MAX_PAGES,
+        on_page: Callable[[int, int, list[dict]], Any] | None = None,
     ) -> ReportPages:
         """То же самое, но с честным ответом на вопрос «это всё?».
 
@@ -671,6 +672,16 @@ class WBClient:
             page = _listify(await self.request("sales_report_detailed", json=body), "rows", "items")
             rows.extend(page)
             pages += 1
+            # Рассказать, докуда дошли. Год идёт страницами по минуте каждая, и
+            # молчащий бот неотличим от сломавшегося. Сбой рассказчика выгрузку
+            # не роняет: ради строчки «идёт работа» терять час работы нельзя.
+            if on_page is not None:
+                try:
+                    said = on_page(pages, len(rows), page)
+                    if hasattr(said, "__await__"):
+                        await said
+                except Exception:  # noqa: BLE001
+                    logger.exception("не удалось сообщить о ходе выгрузки")
             if len(page) < int(limit):
                 break
             last = page[-1].get("rrdId")

@@ -109,6 +109,7 @@ __all__ = [
     "collect_task",
     "deliver",
     "set_sender",
+    "set_progress",
     "register_jobs",
     "excel_bytes",
     "file_name",
@@ -1209,6 +1210,7 @@ async def collect(
     *,
     limit: int | None = None,
     max_pages: int = MAX_PAGES,
+    progress: bool = False,
     http: Any = None,
     path: str | Path | None = None,
     clock: Callable[[], float] | None = None,
@@ -1225,11 +1227,35 @@ async def collect(
     """
     client = wbapi.get_wb_client(client_id, http=http, path=path, clock=clock, sleep=sleep)
     page = int(limit) if limit is not None else PAGE_LIMIT
+
+    # Рассказ о ходе работы идёт только там, где его ждёт человек. У ночного
+    # сбора по расписанию адресата нет вовсе, и сообщение «выгружаю» в три
+    # часа ночи это не забота, а побудка.
+    first, last = date_from.isoformat(), date_to.isoformat()
+    on_page = None
+    if progress:
+        await _say(client_id, fill_progress(PROGRESS_START, first=first, last=last))
+
+        async def on_page(pages: int, total: int, rows: list) -> None:
+            day = _date_of(_day((rows[-1] if rows else {}).get("rrDate")))
+            await _say(
+                client_id,
+                fill_progress(
+                    PROGRESS_STEP,
+                    first=first,
+                    last=last,
+                    day=day.isoformat() if day else "первых строк",
+                    percent=progress_percent(date_from, date_to, day),
+                    rows=total,
+                ),
+            )
+
     # Обрезку не вычисляем по длинам: клиент сам говорит, кончились ли
     # страницы по потолку при живом курсоре. Ровно полная последняя страница
     # это штатный конец выгрузки, а не повод пугать клиента.
     downloaded = await client.sales_report_detailed_paged(
-        date_from, date_to, period="weekly", limit=page, max_pages=max_pages
+        date_from, date_to, period="weekly", limit=page, max_pages=max_pages,
+        on_page=on_page,
     )
     rows = downloaded.rows
     saved = save_rows(client_id, rows, path=path)
@@ -1272,6 +1298,12 @@ async def collect(
             "не считаются",
             client_id,
             ", ".join(unknown),
+        )
+    if progress:
+        await _say(
+            client_id,
+            fill_progress(PROGRESS_DONE, weeks=len(weeks), rows=saved),
+            True,
         )
     return Collected(
         rows=saved,
@@ -1727,6 +1759,76 @@ def set_sender(fn: Callable[[int, FinanceReport, bytes], Any] | None) -> None:
     _sender = fn
 
 
+# Рассказчик о ходе выгрузки: `fn(client_id, text, final)`. Ставит поверхность
+# бота, как и доставку отчёта. Выгрузка года идёт страницами по минуте каждая,
+# и всё это время клиент видит только «принято»: молчащий бот неотличим от
+# сломавшегося, и человек жмёт кнопку второй раз.
+_progress: Callable[[int, str, bool], Any] | None = None
+
+
+def set_progress(fn: Callable[[int, str, bool], Any] | None) -> None:
+    """Чем рассказывать о ходе долгой выгрузки."""
+    global _progress
+    _progress = fn
+
+
+PROGRESS_START = (
+    "⏳ Выгружаю отчёты Wildberries за период {first} - {last}.\n"
+    "Это долго: Wildberries отдаёт их не чаще одной страницы в минуту. "
+    "Докуда дошёл, буду писать в этом же сообщении, отдельных сообщений не будет."
+)
+PROGRESS_STEP = (
+    "⏳ Выгрузка за период {first} - {last}.\n"
+    "Дошёл до {day}, это примерно {percent} процентов периода. "
+    "Строк пока {rows}."
+)
+PROGRESS_DONE = (
+    "✅ Выгрузка закончена: недель {weeks}, строк {rows}. Считаю отчёт."
+)
+
+
+def fill_progress(template: str, **values: Any) -> str:
+    """Подстановка в текст о ходе работы.
+
+    Своя, а не `bot.texts.fill`: эти сообщения уходят без разметки, экранировать
+    в них нечего, а чужого текста в них не бывает вовсе. Подставляются только
+    наши числа и даты.
+    """
+    return template.format(**values)
+
+
+def progress_percent(date_from: date, date_to: date, day: date | None) -> int:
+    """Какая часть периода выгружена, целыми процентами.
+
+    Считается по дате операции последней прочитанной строки: страниц заранее
+    не знает никто, а даты у периода есть обе. Ноль и сто не обрезаются в
+    «почти»: честнее показать ноль в начале, чем выдуманную единицу.
+    """
+    if day is None:
+        return 0
+    whole = (date_to - date_from).days
+    if whole <= 0:
+        return 100
+    done = (day - date_from).days
+    if done <= 0:
+        return 0
+    if done >= whole:
+        return 100
+    return int(round(done * 100 / whole))
+
+
+async def _say(client_id: int, text: str, final: bool = False) -> None:
+    """Сказать о ходе работы. Молчащий или сломавшийся рассказчик не авария."""
+    if _progress is None:
+        return
+    try:
+        said = _progress(client_id, text, final)
+        if hasattr(said, "__await__"):
+            await said
+    except Exception:  # noqa: BLE001 - рассказ о работе не важнее самой работы
+        logger.exception("не удалось рассказать о ходе выгрузки")
+
+
 def _date_of(value: Any) -> date | None:
     try:
         return date.fromisoformat(str(value or "")[:10])
@@ -1780,7 +1882,9 @@ def request_collect(
     )
 
 
-async def collect_task(task: Any, *, path: str | Path | None = None) -> Collected:
+async def collect_task(
+    task: Any, *, path: str | Path | None = None, progress: bool = False
+) -> Collected:
     """Собрать период в базу и замолчать. Ни сообщения, ни Excel.
 
     Ради этого вида задача и разведена надвое. Пока `fin_weeks` наполняла
@@ -1791,7 +1895,11 @@ async def collect_task(task: Any, *, path: str | Path | None = None) -> Collecte
     """
     window = period_of_task(task)
     return await collect(
-        int(task.client_id), window.date_from, window.date_to, path=path
+        int(task.client_id),
+        window.date_from,
+        window.date_to,
+        progress=progress,
+        path=path,
     )
 
 
@@ -1819,7 +1927,7 @@ async def report_task(task: Any, *, path: str | Path | None = None) -> FinanceRe
     """Обработчик задачи клиента: собрать период и сразу отдать собранное."""
     client_id = int(task.client_id)
     window = period_of_task(task)
-    await collect_task(task, path=path)
+    await collect_task(task, path=path, progress=True)
     return await deliver(client_id, window, path=path)
 
 
