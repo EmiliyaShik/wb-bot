@@ -946,3 +946,59 @@ async def test_registry_of_acts_goes_out_by_itself_on_the_first_day(db_path, bus
     chat_id, filename = app.bot.documents[0]
     assert chat_id == OWNER
     assert filename.endswith(".xlsx")
+
+
+# --- /trace: где именно упало -------------------------------------------
+
+
+def _trace_row(at="2026-10-17 09:00:00", client_id=7, message="Traceback..."):
+    return {"at": at, "client_id": client_id, "message": message, "kind": "trace"}
+
+
+def test_trace_says_so_when_nothing_fell():
+    assert "нет" in str(admin.trace_text([], 1)).lower()
+
+
+def test_trace_shows_the_newest_first():
+    rows = [_trace_row(message="свежий"), _trace_row(message="старый")]
+    text = str(admin.trace_text(rows, 1))
+    assert "свежий" in text and "старый" not in text
+    assert "1 из 2" in text
+
+
+def test_trace_can_look_further_back():
+    rows = [_trace_row(message="свежий"), _trace_row(message="старый")]
+    assert "старый" in str(admin.trace_text(rows, 2))
+
+
+def test_trace_refuses_a_number_it_has_no_record_for():
+    text = str(admin.trace_text([_trace_row()], 5))
+    assert "нет" in text.lower() and "1" in text
+
+
+def test_trace_wraps_the_stack_so_telegram_does_not_choke():
+    """В кадрах стека живут скобки и стрелки: без <pre> сообщение не уйдёт."""
+    text = str(admin.trace_text([_trace_row(message='line 1, in <module>')], 1))
+    assert "<pre>" in text and "&lt;module&gt;" in text
+
+
+@pytest.mark.asyncio
+async def test_trace_is_silent_for_a_stranger(db_path, owner):
+    message = FakeMessage()
+    await admin.trace_command(FakeUpdate(STRANGER, message), context(), path=db_path)
+    assert message.sent == []
+
+
+@pytest.mark.asyncio
+async def test_trace_shows_the_owner_the_place_of_the_last_failure(db_path, owner):
+    client_id = db.admin_repo(db_path).ensure_client(555)
+    try:
+        raise RuntimeError("так не бывает")
+    except RuntimeError as error:
+        audit.log("error", client_id, "задача упала", level="error",
+                  path=db_path, error=error)
+    message = FakeMessage()
+
+    await admin.trace_command(FakeUpdate(OWNER, message), context(), path=db_path)
+
+    assert "RuntimeError" in message.last and "так не бывает" in message.last

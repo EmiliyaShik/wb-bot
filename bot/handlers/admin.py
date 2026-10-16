@@ -188,6 +188,17 @@ TASKS_NONE = "Упавших задач нет, в работе тоже пус�
 TASKS_RUNNING = "<b>В работе</b>"
 TASKS_FAILED = "<b>Упали</b>"
 TASKS_EVENTS = "<b>Последние ошибки в журнале</b>"
+TRACE_HEAD = "🧨 <b>Место сбоя {number} из {total}</b>\n{at}, {who}"
+TRACE_NONE = (
+    "Мест сбоя в журнале нет. Это хорошая новость: непредвиденных падений "
+    "задач не было."
+)
+TRACE_GONE = "Столько записей о сбоях нет. Всего их {total}."
+TRACE_USAGE = (
+    "\n\nПоказать предыдущую: <code>/trace 2</code>, перед ней "
+    "<code>/trace 3</code> и так далее."
+)
+
 RETRY_BUTTON = "Перезапустить #{task_id}"
 RETRY_DONE = "Задача #{task_id} возвращена в очередь, счётчик попыток обнулён."
 RETRY_GONE = "Такой задачи уже нет."
@@ -724,6 +735,47 @@ async def tasks_command(update, context, *, path: str | Path | None = None) -> N
     await _reply(update, tasks_text(running, failed, errors), reply_markup=tasks_keyboard(failed))
 
 
+TRACE_LIMIT = 20
+
+
+def trace_text(rows: list, number: int) -> Safe:
+    """Один стек вызовов из журнала. Номер считается от свежего к старому."""
+    if not rows:
+        return Safe(TRACE_NONE)
+    if number < 1 or number > len(rows):
+        return Safe(fill(TRACE_GONE, total=len(rows)))
+    row = rows[number - 1]
+    client = row["client_id"]
+    who = f"клиент #{int(client)}" if client is not None else "общая работа"
+    head = fill(
+        TRACE_HEAD, number=number, total=len(rows), at=row["at"], who=who
+    )
+    # Стек уже вычищен при записи (`audit.place_of`), но разметку в нём
+    # никто не экранировал: в кадрах лежат куски кода со скобками и
+    # стрелками, и без <pre> Telegram отказался бы показывать сообщение.
+    body = fill("\n<pre>{place}</pre>", place=str(row["message"] or ""))
+    return Safe(head + body + (TRACE_USAGE if len(rows) > 1 else ""))
+
+
+async def trace_command(update, context, *, path: str | Path | None = None) -> None:
+    """`/trace`: где именно упала задача.
+
+    Место сбоя пишется в журнал отдельным видом события (ADR 0018), и до сих
+    пор прочитать его можно было только из базы или из логов хостинга. На
+    хостинге логи живут до перезапуска, а разбираться надо здесь и сейчас,
+    поэтому у владельца есть своя команда.
+    """
+    if _owner(update) is None:
+        return
+    rows = db.admin_repo(path).events(limit=TRACE_LIMIT, kind=audit.TRACE_KIND)
+    args = getattr(context, "args", None) or []
+    try:
+        number = int(args[0]) if args else 1
+    except (TypeError, ValueError):
+        number = 1
+    await _reply(update, trace_text(list(rows), number))
+
+
 def _task_by_id(task_id: int, path) -> Any:
     for row in db.admin_repo(path).tasks(limit=1000):
         if int(row["id"]) == task_id:
@@ -780,6 +832,7 @@ def register(app, *, path: str | Path | None = None) -> None:
     app.add_handler(CommandHandler("grant", functools.partial(grant_command, path=path)))
     app.add_handler(CommandHandler("revoke", functools.partial(revoke_command, path=path)))
     app.add_handler(CommandHandler("tasks", functools.partial(tasks_command, path=path)))
+    app.add_handler(CommandHandler("trace", functools.partial(trace_command, path=path)))
     app.add_handler(
         CallbackQueryHandler(functools.partial(retry_callback, path=path), pattern=f"^{PREFIX}")
     )
