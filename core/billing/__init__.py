@@ -276,7 +276,7 @@ def service_line(module: str, months: int) -> str:
     info = config.modules().get(module)
     title = (info.title if info and info.title else module) or module
     if not template:
-        return f"Доступ к сервису WBРентген, модуль {title}, {months_words(months)}"
+        return f"Доступ к сервису «Рентген Продаж», модуль {title}, {months_words(months)}"
     return template.format(module=title, period=months_words(months))
 
 

@@ -228,8 +228,8 @@ def install(job_queue: Any, path: str | Path | None = None) -> list[str]:
         async def morning_job(_context: Any = None) -> None:
             run_daily(path=path)
 
-        job_queue.run_daily(morning_job, time=moment, name="wbrentgen_daily")
-        installed.append("wbrentgen_daily")
+        job_queue.run_daily(morning_job, time=moment, name="rentgen_daily")
+        installed.append("rentgen_daily")
 
     if _weekly:
         async def report_check_job(_context: Any = None) -> None:
@@ -239,8 +239,8 @@ def install(job_queue: Any, path: str | Path | None = None) -> list[str]:
             report_check_job,
             interval=timedelta(hours=weekly_check_hours()),
             first=timedelta(seconds=30),
-            name="wbrentgen_weekly_check",
+            name="rentgen_weekly_check",
         )
-        installed.append("wbrentgen_weekly_check")
+        installed.append("rentgen_weekly_check")
 
     return installed

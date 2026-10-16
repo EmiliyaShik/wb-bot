@@ -124,7 +124,7 @@ async def test_schedule_jobs_are_installed(prepared):
     app = FakeApp(job_queue=FakeJobQueue())
     await bot_app.start_background(app)
     try:
-        assert "wbrentgen_daily" in app.job_queue.jobs
+        assert "rentgen_daily" in app.job_queue.jobs
         assert app.bot_data["scheduled_jobs"]
     finally:
         await bot_app.stop_background(app)

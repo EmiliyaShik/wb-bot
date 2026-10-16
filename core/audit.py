@@ -26,7 +26,7 @@ from typing import Any
 
 from core import config, db
 
-logger = logging.getLogger("wbrentgen.audit")
+logger = logging.getLogger("rentgen.audit")
 
 HIDDEN = "[скрыто]"
 

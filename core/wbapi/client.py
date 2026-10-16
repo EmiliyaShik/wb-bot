@@ -37,7 +37,7 @@ from core.wbapi.errors import (
 )
 from core.wbapi.token import TokenInfo, category_title, verify_token
 
-logger = logging.getLogger("wbrentgen.wbapi")
+logger = logging.getLogger("rentgen.wbapi")
 
 # Домены WB. Ключ это короткое имя для журнала и /diag.
 HOSTS: dict[str, str] = {
@@ -108,7 +108,7 @@ MAX_PAGES = 500           # защита от бесконечной пагин�
 # У /diag короткий срок ожидания: владельцу нужен быстрый ответ, а не терпение.
 PING_TIMEOUT = httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0)
 
-USER_AGENT = "WBRentgen/1.0"
+USER_AGENT = "RentgenProdazh/1.0"
 
 
 @dataclass(frozen=True)
