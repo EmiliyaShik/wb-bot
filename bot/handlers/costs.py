@@ -213,6 +213,28 @@ def too_big_text(size: int, limit: int) -> str:
     )
 
 
+def accepted(result: costs.Upload) -> bool:
+    """Файл принят без претензий: строки сохранены и чинить нечего."""
+    return bool(result.saved) and not result.problems
+
+
+def done_keyboard(result: costs.Upload):
+    """Кнопки под ответом. Есть что чинить - кнопок нет.
+
+    Следующий шаг у принятого файла и у файла с ошибками разный: в первом
+    случае это отчёт, во втором поправить строки и прислать снова, и кнопка
+    «Прибыль по артикулам» звала бы считать прибыль по неполным данным.
+
+    Меню импортируется внутри функции: кнопка «Внести себестоимость» в нём
+    ведёт сюда, и наверху файла это был бы круг импортов.
+    """
+    if not accepted(result):
+        return None
+    from bot.handlers import menu
+
+    return menu.after_costs_keyboard()
+
+
 def result_text(result: costs.Upload) -> str:
     """Что получилось из присланного файла, человеческим языком."""
     lines = [f"Принято строк: {result.saved}."]
@@ -230,7 +252,7 @@ def result_text(result: costs.Upload) -> str:
             lines.append(f"и ещё строк с ошибками: {hidden}.")
         lines.append("")
         lines.append("Поправьте эти строки и пришлите файл ещё раз.")
-    elif result.saved:
+    elif accepted(result):
         lines.append("Себестоимость сохранена, можно считать прибыль.")
     return "\n".join(lines)
 
@@ -290,7 +312,7 @@ async def costs_document(
         await message.reply_text(str(error))
         return
 
-    await message.reply_text(result_text(result))
+    await message.reply_text(result_text(result), reply_markup=done_keyboard(result))
 
 
 def make_sender(app: Any, path: str | Path | None = None):

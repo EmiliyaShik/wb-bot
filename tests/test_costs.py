@@ -730,3 +730,54 @@ def test_a_cabinet_without_collected_weeks_does_not_invent_a_denominator(cabinet
     priced = costs_handler.state_text(costs_handler.coverage(client_id, path=path))
     assert "Артикулов с себестоимостью: 1" in priced
     assert "соберётся первый недельный отчёт" in priced
+
+
+@pytest.mark.asyncio
+async def test_accepted_file_offers_the_profit_report_by_button(cabinet):
+    """Файл принят - следующий шаг под пальцем, а не в памяти."""
+    from bot.handlers import costs as handler
+    from bot.handlers import menu
+
+    client_id, path = cabinet
+    data = upload([[1, "art-1", "Носки", 100]])
+    message = FakeMessage(document())
+
+    await handler.costs_document(
+        FakeUpdate(777, message), SimpleNamespace(bot=FakeBot(data)), path=path
+    )
+
+    markup = message.markup[-1]
+    assert markup is not None
+    actions = [button.callback_data for row in markup.inline_keyboard for button in row]
+    assert actions == [f"{menu.PREFIX}{menu.PROFIT}", f"{menu.PREFIX}{menu.REPORTS}"]
+
+
+@pytest.mark.asyncio
+async def test_file_with_broken_rows_offers_no_report_buttons(cabinet):
+    """Чинить строки, а не считать прибыль по неполным данным."""
+    from bot.handlers import costs as handler
+
+    client_id, path = cabinet
+    data = upload([[1, "art-1", "Носки", 100], [2, "art-2", "Кепка", "сто"]])
+    message = FakeMessage(document())
+
+    await handler.costs_document(
+        FakeUpdate(777, message), SimpleNamespace(bot=FakeBot(data)), path=path
+    )
+
+    assert message.markup[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_empty_file_offers_no_report_buttons(cabinet):
+    """Нечего считать: ни одной строки не сохранено."""
+    from bot.handlers import costs as handler
+
+    client_id, path = cabinet
+    message = FakeMessage(document())
+
+    await handler.costs_document(
+        FakeUpdate(777, message), SimpleNamespace(bot=FakeBot(upload([]))), path=path
+    )
+
+    assert message.markup[-1] is None
