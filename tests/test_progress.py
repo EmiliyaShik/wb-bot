@@ -224,3 +224,34 @@ async def test_silent_telegram_is_not_an_avalanche(reporter, caplog):
     bot.send_message = boom
     with caplog.at_level(logging.ERROR):
         await report(client_id, "начал")
+
+
+@pytest.mark.asyncio
+async def test_a_forgotten_story_starts_a_new_message(reporter):
+    """Сорвавшаяся работа последней вести не шлёт: старое сообщение не правим.
+
+    Нашлось обзором: без срока следующая выгрузка правила бы сообщение
+    прошлой, уехавшее далеко вверх, и клиент увидел бы, как старый текст
+    меняется сам по себе.
+    """
+    bot, client_id, clock, report = reporter
+
+    await report(client_id, "начал")
+    clock.now += progress.FORGET_AFTER_SEC + 1
+    await report(client_id, "новая выгрузка")
+
+    assert [text for _, text in bot.sent] == ["начал", "новая выгрузка"]
+    assert bot.edited == []
+
+
+@pytest.mark.asyncio
+async def test_a_long_download_keeps_the_same_message(reporter):
+    """Полтора часа это нормальная выгрузка года, а не брошенный рассказ."""
+    bot, client_id, clock, report = reporter
+
+    await report(client_id, "начал")
+    clock.now += 90 * 60
+    await report(client_id, "идёт")
+
+    assert [text for _, text in bot.sent] == ["начал"]
+    assert [text for _, _, text in bot.edited] == ["идёт"]

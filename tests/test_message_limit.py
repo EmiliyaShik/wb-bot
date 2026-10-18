@@ -93,3 +93,34 @@ def test_report_summary_goes_through_the_clipper(module):
     assert all("clip" in one for one in sends), (
         f"сводка {module} уходит мимо ограничителя длины: {sends}"
     )
+
+
+# --- обрезка не должна ломать разметку ---
+
+
+def test_cut_does_not_leave_a_half_written_entity():
+    """«&lt» без точки с запятой Telegram не разбирает вовсе.
+
+    Нашлось обзором безопасности: сводка из одной длинной строки режется по
+    знакам, и разрез попадал в середину экранированного символа. Ответ
+    Telegram на такое тот же самый «Message is too long»... то есть отказ, от
+    которого обрезка и защищает.
+    """
+    long = "Товар " + "&lt;кружка&gt; и &amp; " * 500
+    out = texts.clip(long)
+    body = out[: out.index("…")]
+    assert not re.search(r"&[a-zA-Z#0-9]*$", body.rstrip())
+
+
+def test_cut_does_not_leave_a_half_written_tag():
+    long = "<b>" + "я" * 9000
+    out = texts.clip(long)
+    body = out[: out.index("…")]
+    assert not re.search(r"<[^>]*$", body.rstrip())
+    assert out.count("<b>") == out.count("</b>")
+
+
+def test_whole_entities_survive_the_cut():
+    """Отрезается только оборванное: целая сущность остаётся на месте."""
+    out = texts.clip("&amp; " * 2000)
+    assert "&amp;" in out

@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 # коротким периодам, где страницы приезжают подряд.
 MIN_GAP_SEC = 20.0
 
+# Через сколько забыть начатый рассказ. Сорвавшаяся работа последней вести не
+# присылает (её место занимает сообщение очереди о сбое), и без срока следующий
+# запуск правил бы то старое сообщение: клиент увидел бы, как давно уехавший
+# вверх текст вдруг меняется сам по себе. Срок щедрый: выгрузка года идёт
+# полтора часа, и живой рассказ обрывать нельзя.
+FORGET_AFTER_SEC = 3 * 60 * 60.0
+
 
 def make_reporter(
     app: Any,
@@ -62,6 +69,11 @@ def make_reporter(
                 live[int(client_id)] = (int(message.message_id), now)
             return
         message_id, said_at = known
+        if now - said_at > FORGET_AFTER_SEC:
+            # Прошлый рассказ брошен: начинаем новый, а не правим старый.
+            live.pop(int(client_id), None)
+            await report(client_id, text, final)
+            return
         if not final and now - said_at < min_gap_sec:
             return
         try:

@@ -126,6 +126,17 @@ _PAIRED_TAGS = ("b", "strong", "i", "em", "u", "s", "code", "pre", "a", "blockqu
 _TAG_RE = re.compile(r"<(/?)([a-zA-Z]+)[^>]*>")
 
 
+# Оборванный хвост: начатая сущность (&lt без точки с запятой) или начатый
+# тег. Telegram на таком отвечает «Can't parse entities» и не показывает
+# сообщение вовсе, то есть тем же отказом, ради которого обрезка и писалась.
+_TAIL_RE = re.compile(r"(&[a-zA-Z#0-9]{0,8}|<[^>]{0,40})$")
+
+
+def _whole(text: str) -> str:
+    """Отрезает оборванную сущность или начатый тег на конце."""
+    return _TAIL_RE.sub("", text)
+
+
 def _closed(text: str) -> str:
     """Дописывает закрывающие теги, которые осталась должна обрезка."""
     opened: list[str] = []
@@ -168,7 +179,7 @@ def clip(text: Any, limit: int = MESSAGE_LIMIT, tail: str = CLIPPED) -> Safe:
     if not cut:
         # Одна строка длиннее предела: режем по знакам, выбора нет.
         cut = body[:room].rstrip()
-    return Safe(_closed(cut) + tail)
+    return Safe(_closed(_whole(cut)) + tail)
 
 
 def fill(template: str, **fields: Any) -> Safe:
