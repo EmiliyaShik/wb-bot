@@ -12,7 +12,7 @@ Telegram-бот для селлеров Wildberries: селлер подключ
 | `pip install -r requirements.txt` | Зависимости бота. В текущем окружении уже установлены, заново гонять не нужно |
 | `pip install -r requirements-dev.txt` | Только для тестов (`pytest`). На хостинге не ставится: боту они не нужны, а установка дольше |
 | `python bot.py` | Запуск бота (long polling). Нужен `.env` с `TELEGRAM_BOT_TOKEN`, иначе `SystemExit` с подсказкой |
-| `python -m pytest -q` | Весь набор: 1334 passed, 1 skipped, примерно за полторы минуты |
+| `python -m pytest -q` | Весь набор: 1336 passed, 1 skipped, примерно за полторы минуты |
 | `python -m pytest -q tests/test_finance.py` | Один файл |
 | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` | Новый `ENCRYPTION_KEY` |
 
@@ -35,6 +35,7 @@ tests/            pytest, примерно по файлу на модуль
 docs/wb-api.md    что в WB Seller API живо, что отключено и чем заменено
 docs/wb-api-ads-funnel.md  методы рекламы и воронки: лимиты, поля, чего у WB нет
 docs/adr/         решения и их причины, по файлу на решение
+docs/brand/       логотип и код, которым он нарисован
 config.toml       цены, периоды, пороги ([alerts], [cards], [ads], [funnel]), выбор периода отчёта ([reports]), ставки УСН по умолчанию ([tax]), суточная история: срок, окно и догон ([storage]), места и повторы очереди ([queue]), расписание, лимиты; секретов здесь нет
 data/             wbrentgen.db, в git не попадает (имя файла осталось от прежнего названия)
 .autopilot/       служебная папка сборки
@@ -155,7 +156,7 @@ data/             wbrentgen.db, в git не попадает (имя файла 
 
 `pytest` плюс `pytest-asyncio`, конфигурационного файла нет: асинхронные тесты помечены `@pytest.mark.asyncio`. Тесты лежат в `tests/`, примерно по файлу на модуль (`tests/test_finance.py`, `tests/test_queue.py`, `tests/test_wbapi.py`, `tests/test_storage.py` и так далее). Общих фикстур в `tests/conftest.py` две. `db_path` это временный файл базы с применёнными миграциями, его тест просит сам. `sealed_data_dir` автоматическая и на весь прогон: она переставляет `DATA_DIR` во временную папку и подменяет `sqlite3.connect` сторожем, который отказывается открывать базу вне неё. Нужна она потому, что путь к базе знает не весь код (реестр хендлеров, предупреждение о DaData, обработчик ошибок берут путь по умолчанию), и прогон молча дописывал боевой журнал владельца. Третьего шва это не заводит: `DATA_DIR` та же переменная бота, которой пользуется хостинг.
 
-- Весь набор: `python -m pytest -q` (1334 passed, 1 skipped).
+- Весь набор: `python -m pytest -q` (1336 passed, 1 skipped).
 - Один файл: `python -m pytest -q tests/test_finance.py`.
 - Один тест: `python -m pytest -q tests/test_queue.py::test_name`.
 

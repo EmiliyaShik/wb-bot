@@ -2025,3 +2025,67 @@ async def test_chosen_mode_stops_the_question(seller, db_path):
     assert message.sent[0][1]["reply_markup"].inline_keyboard[0][0].callback_data == (
         "profit:week"
     )
+
+
+# --- обезличка: число в методологии и число в колонке ---
+
+
+def test_method_line_names_the_column_total_when_it_differs(db_path):
+    """Селлер складывает числа. Расхождение обязано быть названо, а не найдено.
+
+    В обезличку идут и части статей со своей колонкой: комиссию Wildberries
+    отдаёт и строками без артикула, и там она бывает отрицательной. Тогда в
+    колонке «Расходы без артикула» меньше, чем в сумме статей, «которых нет
+    вовсе», и без этой фразы разницу приходится искать по листу проблем
+    руками.
+    """
+    client_id = db.admin_repo(db_path).ensure_client(6161)
+    rows = [dict(row) for row in ROWS]
+    # Строка без артикула, в которой Wildberries вернул комиссию: ровно такая
+    # приезжает у живого кабинета, и ровно она разводит два числа.
+    rows.append(
+        {
+            "reportId": 1,
+            "rrdId": 99,
+            "dateFrom": "2026-09-01",
+            "dateTo": "2026-09-07",
+            "docTypeName": "",
+            "vw": -120,
+        }
+    )
+    finance.save_rows(client_id, rows, path=db_path)
+    for week in finance.aggregate(rows).values():
+        finance.save_week(client_id, week, path=db_path)
+    costs_module.save_costs(
+        client_id, {111: Decimal("500"), 222: Decimal("900")}, path=db_path
+    )
+    report = profit.build(
+        client_id, "week", today=TODAY, ads=profit.AdSpend(dict(ADS)), path=db_path
+    )
+
+    hidden = sum((item.in_pool for item in report.unshared_items), Decimal("0"))
+    assert hidden != report.unallocated, "данные теста не разводят два числа"
+
+    book = xlsx.read_book(profit.excel_bytes(report))
+    method = {row.get("Показатель"): row for row in book[profit.METHOD_SHEET].rows}
+    note = str(method["Чего нет в этом отчёте"].get("Пояснение"))
+
+    assert "В самой колонке стоит" in note
+    # Оба числа названы, и колонка сходится с листом проблем.
+    assert f"{hidden:.2f}" in note
+    assert f"{report.unallocated:.2f}" in note
+
+
+def test_method_line_stays_short_when_the_numbers_agree(seller, db_path):
+    """Лишней фразы нет там, где складывать нечего: числа и так сходятся."""
+    report = report_of(seller, db_path)
+    assert sum(
+        (item.in_pool for item in report.unshared_items), Decimal("0")
+    ) == report.unallocated
+
+    book = xlsx.read_book(profit.excel_bytes(report))
+    method = {row.get("Показатель"): row for row in book[profit.METHOD_SHEET].rows}
+
+    assert "В самой колонке стоит" not in str(
+        method["Чего нет в этом отчёте"].get("Пояснение")
+    )
