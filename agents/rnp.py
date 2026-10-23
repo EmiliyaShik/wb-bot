@@ -879,6 +879,27 @@ def facts(
     )
 
 
+def collected_days(
+    client_id: int, *, path: str | Path | None = None
+) -> tuple[int, date | None]:
+    """Сколько суток истории уже накоплено и с какого дня она идёт.
+
+    Нужно экрану покупки: модули «План-факт» и «Воронка» считают по этой
+    истории, а копится она с первого дня подключения кабинета. Продавать
+    молча то, что заработает через неделю, нечестно, поэтому число видно до
+    оплаты, а не после.
+    """
+    rows = db.repo(client_id, path).rows("nm_daily")
+    days = sorted({str(row["date"])[:10] for row in rows})
+    if not days:
+        return 0, None
+    try:
+        first = date.fromisoformat(days[0])
+    except ValueError:
+        first = None
+    return len(days), first
+
+
 def request_facts(
     client_id: int,
     date_from: date,

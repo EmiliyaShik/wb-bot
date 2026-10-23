@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Callable
@@ -28,6 +28,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
+from agents import rnp as rnp_agent
 from bot.texts import Safe, fill
 from core import access, config, db, scheduler
 
@@ -244,8 +245,82 @@ def tariffs_text(
     return Safe("\n\n".join(blocks))
 
 
-def offer_text(module: str) -> Safe:
-    """Ответ платной команды без доступа: что даёт модуль и сколько стоит."""
+READY_ENOUGH = (
+    "\n\n✅ История за {days} у вас уже собрана, отчёт будет полным сразу."
+)
+READY_PARTIAL = (
+    "\n\n⏳ Этот отчёт считается по суточной истории, а её бот копит сам: "
+    "Wildberries отдаёт такие данные максимум за неделю назад. У вас собрано "
+    "{days}, нужно {need}. Полным отчёт станет {when}, а до того будет "
+    "считаться по тому, что есть."
+)
+READY_EMPTY = (
+    "\n\n⏳ Этот отчёт считается по суточной истории, а её бот копит сам: "
+    "Wildberries отдаёт такие данные максимум за неделю назад. У вас пока не "
+    "собрано ни одних суток. Подключите кабинет командой <code>/connect</code>, "
+    "и первая неделя приедет уже следующей ночью: больше недели назад взять "
+    "их негде."
+)
+
+
+def history_needed(module: str) -> int:
+    """Сколько суток истории нужно модулю. У пакета это самый долгий из его.
+
+    Пакет это обычный модуль с `includes = "*"`, и своего числа у него нет:
+    он открывает всё видимое, значит ждать надо того, кому ждать дольше всех.
+    """
+    modules = config.modules()
+    info = modules.get(module)
+    if info is None:
+        return 0
+    if info.includes == "*":
+        return max(
+            (one.history_days for one in modules.values() if one.visible), default=0
+        )
+    return int(info.history_days or 0)
+
+
+def readiness_line(
+    module: str, client_id: int | None, path: str | Path | None = None
+) -> str:
+    """Строка про накопленную историю для экрана покупки.
+
+    Пустая строка у модулей, которым история не нужна: они считают по
+    выгруженным деньгам, а их Wildberries отдаёт за год назад.
+    """
+    need = history_needed(module)
+    if not need or client_id is None:
+        return ""
+    try:
+        have, _ = rnp_agent.collected_days(client_id, path=path)
+    except Exception:  # noqa: BLE001 - витрина не падает из-за подсчёта суток
+        logger.exception("не удалось посчитать накопленные сутки клиента %s", client_id)
+        return ""
+    if have >= need:
+        return fill(READY_ENOUGH, days=_days_word(need))
+    if have == 0:
+        return READY_EMPTY
+    when = date.today() + timedelta(days=need - have)
+    return fill(
+        READY_PARTIAL,
+        days=_days_word(have),
+        need=_days_word(need),
+        when=when.strftime("%d.%m.%Y"),
+    )
+
+
+def _days_word(count: int) -> str:
+    """Сутки по-русски: 1 сутки, 2 суток. Слово одно, склонений не плодим."""
+    return f"{count} суток" if count != 1 else "1 сутки"
+
+
+def offer_text(module: str, ready: str = "") -> Safe:
+    """Ответ платной команды без доступа: что даёт модуль и сколько стоит.
+
+    `ready` это строка про накопленную историю. Считает её `readiness_line`,
+    а не этот текст: здесь нет ни базы, ни клиента, и вызов из витрины без
+    клиента должен остаться возможным.
+    """
     info = config.modules().get(module)
     title = (info.title if info and info.title else module) or module
     lines = [fill("🔒 Модуль <b>{title}</b> пока не подключён.", title=title), ""]
@@ -256,7 +331,7 @@ def offer_text(module: str) -> Safe:
     if reports:
         lines += reports + [""]
     lines += [price_line(module), "", TRIAL_INVITE]
-    return Safe("\n".join(lines))
+    return Safe("\n".join(lines) + (ready or ""))
 
 
 def buy_button(module: str, label: str) -> InlineKeyboardButton:
@@ -313,7 +388,7 @@ def client_id_of(update: Update, path: str | Path | None = None) -> int | None:
     return db.admin_repo(path).ensure_client(user.id)
 
 
-async def send_offer(update: Update, module: str) -> None:
+async def send_offer(update: Update, module: str, ready: str = "") -> None:
     """Показывает предложение вместо отказа."""
     # Нажали кнопку, а доступа уже нет: подписка кончилась между показом
     # клавиатуры и нажатием. Телеграм ждёт ответа на нажатие, и без него
@@ -331,7 +406,7 @@ async def send_offer(update: Update, module: str) -> None:
     if message is None:
         return
     await message.reply_text(
-        offer_text(module),
+        offer_text(module, ready),
         parse_mode=ParseMode.HTML,
         reply_markup=offer_keyboard(module),
     )
@@ -359,7 +434,9 @@ def require_module(module: str, *, path: str | Path | None = None):
                 return None
             if access.has_access(client_id, module, path=path):
                 return await handler(update, context, *rest)
-            await send_offer(update, module)
+            # Сколько суток истории накоплено, видно до оплаты, а не после:
+            # «План-факт» и «Воронка» считают по ней, и копится она сама.
+            await send_offer(update, module, readiness_line(module, client_id, path))
             return None
 
         wrapper.required_module = module

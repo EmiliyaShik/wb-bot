@@ -62,6 +62,10 @@ class ModuleInfo:
     gives: str = ""
     diagnostic_line: str = ""
     reports: tuple[ReportInfo, ...] = field(default_factory=tuple)
+    # Сколько суток накопленной истории нужно модулю, чтобы его отчёт стал
+    # полным. Ноль у модулей, которые считают по выгруженным деньгам: им
+    # история не нужна, Wildberries отдаёт её за год назад.
+    history_days: int = 0
 
 
 def _reports(raw: Any) -> tuple[ReportInfo, ...]:
@@ -108,6 +112,7 @@ def modules() -> dict[str, ModuleInfo]:
             gives=str(raw.get("gives", "") or ""),
             diagnostic_line=str(raw.get("diagnostic_line", "") or ""),
             reports=_reports(raw.get("reports")),
+            history_days=int(raw.get("history_days", 0) or 0),
         )
     return result
 

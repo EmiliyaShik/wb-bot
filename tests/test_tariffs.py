@@ -1,7 +1,7 @@
 """Витрина тарифов и заготовка для платных команд. Шов один: путь к базе."""
 
 import copy
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -528,3 +528,58 @@ def test_the_package_is_gone_from_the_trial_and_the_open_modules_are_not():
         for button in row
     }
     assert offered == {"trial:finance", "trial:rnp", "trial:ads", "trial:funnel"}
+
+
+# --- накопленная история видна до оплаты ---
+
+
+def test_modules_counted_by_money_say_nothing_about_history(db_path):
+    """Финансам история не нужна: Wildberries отдаёт деньги за год назад."""
+    client_id = db.admin_repo(db_path).ensure_client(3131)
+    assert tariffs.readiness_line("finance", client_id, db_path) == ""
+
+
+def test_an_empty_cabinet_is_told_where_the_days_come_from(db_path):
+    client_id = db.admin_repo(db_path).ensure_client(3232)
+
+    line = tariffs.readiness_line("rnp", client_id, db_path)
+
+    assert "не собрано ни одних суток" in line
+    assert "/connect" in line
+
+
+def test_a_half_collected_cabinet_gets_the_date_when_it_is_full(db_path):
+    """Клиент платит, понимая, что получит и когда."""
+    client_id = db.admin_repo(db_path).ensure_client(3333)
+    repo = db.repo(client_id, db_path)
+    for day in range(1, 5):
+        repo.upsert("nm_daily", {"date": f"2026-10-{day:02d}", "nm_id": 111}, orders=1)
+
+    line = tariffs.readiness_line("rnp", client_id, db_path)
+
+    assert "4 суток" in line and "7 суток" in line
+    # Полным отчёт станет через три дня, и дата названа числом.
+    assert (date.today() + timedelta(days=3)).strftime("%d.%m.%Y") in line
+
+
+def test_enough_history_is_said_plainly(db_path):
+    client_id = db.admin_repo(db_path).ensure_client(3434)
+    repo = db.repo(client_id, db_path)
+    for day in range(1, 9):
+        repo.upsert("nm_daily", {"date": f"2026-10-{day:02d}", "nm_id": 111}, orders=1)
+
+    assert "будет полным сразу" in tariffs.readiness_line("rnp", client_id, db_path)
+
+
+def test_the_package_waits_for_the_slowest_module():
+    """Пакет открывает всё видимое, значит ждёт того, кому ждать дольше."""
+    assert tariffs.history_needed("all") == tariffs.history_needed("funnel") == 14
+
+
+def test_the_offer_keeps_the_line_at_the_end(db_path):
+    client_id = db.admin_repo(db_path).ensure_client(3535)
+    text = str(tariffs.offer_text("rnp", tariffs.readiness_line("rnp", client_id, db_path)))
+
+    assert text.endswith("взять их негде.")
+    # Цена и приглашение в пробный период на месте, строка их не вытеснила.
+    assert "590" in text
