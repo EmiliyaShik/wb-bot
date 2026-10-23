@@ -24,7 +24,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -41,6 +41,9 @@ COLLECT_ALL = "rnp_collect"
 REPORT_ALL = "rnp_report"
 COLLECT_ONE = "rnp_collect_client"
 REPORT_ONE = "rnp_report_client"
+# Факт за произвольный период: отдельная задача, потому что считается он
+# по другим правилам и отдаётся другим текстом.
+FACTS_ONE = "rnp_facts_client"
 
 # Сколько суток забираем за один заход. Больше недели WB всё равно не даст,
 # а окно (а не один вчерашний день) закрывает дыры после простоя бота.
@@ -694,6 +697,15 @@ def set_delivery(fn: Callable[[int, RnpReport], Any] | None) -> None:
     _delivery = fn
 
 
+_facts_delivery: Callable[[int, "PeriodFacts"], Any] | None = None
+
+
+def set_facts_delivery(fn: Callable[[int, "PeriodFacts"], Any] | None) -> None:
+    """Чем уходит факт за период. Доставка своя: текст у него другой."""
+    global _facts_delivery
+    _facts_delivery = fn
+
+
 async def report_client(task: Any, *, path: str | Path | None = None) -> RnpReport:
     """Собирает утренний отчёт и отдаёт его тому, кто умеет писать клиенту."""
     report = daily(task.client_id, today=_payload_date(task), path=path)
@@ -701,6 +713,198 @@ async def report_client(task: Any, *, path: str | Path | None = None) -> RnpRepo
         logger.warning("отчёт клиента %s некому отправить", task.client_id)
         return report
     result = _delivery(task.client_id, report)
+    if hasattr(result, "__await__"):
+        await result
+    return report
+
+
+@dataclass(frozen=True)
+class PeriodFacts:
+    """Факт за произвольный отрезок и доля плана, приходящаяся на эти дни.
+
+    Доля плана считается пропорционально дням (решение владельца): за 14 дней
+    из 31 ждём 14/31 месячного плана. У сезонного товара продажи внутри
+    месяца неровные, и такое ожидание на короткий отрезок врёт в обе стороны,
+    поэтому отчёт называет правило вслух, а не выдаёт долю за настоящий план.
+
+    `days` и `days_total` стоят рядом нарочно: суточную историю бот копит сам
+    с первого дня подключения кабинета, Wildberries её больше недели назад не
+    отдаёт, и у периода, в который бот ещё не работал, факт неполон. Молчать
+    об этом нельзя: недобранные сутки выглядят как падение продаж.
+    """
+
+    client_id: int
+    date_from: date
+    date_to: date
+    days: int = 0
+    days_total: int = 0
+    orders: int = 0
+    revenue: Decimal = Decimal("0")
+    ad_spend: Decimal = Decimal("0")
+    plan_revenue: Decimal | None = None
+    plan_orders: int | None = None
+    plan_months: tuple[str, ...] = ()
+
+    @property
+    def has_data(self) -> bool:
+        return self.days > 0
+
+    @property
+    def complete(self) -> bool:
+        """Собраны ли все сутки периода."""
+        return self.days >= self.days_total
+
+    @property
+    def drr(self) -> Decimal | None:
+        return drr(self.ad_spend, self.revenue)
+
+    @property
+    def avg_orders(self) -> Decimal | None:
+        """Среднее в день считается по собранным суткам, а не по всем.
+
+        Делить на несобранные сутки значит занижать темп ровно там, где он и
+        так неизвестен.
+        """
+        if not self.days:
+            return None
+        return (Decimal(self.orders) / self.days).quantize(CENT)
+
+    @property
+    def avg_revenue(self) -> Decimal | None:
+        if not self.days:
+            return None
+        return (self.revenue / self.days).quantize(CENT)
+
+    @property
+    def revenue_done(self) -> Decimal | None:
+        """Сколько процентов доли плана по выручке сделано."""
+        if not self.plan_revenue:
+            return None
+        return (self.revenue * 100 / self.plan_revenue).quantize(CENT)
+
+    @property
+    def orders_done(self) -> Decimal | None:
+        if not self.plan_orders:
+            return None
+        return (Decimal(self.orders) * 100 / self.plan_orders).quantize(CENT)
+
+    @property
+    def has_plan(self) -> bool:
+        return self.plan_revenue is not None or self.plan_orders is not None
+
+
+def months_in(date_from: date, date_to: date) -> list[tuple[str, int, int]]:
+    """Месяцы, которые задел период: ключ, сколько дней задето, сколько всего."""
+    found: list[tuple[str, int, int]] = []
+    cursor = date_from.replace(day=1)
+    while cursor <= date_to:
+        length = calendar.monthrange(cursor.year, cursor.month)[1]
+        last = cursor.replace(day=length)
+        first_in = max(date_from, cursor)
+        last_in = min(date_to, last)
+        found.append((cursor.strftime("%Y-%m"), (last_in - first_in).days + 1, length))
+        cursor = last + timedelta(days=1)
+    return found
+
+
+def plan_share(
+    client_id: int,
+    date_from: date,
+    date_to: date,
+    *,
+    path: str | Path | None = None,
+) -> tuple[Decimal | None, int | None, tuple[str, ...]]:
+    """Доля месячного плана, приходящаяся на дни периода.
+
+    Период может задеть два месяца и больше: тогда берётся доля каждого плана
+    и они складываются. Месяц без плана долю не даёт вовсе, и это видно по
+    списку месяцев в ответе: ноль вместо «плана нет» читался бы как «план
+    ноль», то есть «выполнено бесконечно».
+    """
+    revenue: Decimal | None = None
+    orders_part = Decimal("0")
+    orders_known = False
+    months: list[str] = []
+    for key, days, length in months_in(date_from, date_to):
+        plan = plan_of(client_id, key, path=path)
+        if plan is None:
+            continue
+        months.append(key)
+        share = Decimal(days) / Decimal(length)
+        if plan.revenue is not None:
+            revenue = (revenue or Decimal("0")) + plan.revenue * share
+        if plan.orders is not None:
+            orders_known = True
+            orders_part += Decimal(plan.orders) * share
+    return (
+        None if revenue is None else revenue.quantize(CENT),
+        # Заказы целые: половины заказа не бывает, и в цели она читалась бы
+        # как придирка. Округление обычное, вверх с половины.
+        int(orders_part.quantize(Decimal("1"), rounding=ROUND_HALF_UP)) if orders_known else None,
+        tuple(months),
+    )
+
+
+def facts(
+    client_id: int,
+    date_from: date,
+    date_to: date,
+    *,
+    path: str | Path | None = None,
+) -> PeriodFacts:
+    """Факт за период по накопленным суткам. В WB этот вызов не ходит."""
+    repo = db.repo(client_id, path)
+    rows = repo.rows_between(
+        "nm_daily", "date", date_from.isoformat(), date_to.isoformat()
+    )
+    # Сутки собраны, если по ним есть хоть одна строка. Правило то же, что у
+    # утреннего отчёта (`daily`), и второго правила в модуле быть не должно:
+    # иначе «собрано 12 из 14» в одном отчёте и «13 из 14» в соседнем.
+    days = {str(row["date"])[:10] for row in rows}
+    plan_revenue, plan_orders, months = plan_share(
+        client_id, date_from, date_to, path=path
+    )
+    return PeriodFacts(
+        client_id=client_id,
+        date_from=date_from,
+        date_to=date_to,
+        days=len(days),
+        days_total=(date_to - date_from).days + 1,
+        orders=_sum(rows, "orders"),
+        revenue=db.from_kop(_sum(rows, "orders_sum_kop")),
+        ad_spend=db.from_kop(_sum(rows, "ad_spend_kop")),
+        plan_revenue=plan_revenue,
+        plan_orders=plan_orders,
+        plan_months=months,
+    )
+
+
+def request_facts(
+    client_id: int,
+    date_from: date,
+    date_to: date,
+    *,
+    path: str | Path | None = None,
+) -> queue.TaskId:
+    """Факт за период в очередь. Период едет датами, а не именем кнопки."""
+    return queue.enqueue(
+        client_id,
+        FACTS_ONE,
+        {"from": date_from.isoformat(), "to": date_to.isoformat()},
+        path=path,
+    )
+
+
+async def facts_client(task: Any, *, path: str | Path | None = None) -> PeriodFacts:
+    """Собирает факт за период и отдаёт его поверхности бота."""
+    payload = getattr(task, "payload", None) or {}
+    first = date.fromisoformat(str(payload.get("from")))
+    last = date.fromisoformat(str(payload.get("to")))
+    report = facts(task.client_id, first, last, path=path)
+    if _facts_delivery is None:
+        logger.warning("факт за период клиента %s некому отправить", task.client_id)
+        return report
+    result = _facts_delivery(task.client_id, report)
     if hasattr(result, "__await__"):
         await result
     return report
@@ -719,3 +923,4 @@ def register_jobs() -> None:
     # Суточный план-факт ставит и расписание, и сам клиент командой. Молчать
     # о его сбое нельзя: в обоих случаях селлер ждёт этот разбор утром.
     queue.register(REPORT_ONE, report_client, title="план-факт")
+    queue.register(FACTS_ONE, facts_client, title="факт за период")

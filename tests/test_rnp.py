@@ -541,22 +541,35 @@ from bot.handlers import rnp as handler  # noqa: E402
 
 class FakeMessage:
     def __init__(self):
-        self.sent: list[str] = []
+        # Клавиатура запоминается рядом с текстом: кнопки периода это часть
+        # ответа, и проверять их надо тем же тестом, что и слова.
+        self.sent: list[tuple[str, dict]] = []
 
     async def reply_text(self, text, **kwargs):
-        self.sent.append(text)
+        self.sent.append((text, kwargs))
         return self
 
     @property
     def last(self) -> str:
-        return self.sent[-1] if self.sent else ""
+        return self.sent[-1][0] if self.sent else ""
+
+
+class FakeQuery:
+    def __init__(self, data, message):
+        self.data = data
+        self.message = message
+        self.answered = None
+
+    async def answer(self, text=None, **kwargs):
+        self.answered = text or ""
 
 
 class FakeUpdate:
-    def __init__(self, telegram_id, message):
+    def __init__(self, telegram_id, message, query=None):
         self.effective_user = SimpleNamespace(id=telegram_id)
         self.effective_message = message
         self.message = message
+        self.callback_query = query
 
 
 def test_report_text_without_a_plan_comes_without_the_plan_fact_block(db_path, half_a_month):
@@ -617,11 +630,31 @@ async def test_plan_command_without_numbers_explains_how_to_set_it(db_path, cabi
 
 
 @pytest.mark.asyncio
-async def test_rnp_command_puts_a_task_in_the_queue_instead_of_calling_wb(db_path, cabinet):
+async def test_rnp_command_asks_what_to_show(db_path, cabinet):
+    """Команда сама ничего не считает: сначала вопрос, что показать."""
     message = FakeMessage()
 
     await handler.rnp_command(
         FakeUpdate(4040, message), SimpleNamespace(args=[]), path=db_path, today=TODAY
+    )
+
+    assert db.repo(cabinet, db_path).rows("tasks") == []
+    actions = [
+        button.callback_data
+        for row in message.sent[-1][1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert actions[0] == "rnp:daily"
+    assert "rnp:two_weeks" in actions
+
+
+@pytest.mark.asyncio
+async def test_daily_button_puts_the_morning_report_in_the_queue(db_path, cabinet):
+    message = FakeMessage()
+    query = FakeQuery("rnp:daily", message)
+
+    await handler.chosen(
+        FakeUpdate(4040, message, query), None, path=db_path, today=TODAY
     )
 
     tasks = db.repo(cabinet, db_path).rows("tasks", kind=rnp.REPORT_ONE)
@@ -653,12 +686,13 @@ def test_register_puts_commands_and_both_daily_jobs_in_place(db_path, cabinet):
 
     handler.register(app, path=db_path)
 
-    assert len(app.added) == 2
+    assert len(app.added) == 3
     # Сбор и рассылка это две разные утренние работы: одна идёт всем,
     # вторая только подписчикам.
     assert set(scheduler.daily_names()) == {rnp.COLLECT_ALL}
     assert rnp.COLLECT_ONE in queue.handlers()
     assert rnp.REPORT_ONE in queue.handlers()
+    assert rnp.FACTS_ONE in queue.handlers()
 
 
 @pytest.mark.asyncio
@@ -898,3 +932,120 @@ def test_an_article_from_wildberries_does_not_become_markup(db_path, half_a_mont
     assert "<a href" not in text
     assert "&lt;a href=&quot;" in text
     assert "<b>" in text  # разметка самого бота при этом на месте
+
+
+# --- факт за период ---------------------------------------------------------
+
+
+def test_facts_sum_the_collected_days(db_path, half_a_month):
+    """Факт складывается по собранным суткам, а не по длине периода."""
+    report = rnp.facts(half_a_month, date(2026, 9, 1), date(2026, 9, 14), path=db_path)
+
+    assert report.days == 14 and report.days_total == 14
+    assert report.orders == 140
+    assert report.revenue == Decimal("14000")
+    assert report.avg_orders == Decimal("10")
+    assert report.complete is True
+
+
+def test_facts_say_how_many_days_are_missing(db_path, half_a_month):
+    """Половина периода не собрана: это видно числом, а не догадкой.
+
+    Сутки до подключения кабинета взять негде: Wildberries отдаёт их максимум
+    за неделю назад. Молчать об этом нельзя, недобранные дни читаются как
+    падение продаж.
+    """
+    report = rnp.facts(half_a_month, date(2026, 8, 25), date(2026, 9, 14), path=db_path)
+
+    assert report.days == 14
+    assert report.days_total == 21
+    assert report.complete is False
+    # Среднее считается по собранным суткам, иначе темп занижен вдвое.
+    assert report.avg_orders == Decimal("10")
+
+
+def test_facts_without_any_day_say_so(db_path, cabinet):
+    report = rnp.facts(cabinet, date(2026, 7, 1), date(2026, 7, 14), path=db_path)
+
+    assert report.has_data is False
+    assert "Wildberries" in str(handler.facts_text(report))
+
+
+def test_plan_share_is_counted_by_days(db_path, half_a_month):
+    """Вариант владельца: доля плана пропорциональна дням периода."""
+    rnp.set_plan(half_a_month, "2026-09", revenue=Decimal("300000"), orders=600, path=db_path)
+
+    report = rnp.facts(half_a_month, date(2026, 9, 1), date(2026, 9, 10), path=db_path)
+
+    # Сентябрь это 30 дней, период 10: ровно треть плана.
+    assert report.plan_revenue == Decimal("100000")
+    assert report.plan_orders == 200
+    assert report.revenue_done == Decimal("10")
+
+
+def test_plan_share_adds_up_across_two_months(db_path, cabinet):
+    """Период на стыке: доля каждого месяца своя и считается отдельно."""
+    rnp.set_plan(cabinet, "2026-08", revenue=Decimal("310000"), path=db_path)
+    rnp.set_plan(cabinet, "2026-09", revenue=Decimal("300000"), path=db_path)
+
+    report = rnp.facts(cabinet, date(2026, 8, 30), date(2026, 9, 2), path=db_path)
+
+    # Август: 2 дня из 31 это 20000. Сентябрь: 2 дня из 30 это 20000.
+    assert report.plan_revenue == Decimal("40000")
+
+
+def test_a_month_without_a_plan_does_not_pretend_to_have_one(db_path, cabinet):
+    """Месяц без плана доли не даёт: ноль читался бы как «план ноль»."""
+    rnp.set_plan(cabinet, "2026-09", revenue=Decimal("300000"), path=db_path)
+
+    report = rnp.facts(cabinet, date(2026, 8, 30), date(2026, 9, 2), path=db_path)
+
+    assert report.plan_revenue == Decimal("20000")
+    assert report.plan_months == ("2026-09",)
+
+
+def test_facts_text_names_the_rule_and_the_share(db_path, half_a_month):
+    rnp.set_plan(half_a_month, "2026-09", revenue=Decimal("300000"), orders=600, path=db_path)
+    report = rnp.facts(half_a_month, date(2026, 9, 1), date(2026, 9, 10), path=db_path)
+
+    text = str(handler.facts_text(report))
+
+    assert "Доля месячного плана" in text
+    assert "ровно по дням" in text
+    assert "100 000" in text.replace(" ", " ")
+
+
+def test_facts_text_offers_to_set_a_plan_when_there_is_none(db_path, half_a_month):
+    report = rnp.facts(half_a_month, date(2026, 9, 1), date(2026, 9, 10), path=db_path)
+
+    assert "/plan" in str(handler.facts_text(report))
+
+
+@pytest.mark.asyncio
+async def test_period_button_queues_the_facts(db_path, half_a_month):
+    message = FakeMessage()
+    query = FakeQuery("rnp:two_weeks", message)
+
+    await handler.chosen(
+        FakeUpdate(4040, message, query), None, path=db_path, today=TODAY
+    )
+
+    tasks = db.repo(half_a_month, db_path).rows("tasks", kind=rnp.FACTS_ONE)
+    assert len(tasks) == 1
+    # Период едет датами и кончается вчера: сегодняшних суток ещё нет ни у
+    # бота, ни у Wildberries.
+    payload = json.loads(tasks[0]["payload"])
+    assert payload == {"from": "2026-09-02", "to": "2026-09-15"}
+
+
+@pytest.mark.asyncio
+async def test_a_made_up_button_is_refused(db_path, cabinet):
+    """`callback_data` приходит от клиента: чужой период в очередь не ляжет."""
+    message = FakeMessage()
+    query = FakeQuery("rnp:vsyo_vremya", message)
+
+    await handler.chosen(
+        FakeUpdate(4040, message, query), None, path=db_path, today=TODAY
+    )
+
+    assert db.repo(cabinet, db_path).rows("tasks") == []

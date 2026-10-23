@@ -12,7 +12,7 @@ Telegram-бот для селлеров Wildberries: селлер подключ
 | `pip install -r requirements.txt` | Зависимости бота. В текущем окружении уже установлены, заново гонять не нужно |
 | `pip install -r requirements-dev.txt` | Только для тестов (`pytest`). На хостинге не ставится: боту они не нужны, а установка дольше |
 | `python bot.py` | Запуск бота (long polling). Нужен `.env` с `TELEGRAM_BOT_TOKEN`, иначе `SystemExit` с подсказкой |
-| `python -m pytest -q` | Весь набор: 1341 passed, 1 skipped, примерно за полторы минуты |
+| `python -m pytest -q` | Весь набор: 1352 passed, 1 skipped, примерно за полторы минуты |
 | `python -m pytest -q tests/test_finance.py` | Один файл |
 | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` | Новый `ENCRYPTION_KEY` |
 
@@ -77,7 +77,7 @@ data/             wbrentgen.db, в git не попадает (имя файла 
 - **Доступ включается только `core.access.grant_access`** (счёт, ручная выдача, пробный период). Повтор с тем же `payment_ref` возвращает `Access.duplicate = True` и ничего не продлевает. Гасит только `revoke_access`, её идемпотентность стоит на состоянии, а не на `payment_ref`.
 - **Платные команды обёрнуты `bot.handlers.tariffs.require_module(module)`**, своей проверки доступа хендлеры не пишут: без доступа клиент видит описание модуля, цену и кнопку «Оформить».
 - **`core.clients.on_wb_error` - единственная реакция на ошибку WB:** 401 ставит модули на паузу, 403 не ставит.
-- **Свои задачи и работы агент регистрирует сам** в `register_jobs()`, а зовёт её `register(app)` соответствующего хендлера (`finance`, `profit`, `rnp`, `ads`, `funnel`, `dynamics`, `diagnostic`, `settings`). Виды задач: `finance_report`, `finance_collect`, `profit_report`, `rnp_collect_client`, `rnp_report_client`, `ads_report`, `ads_collect_client`, `funnel_report`, `storage_collect_client`, `diagnostic`, `costs_template`, плюс `token_check` и `wb_diag` от хендлеров `connect` и `diag`. Работы расписания это тоже виды задач, под своими именами: ежедневные `lifecycle_daily`, `lifecycle_reports`, `lifecycle_finance_collect`, `rnp_collect`, `ads_collect`, `ads_cleanup`, `funnel_cleanup`, `storage_collect`, `storage_cleanup`, `token_expiry_reminder`, `invoices_overdue`, `acts_monthly` и недельные `lifecycle_weekly`, `watchdog_alerts`. Чистки (`ads_cleanup`, `funnel_cleanup`, `storage_cleanup`) срезают суточную историю глубже `[storage] daily_history_days`: она копится у всех подключённых кабинетов каждый день, и без срока таблицы растут бесконечно.
+- **Свои задачи и работы агент регистрирует сам** в `register_jobs()`, а зовёт её `register(app)` соответствующего хендлера (`finance`, `profit`, `rnp`, `ads`, `funnel`, `dynamics`, `diagnostic`, `settings`). Виды задач: `finance_report`, `finance_collect`, `profit_report`, `rnp_collect_client`, `rnp_report_client`, `rnp_facts_client`, `ads_report`, `ads_collect_client`, `funnel_report`, `storage_collect_client`, `diagnostic`, `costs_template`, плюс `token_check` и `wb_diag` от хендлеров `connect` и `diag`. Работы расписания это тоже виды задач, под своими именами: ежедневные `lifecycle_daily`, `lifecycle_reports`, `lifecycle_finance_collect`, `rnp_collect`, `ads_collect`, `ads_cleanup`, `funnel_cleanup`, `storage_collect`, `storage_cleanup`, `token_expiry_reminder`, `invoices_overdue`, `acts_monthly` и недельные `lifecycle_weekly`, `watchdog_alerts`. Чистки (`ads_cleanup`, `funnel_cleanup`, `storage_cleanup`) срезают суточную историю глубже `[storage] daily_history_days`: она копится у всех подключённых кабинетов каждый день, и без срока таблицы растут бесконечно.
 
 ### Периоды отчётов
 
@@ -110,6 +110,17 @@ data/             wbrentgen.db, в git не попадает (имя файла 
 (`Period.payload`, `finance.period_of_task`): воркер может взять работу на
 следующих сутках, и у относительной кнопки «сегодня» подвижно по смыслу, а
 названный месяц обязан остаться тем же месяцем.
+
+У `/rnp` период свой и считается не по деньгам, а по накопленным суткам
+(`nm_daily`): кнопка «Как дела сегодня» это прежний разбор вчерашнего дня, а
+кнопки отрезков и своих дат дают «Факт за период» (`rnp.facts`). Доля плана
+там считается пропорционально дням (решение владельца 20.10.2026), по каждому
+задетому месяцу отдельно, и отчёт называет это правило вслух: у сезонного
+товара ожидание по дням врёт в обе стороны. Месяц без плана доли не даёт
+вовсе, ноль читался бы как «план ноль». Отрезок кончается вчера, а не
+сегодня: сегодняшних суток нет ни у бота, ни у Wildberries. Несобранные сутки
+названы числом, а средние считаются по собранным: делить на несобранные
+значит занижать темп там, где он неизвестен.
 
 Точный период есть у `/finance`, `/profit` и `/ads`. У `/funnel` его нет, и
 это решение: период воронки это окно плюс равное окно до него для сравнения,
@@ -156,7 +167,7 @@ data/             wbrentgen.db, в git не попадает (имя файла 
 
 `pytest` плюс `pytest-asyncio`, конфигурационного файла нет: асинхронные тесты помечены `@pytest.mark.asyncio`. Тесты лежат в `tests/`, примерно по файлу на модуль (`tests/test_finance.py`, `tests/test_queue.py`, `tests/test_wbapi.py`, `tests/test_storage.py` и так далее). Общих фикстур в `tests/conftest.py` две. `db_path` это временный файл базы с применёнными миграциями, его тест просит сам. `sealed_data_dir` автоматическая и на весь прогон: она переставляет `DATA_DIR` во временную папку и подменяет `sqlite3.connect` сторожем, который отказывается открывать базу вне неё. Нужна она потому, что путь к базе знает не весь код (реестр хендлеров, предупреждение о DaData, обработчик ошибок берут путь по умолчанию), и прогон молча дописывал боевой журнал владельца. Третьего шва это не заводит: `DATA_DIR` та же переменная бота, которой пользуется хостинг.
 
-- Весь набор: `python -m pytest -q` (1341 passed, 1 skipped).
+- Весь набор: `python -m pytest -q` (1352 passed, 1 skipped).
 - Один файл: `python -m pytest -q tests/test_finance.py`.
 - Один тест: `python -m pytest -q tests/test_queue.py::test_name`.
 

@@ -24,19 +24,21 @@ from __future__ import annotations
 import functools
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import CommandHandler
+from telegram.ext import CallbackQueryHandler, CommandHandler
 
 from agents import rnp
+from bot.handlers import period
 from bot.handlers.tariffs import client_id_of, require_module, rubles
 from bot import texts
 from bot.texts import Safe, fill
-from core import db, scheduler
+from core import db, queue, scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +143,159 @@ def _orders(count: int) -> str:
     return {1: f"{count} заказ", 2: f"{count} заказа", 3: f"{count} заказа", 4: f"{count} заказа"}.get(
         count % 10, f"{count} заказов"
     )
+
+
+PREFIX = "rnp:"
+DAILY = "daily"
+
+# Относительные кнопки факта. Число дней стоит в подписи: «месяц» читался бы
+# как календарный, а это дни назад от вчера.
+FACT_PERIODS: tuple[tuple[str, str], ...] = (
+    ("week", "Последние 7 дней"),
+    ("two_weeks", "Последние 14 дней"),
+    ("month", "Последние 31 день"),
+)
+FACT_DAYS = {"week": 7, "two_weeks": 14, "month": 31}
+
+ASK_WHAT = (
+    "📈 <b>План-факт</b>\n\n"
+    "«Как дела сегодня» это разбор вчерашнего дня: темп, прогноз на конец "
+    "месяца и остатки. Факт за период это итог нескольких дней подряд и доля "
+    "месячного плана, которая на эти дни приходится."
+)
+
+FACTS_HEADER = "📈 <b>Факт за период: {first} - {last}</b>"
+
+FACTS_NO_DATA = (
+    "За эти дни у меня нет ни одних собранных суток.\n\n"
+    "Заказы и воронку по дням Wildberries отдаёт максимум за неделю назад, "
+    "поэтому бот копит их сам, каждую ночь, с первого дня подключения "
+    "кабинета. За дни до подключения взять их негде."
+)
+
+FACTS_BODY = (
+    "Заказов: <b>{orders}</b>\n"
+    "Выручка по заказам: <b>{revenue}</b>\n"
+    "В среднем в день: {avg_orders} и {avg_revenue}"
+)
+
+FACTS_ADS = "\n\nРасход на рекламу: {spend}{drr}"
+
+FACTS_PARTIAL = (
+    "\n\n⚠️ Собрано {days} из {total}. Факт за несобранные сутки не "
+    "посчитан: бот копит их с первого дня подключения кабинета, а Wildberries "
+    "больше недели назад их не отдаёт. Недобранные сутки выглядят как "
+    "падение продаж, поэтому пишу об этом прямо."
+)
+
+FACTS_PLAN = (
+    "\n\n<b>План на эти дни</b>\n"
+    "Доля месячного плана по дням: {days_in} из {days_month}.\n"
+)
+FACTS_PLAN_REVENUE = "Выручка: {fact} из {plan}, это {done}\n"
+FACTS_PLAN_ORDERS = "Заказы: {fact} из {plan}, это {done}\n"
+FACTS_PLAN_NOTE = (
+    "Доля считается ровно по дням, поровну на каждый день месяца. У "
+    "сезонного товара продажи внутри месяца неровные, так что это ожидание, "
+    "а не настоящий план на эти даты."
+)
+
+FACTS_NO_PLAN = (
+    "\n\n<b>Плана на этот месяц нет.</b> Поставьте его командой "
+    "<code>/plan 500000 300</code>, и я покажу, какая его доля приходится на "
+    "выбранные дни."
+)
+
+
+def keyboard() -> Any:
+    """Что именно показать: вчерашний разбор или факт за период."""
+    rows = [[InlineKeyboardButton("📊 Как дела сегодня", callback_data=f"{PREFIX}{DAILY}")]]
+    rows += [
+        [InlineKeyboardButton(title, callback_data=f"{PREFIX}{key}")]
+        for key, title in FACT_PERIODS
+    ]
+    return InlineKeyboardMarkup(rows + period.month_rows(PREFIX))
+
+
+def facts_text(report: rnp.PeriodFacts) -> Safe:
+    """Факт за период словами. Доля плана названа долей, а не планом."""
+    head = fill(
+        FACTS_HEADER,
+        first=_date_ru(report.date_from),
+        last=_date_ru(report.date_to),
+    )
+    if not report.has_data:
+        return Safe(head + "\n\n" + FACTS_NO_DATA)
+
+    body = fill(
+        FACTS_BODY,
+        orders=report.orders,
+        revenue=rubles(report.revenue),
+        avg_orders=_orders(int(report.avg_orders or 0)),
+        avg_revenue=rubles(report.avg_revenue or Decimal("0")),
+    )
+    text = Safe(head + "\n\n" + body)
+
+    if report.ad_spend:
+        drr_part = (
+            fill(", ДРР {drr}", drr=_percent(report.drr)) if report.drr is not None else ""
+        )
+        text = Safe(text + fill(FACTS_ADS, spend=rubles(report.ad_spend), drr=drr_part))
+
+    if not report.complete:
+        text = Safe(
+            text
+            + fill(
+                FACTS_PARTIAL,
+                days=_days(report.days),
+                total=report.days_total,
+            )
+        )
+
+    if not report.has_plan:
+        return Safe(text + FACTS_NO_PLAN)
+
+    lines = Safe(
+        fill(
+            FACTS_PLAN,
+            days_in=report.days_total,
+            days_month=_plan_month_days(report),
+        )
+    )
+    if report.plan_revenue is not None:
+        lines = Safe(
+            lines
+            + fill(
+                FACTS_PLAN_REVENUE,
+                fact=rubles(report.revenue),
+                plan=rubles(report.plan_revenue),
+                done=_percent(report.revenue_done),
+            )
+        )
+    if report.plan_orders is not None:
+        lines = Safe(
+            lines
+            + fill(
+                FACTS_PLAN_ORDERS,
+                fact=report.orders,
+                plan=report.plan_orders,
+                done=_percent(report.orders_done),
+            )
+        )
+    return Safe(text + lines + FACTS_PLAN_NOTE)
+
+
+def _plan_month_days(report: rnp.PeriodFacts) -> int:
+    """Сколько дней в месяце, от которого берётся доля.
+
+    У периода внутри одного месяца это его длина. У периода на стыке месяцев
+    одного числа не существует, и тогда показывается сумма дней задетых
+    месяцев: доля всё равно считалась по каждому месяцу отдельно.
+    """
+    total = 0
+    for _, _, length in rnp.months_in(report.date_from, report.date_to):
+        total += length
+    return total
 
 
 def report_text(report: rnp.RnpReport) -> Safe:
@@ -372,12 +527,97 @@ async def rnp_command(
     path: str | Path | None = None,
     today: date | None = None,
 ) -> None:
-    """`/rnp`: отчёт по требованию. Ставится в очередь, а не считается тут."""
+    """`/rnp`: спрашивает, что показать. Считает очередь, а не хендлер."""
     message = update.effective_message
     client_id = client_id_of(update, path)
     if message is None or client_id is None:
         return
-    rnp.request_report(client_id, day=_today(today), path=path)
+    await message.reply_text(
+        ASK_WHAT, parse_mode=ParseMode.HTML, reply_markup=keyboard()
+    )
+
+
+def _last_days(count: int, today: date) -> tuple[date, date]:
+    """Отрезок в `count` дней, заканчивающийся вчера.
+
+    Вчера, а не сегодня: сутки собираются ночью, и сегодняшних данных нет ни
+    у бота, ни у Wildberries. Кнопка, которая всегда тянет пустой последний
+    день, занижала бы и средние, и долю плана.
+    """
+    last = today - timedelta(days=1)
+    return last - timedelta(days=count - 1), last
+
+
+async def chosen(
+    update: Any,
+    context: Any,
+    *,
+    path: str | Path | None = None,
+    today: date | None = None,
+) -> None:
+    """Кнопка: вчерашний разбор, относительный отрезок, месяц или свои даты.
+
+    Период проверяет функция, а не клавиатура: `callback_data` присылает
+    клиент, и подделать его ничего не стоит.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+    client_id = client_id_of(update, path)
+    if client_id is None:
+        await query.answer()
+        return
+    tail = str(query.data or "")[len(PREFIX) :]
+    now = _today(today)
+
+    if tail == DAILY:
+        rnp.request_report(client_id, day=now, path=path)
+        await query.answer("Принято")
+        return
+
+    if tail == period.CUSTOM:
+        await query.answer()
+        await period.ask(update, context, rnp.MODULE)
+        return
+
+    if tail in FACT_DAYS:
+        first, last = _last_days(FACT_DAYS[tail], now)
+    elif tail.startswith(period.MARK):
+        window = period.period_of_callback(tail)
+        if window is None:
+            await query.answer()
+            if query.message is not None:
+                await query.message.reply_text(
+                    period.stale_text("rnp"), parse_mode=ParseMode.HTML
+                )
+            return
+        first, last = window.date_from, window.date_to
+    else:
+        await query.answer()
+        return
+
+    task = rnp.request_facts(client_id, first, last, path=path)
+    await query.answer("Принято" if task.created else queue.ALREADY_QUEUED)
+
+
+async def dates_chosen(
+    update: Any,
+    context: Any,
+    window: Any,
+    *,
+    path: str | Path | None = None,
+) -> None:
+    """Свои даты: тот же факт за период, только границы ввёл человек."""
+    client_id = client_id_of(update, path)
+    if client_id is None:
+        return
+    task = rnp.request_facts(client_id, window.date_from, window.date_to, path=path)
+    message = update.effective_message
+    if message is None:
+        return
+    await message.reply_text(
+        Safe(queue.ACCEPTED if task.created else queue.ALREADY_QUEUED)
+    )
 
 
 # --- доставка утреннего отчёта ---
@@ -400,9 +640,27 @@ def make_delivery(app: Any, path: str | Path | None = None):
     return deliver
 
 
+def make_facts_delivery(app: Any, path: str | Path | None = None):
+    """Чем уходит факт за период. Текст свой, поэтому и доставка своя."""
+
+    async def deliver(client_id: int, report: rnp.PeriodFacts) -> None:
+        row = db.admin_repo(path).client(client_id)
+        if row is None:
+            logger.warning("некому отправить факт: клиента %s нет в базе", client_id)
+            return
+        await app.bot.send_message(
+            chat_id=int(row["telegram_id"]),
+            text=texts.clip(facts_text(report)),
+            parse_mode=ParseMode.HTML,
+        )
+
+    return deliver
+
+
 def register(app, *, path: str | Path | None = None) -> None:
     """Хендлер ставит себя сам: bot/app.py никто не трогает."""
     rnp.set_delivery(make_delivery(app, path))
+    rnp.set_facts_delivery(make_facts_delivery(app, path))
     rnp.register_jobs()
 
     guard = require_module(rnp.MODULE, path=path)
@@ -410,3 +668,11 @@ def register(app, *, path: str | Path | None = None) -> None:
         CommandHandler("plan", guard(functools.partial(plan_command, path=path)))
     )
     app.add_handler(CommandHandler("rnp", guard(functools.partial(rnp_command, path=path))))
+    # Даты приходят текстом, мимо кнопки, поэтому доступ проверяется и на
+    # них: пока человек набирал период, оплаченные дни могли кончиться.
+    period.set_owner(rnp.MODULE, guard(functools.partial(dates_chosen, path=path)))
+    app.add_handler(
+        CallbackQueryHandler(
+            guard(functools.partial(chosen, path=path)), pattern=f"^{PREFIX}"
+        )
+    )
