@@ -1104,3 +1104,72 @@ def test_an_old_cabinet_without_any_history_is_sent_to_diag(db_path, cabinet):
     text = str(handler.no_data_text(report))
     assert "/diag" in text and "Аналитика" in text
     assert "в первый день" not in text
+
+
+# --- отчёт до утреннего сбора ---
+
+
+@pytest.mark.asyncio
+async def test_a_report_asked_at_night_collects_the_missing_day_first(
+    db_path, cabinet, monkeypatch
+):
+    """В час ночи вчерашних суток ещё нет: сбор идёт в девять утра.
+
+    Раньше бот отвечал «данных пока нет» на живом кабинете только потому, что
+    его спросили раньше расписания. Та же проверка снимает и вопрос порядка
+    утренних работ: отчёт мог посчитаться раньше сбора.
+    """
+    asked: list[date] = []
+
+    async def fake_collect(client_id, *, day=None, **kw):
+        asked.append(day)
+        put_day(client_id, db_path, day.isoformat())
+        return 1
+
+    monkeypatch.setattr(rnp, "collect", fake_collect)
+    task = queue.Task(
+        id=1, client_id=cabinet, kind=rnp.REPORT_ONE,
+        payload={"date": "2026-09-16"}, attempts=0,
+    )
+
+    report = await rnp.report_client(task, path=db_path)
+
+    assert asked == [date(2026, 9, 15)]
+    assert report.has_data is True
+
+
+@pytest.mark.asyncio
+async def test_a_collected_day_is_not_collected_twice(db_path, half_a_month, monkeypatch):
+    """Лишний поход в Wildberries это лимит кабинета, а не мелочь."""
+    calls: list[int] = []
+
+    async def fake_collect(client_id, *, day=None, **kw):
+        calls.append(client_id)
+        return 0
+
+    monkeypatch.setattr(rnp, "collect", fake_collect)
+    task = queue.Task(
+        id=2, client_id=half_a_month, kind=rnp.REPORT_ONE,
+        payload={"date": "2026-09-16"}, attempts=0,
+    )
+
+    await rnp.report_client(task, path=db_path)
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_silent_wildberries_does_not_eat_the_report(db_path, cabinet, monkeypatch):
+    """Сбор не удался - отчёт всё равно уходит и сам объясняет, чего в нём нет."""
+    async def fake_collect(client_id, *, day=None, **kw):
+        raise RuntimeError("WB молчит")
+
+    monkeypatch.setattr(rnp, "collect", fake_collect)
+    task = queue.Task(
+        id=3, client_id=cabinet, kind=rnp.REPORT_ONE,
+        payload={"date": "2026-09-16"}, attempts=0,
+    )
+
+    report = await rnp.report_client(task, path=db_path)
+
+    assert report.has_data is False

@@ -726,9 +726,38 @@ def set_facts_delivery(fn: Callable[[int, "PeriodFacts"], Any] | None) -> None:
     _facts_delivery = fn
 
 
+async def _collect_if_missing(
+    client_id: int, today: date, *, path: str | Path | None = None
+) -> None:
+    """Добирает вчерашние сутки, если их ещё нет. Иначе ничего не делает.
+
+    Сбор по расписанию идёт утром, а отчёт селлер просит когда угодно: в час
+    ночи вчерашних суток в базе ещё нет, и бот отвечал «данных пока нет» на
+    живом кабинете. Эта же проверка снимает вопрос порядка утренних работ:
+    рассылка и сбор ставятся в очередь вместе, и раньше отчёт мог посчитаться
+    по позавчерашним данным просто потому, что успел первым.
+
+    Недоступность Wildberries тут не авария: отчёт уйдёт по тому, что есть, и
+    сам скажет, чего ему не хватило. Своего повтора здесь нет, повтор живёт в
+    очереди у ночного сбора.
+    """
+    target = today - timedelta(days=1)
+    repo = db.repo(client_id, path)
+    if repo.rows("nm_daily", date=target.isoformat()):
+        return
+    if repo.one("wb_tokens") is None:
+        return
+    try:
+        await collect(client_id, day=target, path=path)
+    except Exception:  # noqa: BLE001 - отчёт важнее недостающих суток
+        logger.exception("не удалось добрать сутки клиента %s перед отчётом", client_id)
+
+
 async def report_client(task: Any, *, path: str | Path | None = None) -> RnpReport:
     """Собирает утренний отчёт и отдаёт его тому, кто умеет писать клиенту."""
-    report = daily(task.client_id, today=_payload_date(task), path=path)
+    today = _payload_date(task)
+    await _collect_if_missing(task.client_id, today, path=path)
+    report = daily(task.client_id, today=today, path=path)
     if _delivery is None:
         logger.warning("отчёт клиента %s некому отправить", task.client_id)
         return report
