@@ -107,6 +107,18 @@ class RnpReport:
     plan: Plan | None = None
     ad_spend: Decimal = Decimal("0")
     risks: tuple[StockRisk, ...] = ()
+    # Почему данных нет. Пустой отчёт у нового кабинета и пустой отчёт у
+    # кабинета, которому сбор не удаётся третий день, это разные беды, а
+    # текст был один на оба: «так бывает в первый день работы бота».
+    # Селлер читал его через месяц после подключения и переставал верить
+    # боту, хотя чинить надо было сбор.
+    collected_days: int = 0
+    last_day: date | None = None
+    collect_failed: bool = False
+    # Сколько суток кабинет подключён. Нужно, чтобы отличить «подключились
+    # вчера, история ещё едет» от «подключились месяц назад, а истории нет»:
+    # вторая беда чинится проверкой категорий токена, а не ожиданием.
+    connected_days: int = 0
 
     @property
     def drr(self) -> Decimal | None:
@@ -603,6 +615,10 @@ def daily(
             risks.append(StockRisk(nm_id, int(stock or 0), per_day.quantize(CENT), left))
     risks.sort(key=lambda risk: (risk.days, risk.nm_id))
 
+    collected, first_day = collected_days(client_id, path=path)
+    last_day = _last_collected_day(client_id, path=path)
+    collect_failed = _collect_failed(client_id, path=path)
+
     return RnpReport(
         client_id=client_id,
         date=target,
@@ -619,6 +635,10 @@ def daily(
         plan=plan_of(client_id, year_month(today), path=path),
         ad_spend=db.from_kop(_sum(day_rows, "ad_spend_kop")),
         risks=tuple(risks[:STOCK_LIMIT]),
+        collected_days=collected,
+        last_day=last_day,
+        collect_failed=collect_failed,
+        connected_days=_connected_days(client_id, today, path=path),
     )
 
 
@@ -898,6 +918,47 @@ def collected_days(
     except ValueError:
         first = None
     return len(days), first
+
+
+def _connected_days(
+    client_id: int, today: date, *, path: str | Path | None = None
+) -> int:
+    """Сколько суток назад подключён кабинет. Ноль, если токена нет вовсе."""
+    row = db.repo(client_id, path).one("wb_tokens")
+    if row is None:
+        return 0
+    try:
+        since = date.fromisoformat(str(row["created_at"])[:10])
+    except (ValueError, TypeError, KeyError, IndexError):
+        return 0
+    return max(0, (today - since).days)
+
+
+def _last_collected_day(
+    client_id: int, *, path: str | Path | None = None
+) -> date | None:
+    """Самые свежие собранные сутки. По ним видно, где оборвался сбор."""
+    rows = db.repo(client_id, path).rows("nm_daily")
+    days = sorted({str(row["date"])[:10] for row in rows})
+    if not days:
+        return None
+    try:
+        return date.fromisoformat(days[-1])
+    except ValueError:
+        return None
+
+
+def _collect_failed(client_id: int, *, path: str | Path | None = None) -> bool:
+    """Сорвалась ли последняя попытка сбора суток.
+
+    Смотрим на задачу сбора, а не на пустую таблицу: пусто бывает и у того,
+    кто подключился вчера, а это разные разговоры с человеком.
+    """
+    rows = db.repo(client_id, path).rows("tasks", kind=COLLECT_ONE)
+    if not rows:
+        return False
+    latest = max(rows, key=lambda row: int(row["id"]))
+    return str(latest["state"]) == queue.FAILED
 
 
 def request_facts(

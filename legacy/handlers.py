@@ -61,6 +61,11 @@ def format_product(product: Product) -> Safe:
             old = f"{product.old_price:,.0f}".replace(",", " ")
             price_line = Safe(price_line + fill(" <s>{old} ₽</s>", old=old))
         lines.append(price_line)
+    elif product.showcase_blocked:
+        # Карточка собрана не с витрины, а с хранилища Wildberries: там есть
+        # всё, кроме цены. Молчать об этом нельзя, иначе «нет данных»
+        # прочитается как «товара нет в наличии».
+        lines.append("💰 Цена: сейчас недоступна, остальное по карточке точное")
     else:
         lines.append("💰 Цена: нет данных (возможно, нет в наличии)")
 
@@ -128,8 +133,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     except WBBlockedError as exc:
+        # Сюда доходит только то, что не спасло и хранилище: карточки нет ни
+        # на витрине, ни на CDN. Клиенту при этом говорится человеческое, а
+        # не «403» и не имя переменной окружения: чинить это ему нечем.
         logger.warning("WB заблокировал запрос для %s: %s", article, exc)
-        await status.edit_text(f"🚫 {exc}")
+        await status.edit_text(
+            "⚠️ Витрина Wildberries сейчас не отвечает на запросы бота. "
+            "Попробуйте ещё раз через несколько минут."
+        )
         return
     except WBApiError:
         logger.exception("Ошибка API WB для артикула %s", article)

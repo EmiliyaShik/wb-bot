@@ -500,3 +500,32 @@ def test_the_same_holds_for_the_weekly_alert(db_path, five_weeks):
 
     assert "<a href" not in text
     assert "&lt;a href=&quot;" in text
+
+
+# --- две строки на одну неделю ---
+
+
+def test_two_reports_for_one_week_are_marked_and_explained(db_path, client):
+    """Wildberries иногда шлёт за неделю два отчёта. Это не сбой бота.
+
+    Владелец увидела в таблице по две строки на 05.10 и 12.10 и решила, что
+    бот двоит данные. Склеить их нельзя: сверка идёт по номеру отчёта.
+    """
+    put_week(client, db_path, 1, "2026-08-31")
+    put_week(client, db_path, 2, "2026-09-07")
+    # Второй отчёт за ту же неделю, со своим номером.
+    put_week(client, db_path, 3, "2026-09-07", revenue="999")
+
+    table = watchdog.dynamics(client, "quarter", today=TODAY, path=db_path)
+    text = handler.table_text(table)
+
+    assert "#2" in text
+    assert "несколько отчётов" in text
+
+
+def test_without_doubles_there_is_no_note_about_them(db_path, five_weeks):
+    """Лишнего объяснения там, где объяснять нечего, быть не должно."""
+    table = watchdog.dynamics(five_weeks, "quarter", today=TODAY, path=db_path)
+
+    assert "#2" not in handler.table_text(table)
+    assert "несколько отчётов" not in handler.table_text(table)

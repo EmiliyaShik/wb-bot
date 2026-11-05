@@ -1360,3 +1360,30 @@ def test_title_comes_from_the_report_row_and_a_service_row_has_none(db_path):
 
     assert finance.title_of(rows[1]) == "Кружка с котом"
     assert finance.title_of(rows[2]) == ""
+
+
+# --- проценты рядом с рублями: доля и тариф это разные числа ---
+
+
+def test_commission_shows_the_share_that_can_be_checked_by_division(db_path):
+    """Владелец поделила рубли на выручку и не сошлась с процентом в строке.
+
+    В строке стоял тариф Wildberries за последнюю неделю, а рубли были за
+    весь период: два разных числа выглядели одним. Теперь первой идёт доля
+    от выручки, её и проверяют делением.
+    """
+    client_id = db.admin_repo(db_path).ensure_client(9191)
+    finance.save_rows(client_id, ROWS, path=db_path)
+    for week in finance.aggregate(ROWS).values():
+        finance.save_week(client_id, week, path=db_path)
+    report = finance.build(client_id, "week", today=date(2026, 9, 15), path=db_path)
+
+    text = str(handlers_finance.summary_text(report))
+
+    totals = report.totals
+    share = totals.commission * Decimal("100") / totals.revenue
+    assert handlers_finance._percent(share) in text
+    assert "это" in text and "от выручки" in text
+    # Тариф остаётся рядом, но теперь он назван тарифом.
+    assert "тариф WB" in text
+    assert "оба верные" in text

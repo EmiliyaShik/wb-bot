@@ -1049,3 +1049,58 @@ async def test_a_made_up_button_is_refused(db_path, cabinet):
     )
 
     assert db.repo(cabinet, db_path).rows("tasks") == []
+
+
+# --- почему данных нет: три разные беды ---
+
+
+def test_a_brand_new_cabinet_hears_about_the_first_day(db_path, cabinet):
+    report = rnp.daily(cabinet, today=TODAY, path=db_path)
+
+    assert report.has_data is False
+    assert "в первый день" in str(handler.no_data_text(report))
+
+
+def test_a_gap_in_the_middle_is_not_called_the_first_day(db_path, cabinet):
+    """Кабинет подключён давно, пропущены одни сутки: текст был про первый день."""
+    for number in (1, 2, 3, 4, 5):
+        put_day(cabinet, db_path, date(2026, 9, number).isoformat())
+
+    report = rnp.daily(cabinet, today=TODAY, path=db_path)
+
+    text = str(handler.no_data_text(report))
+    assert "в первый день" not in text
+    assert "5 сентября" in text and "5 дней" in text
+
+
+def test_a_failed_collection_says_so_instead_of_blaming_the_cabinet(db_path, cabinet):
+    """Сбор падает третий день: клиенту надо сказать правду, а не «первый день»."""
+    for number in (1, 2):
+        put_day(cabinet, db_path, date(2026, 9, number).isoformat())
+    db.repo(cabinet, db_path).insert(
+        "tasks",
+        kind=rnp.COLLECT_ONE,
+        state=queue.FAILED,
+        payload="{}",
+        attempts=3,
+    )
+
+    report = rnp.daily(cabinet, today=TODAY, path=db_path)
+
+    text = str(handler.no_data_text(report))
+    assert "не удался" in text
+    assert "у владельца" in text
+    assert "в первый день" not in text
+
+
+def test_an_old_cabinet_without_any_history_is_sent_to_diag(db_path, cabinet):
+    """Месяц подключён, истории ноль: это поломка, а не «первый день бота»."""
+    db.repo(cabinet, db_path).update(
+        "wb_tokens", {"client_id": cabinet}, created_at="2026-08-01 10:00:00"
+    )
+
+    report = rnp.daily(cabinet, today=TODAY, path=db_path)
+
+    text = str(handler.no_data_text(report))
+    assert "/diag" in text and "Аналитика" in text
+    assert "в первый день" not in text

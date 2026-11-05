@@ -126,6 +126,17 @@ INCOMPLETE = (
 
 FILE_NOTE = "\n\nПодробности в файле: недели, месяцы, артикулы и методология."
 
+# Почему доля от выручки и тариф расходятся. Без этой фразы разница выглядит
+# ошибкой в расчёте, а на деле это скидка площадки: Wildberries берёт тариф с
+# цены до своей скидки, а часть её компенсирует продавцу, и до денег доходит
+# меньше. Тариф при этом настоящий, он стоит в отчёте Wildberries.
+TARIFF_NOTE = (
+    "\n\nДоля от выручки и тариф Wildberries это разные числа, и оба верные. "
+    "Долю можно проверить делением: рубли на выручку. Тариф это ставка из "
+    "отчёта Wildberries за последнюю неделю периода, и до денег она доходит "
+    "не целиком: часть удержания компенсирует скидка площадки."
+)
+
 CENT = Decimal("0.01")
 
 
@@ -153,6 +164,13 @@ def _percent(value: Decimal | None) -> str:
     amount = value.quantize(CENT, rounding=ROUND_HALF_UP)
     text = f"{amount:.2f}".rstrip("0").rstrip(".")
     return f"{text.replace('.', ',')}%"
+
+
+def _share(part: Decimal | None, whole: Decimal | None) -> Decimal | None:
+    """Доля в процентах. Без выручки доли не существует, и это не ноль."""
+    if part is None or whole is None or whole <= Decimal("0"):
+        return None
+    return Decimal(part) * Decimal("100") / Decimal(whole)
 
 
 def _day(text: str) -> str:
@@ -195,15 +213,23 @@ def summary_text(report: Any) -> Safe:
     ]
 
     last = report.weeks[-1]
+    # Рядом стоят две разные величины, и раньше была видна только одна:
+    # процент тарифа Wildberries за последнюю неделю рядом с рублями за весь
+    # период. Владелец сложила 2 873 ₽ с выручкой 63 848 ₽, получила 4,5
+    # процента и не сошлась с «35,24%» в той же строке. Теперь первой стоит
+    # доля от выручки (её и можно проверить делением), а тариф назван
+    # тарифом и неделей, за которую он взят.
     lines += [
         fill(
-            "комиссия {amount} ({percent})",
+            "комиссия {amount}, это {share} от выручки (тариф WB {percent})",
             amount=_money(totals.commission),
+            share=_percent(_share(totals.commission, totals.revenue)),
             percent=_percent(last.commission_percent),
         ),
         fill(
-            "эквайринг {amount} ({percent})",
+            "эквайринг {amount}, это {share} от выручки (тариф WB {percent})",
             amount=_money(totals.acquiring),
+            share=_percent(_share(totals.acquiring, totals.revenue)),
             percent=_percent(last.acquiring_percent),
         ),
         fill("логистика {amount}", amount=_money(totals.logistics)),
@@ -216,7 +242,7 @@ def summary_text(report: Any) -> Safe:
         fill("Недель в отчёте: {count}", count=len(report.weeks)),
     ]
 
-    text = Safe("\n".join(lines) + FILE_NOTE)
+    text = Safe("\n".join(lines) + FILE_NOTE + TARIFF_NOTE)
     # Способ счёта называется прямо: цифра уходит в бухгалтерию, а по какому
     # правилу она посчитана, видно только здесь.
     if report.exact:

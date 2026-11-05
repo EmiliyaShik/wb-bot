@@ -151,6 +151,20 @@ RATES = (
     "Из заказа в выкуп: {buyout} (было {buyout_was})"
 )
 
+# Выкуп считается по суткам, которые уже доехали до покупателя. Без этой
+# строчки селлер складывает заказы последней недели с выкупами последней
+# недели и видит обвал, которого нет: заказ едет до пункта выдачи днями.
+BUYOUT_WINDOW = (
+    "\n\nВыкуп посчитан по заказам до {day}: те, что сделаны позже, ещё едут "
+    "к покупателям, и выкупа по ним быть не может."
+)
+
+BUYOUT_NOT_READY = (
+    "\n\nВыкуп пока не сравниваю: для него нужны сутки, которые уже доехали "
+    "до покупателей, а накопленной истории на это не хватает. Остальные шаги "
+    "воронки считаются как обычно."
+)
+
 DROP = (
     "\n\n🔻 <b>Просел шаг «{stage}»</b>\n"
     "Было {was}, стало {now}, то есть на {points} п.п. меньше.\n"
@@ -403,8 +417,18 @@ def summary_text(report: Any) -> Safe:
             cart_was=_percent(past.to_cart),
             order=_percent(now.to_order),
             order_was=_percent(past.to_order),
-            buyout=_percent(now.to_buyout),
-            buyout_was=_percent(past.to_buyout),
+            buyout=_percent(report.buyout_now),
+            buyout_was=_percent(report.buyout_past),
+        )
+    )
+    # Выкуп живёт по своим часам: заказ едет до пункта выдачи днями, и без
+    # этой строчки селлер читает низкий процент свежей недели как провал.
+    text = Safe(
+        text
+        + (
+            fill(BUYOUT_WINDOW, day=_day(report.buyout_to))
+            if report.buyout_compared
+            else BUYOUT_NOT_READY
         )
     )
 

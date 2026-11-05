@@ -53,10 +53,35 @@ MONTHS = (
 
 HEADER = "📈 <b>Отчёт за {day}</b>"
 
-NO_DATA = (
+# Три разные беды под одним словом «нет данных». Первая это новый кабинет,
+# вторая это пропуск одних суток, третья это сорвавшийся сбор. Текст был
+# один на всех («так бывает в первый день работы бота»), и селлер читал его
+# через месяц после подключения, переставая верить боту.
+NO_DATA_NEW = (
     "За {day} данных от Wildberries пока нет. Так бывает в первый день "
     "работы бота и когда кабинет ещё не отдал статистику. Я соберу их "
     "сегодня ночью, завтрашний отчёт уже будет полным."
+)
+
+NO_DATA_GAP = (
+    "За {day} суток в базе нет, хотя историю я собираю: последние собранные "
+    "сутки это {last}, всего собрано {days}. Так бывает, когда Wildberries за "
+    "эти сутки ничего не отдал. Соберу ночью ещё раз, пропуск за последнюю "
+    "неделю закроется сам."
+)
+
+NO_DATA_SILENT = (
+    "За {day} данных нет, и за прошлые сутки тоже: кабинет подключён {since} "
+    "назад, сбор идёт каждую ночь, а Wildberries по нему ничего не отдаёт. "
+    "Чаще всего дело в категориях токена: суточная воронка живёт в категории "
+    "«Аналитика». Проверить это можно командой <code>/diag</code>, она "
+    "показывает, какие категории у вашего токена есть."
+)
+
+NO_DATA_FAILED = (
+    "За {day} данных нет: последний сбор суток не удался. Это не ваша ошибка "
+    "и не ошибка кабинета, запись о сбое уже у владельца бота. Собранная "
+    "раньше история никуда не делась: всего собрано {days}."
 )
 
 HOW_TO_SET_PLAN = (
@@ -298,6 +323,26 @@ def _plan_month_days(report: rnp.PeriodFacts) -> int:
     return total
 
 
+def no_data_text(report: rnp.RnpReport) -> Safe:
+    """Почему данных нет. Причин три, и путать их нельзя."""
+    day = _date_ru(report.date)
+    if report.collect_failed:
+        return fill(NO_DATA_FAILED, day=day, days=_days(report.collected_days))
+    if report.collected_days and report.last_day:
+        return fill(
+            NO_DATA_GAP,
+            day=day,
+            last=_date_ru(report.last_day),
+            days=_days(report.collected_days),
+        )
+    # Истории нет вовсе. Для кабинета, подключённого на днях, это нормально, а
+    # для давнего это поломка, и чинится она не ожиданием: чаще всего у токена
+    # нет категории «Аналитика».
+    if report.connected_days > rnp.WINDOW_DAYS:
+        return fill(NO_DATA_SILENT, day=day, since=_days(report.connected_days))
+    return fill(NO_DATA_NEW, day=day)
+
+
 def report_text(report: rnp.RnpReport) -> Safe:
     """Утренний отчёт словами.
 
@@ -307,7 +352,7 @@ def report_text(report: rnp.RnpReport) -> Safe:
     lines = [fill(HEADER, day=_date_ru(report.date)), ""]
 
     if not report.has_data:
-        lines.append(fill(NO_DATA, day=_date_ru(report.date)))
+        lines.append(no_data_text(report))
         return Safe("\n".join(lines))
 
     lines.append(

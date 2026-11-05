@@ -125,6 +125,10 @@ class Product:
     description: str | None = None                 # описание с CDN
     characteristics: list[tuple[str, str]] = field(default_factory=list)  # (название, значение)
     reviews: list[Review] = field(default_factory=list)                   # последние отзывы
+    # Витрина отказала, и карточка собрана с CDN. Там есть всё, кроме цены:
+    # цена живёт только в card.wb.ru. Клиенту об этом говорят словами, а не
+    # прочерком в строке цены.
+    showcase_blocked: bool = False
 
     @property
     def url(self) -> str:
@@ -186,10 +190,12 @@ async def _request_card(client: httpx.AsyncClient, article: int) -> dict:
             last_error = exc
 
     if blocked:
+        # Текст читает владелец в журнале, а не клиент: клиенту про IP и
+        # переменные окружения знать нечего, и карточку он всё равно получит
+        # с CDN. Причина названа прямо, чтобы разбор не начинался с догадок.
         raise WBBlockedError(
-            "Wildberries заблокировал запрос (403). Обычно так бывает при "
-            "обращении с не-российского IP - запустите бот с сервера в РФ/СНГ "
-            "или включите прокси (WB_PROXY_ENABLED)."
+            "витрина card.wb.ru ответила 403: так она отвечает на запросы с "
+            "не-российского адреса"
         )
     raise WBApiError(f"Не удалось получить данные с Wildberries: {last_error}")
 
@@ -282,19 +288,29 @@ def _parse_characteristics(card: dict) -> list[tuple[str, str]]:
     return result
 
 
-async def _fetch_card_details(
-    client: httpx.AsyncClient, nm_id: int
-) -> tuple[str | None, list[tuple[str, str]]]:
-    """Забирает описание и характеристики с CDN basket-XX. Best-effort.
+# Какой basket-хост отдал карточку для этого vol. Перебор хостов стоит до
+# сорока запросов, а соседние артикулы лежат на одном хосте, поэтому удачный
+# номер запоминается на время работы процесса. Таблица диапазонов у
+# Wildberries меняется, и память об удачном хосте надёжнее её.
+_CDN_HOST_BY_VOL: dict[int, int] = {}
 
-    Путь на CDN строится по nmId (артикулу), а не по root: описание и
-    характеристики лежат именно под nmId. root тут не подходит - по нему
-    подтягивается карточка чужого товара.
+
+async def _fetch_cdn_card(client: httpx.AsyncClient, nm_id: int) -> dict | None:
+    """Карточка с CDN basket-XX целиком. Best-effort, None если не нашлась.
+
+    Путь строится по nmId (артикулу), а не по root: описание и характеристики
+    лежат именно под nmId. root тут не подходит - по нему подтягивается
+    карточка чужого товара.
     """
     vol = nm_id // 100000
     part = nm_id // 1000
 
-    for host_num in _basket_host_candidates(vol):
+    known = _CDN_HOST_BY_VOL.get(vol)
+    candidates = _basket_host_candidates(vol)
+    if known is not None:
+        candidates = [known] + [n for n in candidates if n != known]
+
+    for host_num in candidates:
         url = (
             f"https://basket-{host_num:02d}.wbbasket.ru"
             f"/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
@@ -306,12 +322,45 @@ async def _fetch_card_details(
             card = response.json()
         except (httpx.HTTPError, ValueError):
             continue
+        _CDN_HOST_BY_VOL[vol] = host_num
+        return card
 
-        description = (card.get("description") or "").strip() or None
-        characteristics = _parse_characteristics(card)
-        return description, characteristics
+    return None
 
-    return None, []
+
+async def _fetch_card_details(
+    client: httpx.AsyncClient, nm_id: int
+) -> tuple[str | None, list[tuple[str, str]]]:
+    """Описание и характеристики с CDN. Best-effort."""
+    card = await _fetch_cdn_card(client, nm_id)
+    if card is None:
+        return None, []
+    description = (card.get("description") or "").strip() or None
+    return description, _parse_characteristics(card)
+
+
+def _product_from_cdn(article: int, card: dict) -> Product:
+    """Карточка, собранная с CDN, когда витрина отказала.
+
+    Цены тут нет и взять её негде: её отдаёт только card.wb.ru. Всё
+    остальное, включая название, бренд, предмет и характеристики, на CDN
+    лежит в том же виде, в каком его видит покупатель.
+    """
+    selling = card.get("selling") or {}
+    return Product(
+        article=article,
+        name=(card.get("imt_name") or "").strip() or "Без названия",
+        brand=str(selling.get("brand_name") or ""),
+        price=None,
+        old_price=None,
+        rating=None,
+        feedbacks=0,
+        supplier=None,
+        root=card.get("imt_id"),
+        description=(card.get("description") or "").strip() or None,
+        characteristics=_parse_characteristics(card),
+        showcase_blocked=True,
+    )
 
 
 async def fetch_product(article: int) -> Product:
@@ -320,7 +369,23 @@ async def fetch_product(article: int) -> Product:
     async with httpx.AsyncClient(
         timeout=15, proxy=proxy, trust_env=trust_env
     ) as client:
-        payload = await _request_card(client, article)
+        try:
+            payload = await _request_card(client, article)
+        except WBApiError as error:
+            # Витрина отказала (403 с не-российского адреса или просто не
+            # ответила). Это не повод отказывать клиенту: карточка целиком,
+            # кроме цены, лежит на CDN, и он доступен оттуда же, откуда
+            # отказала витрина. Проверено на живых артикулах.
+            card = await _fetch_cdn_card(client, article)
+            if card is None:
+                raise
+            product = _product_from_cdn(article, card)
+            if product.root:
+                rating, count, reviews = await _fetch_feedbacks(client, product.root)
+                product.rating = rating
+                product.feedbacks = count or 0
+                product.reviews = reviews
+            return product
 
         products = _extract_products(payload)
         if not products:

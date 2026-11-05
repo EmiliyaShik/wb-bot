@@ -1101,3 +1101,90 @@ def test_a_product_name_from_the_cabinet_does_not_become_markup(cabinet, db_path
 
     assert "<a href" not in text
     assert "&lt;a href=&quot;u&quot;&gt;" in text
+
+
+# --- выкуп считается по доехавшим заказам ---
+
+
+def test_fresh_orders_do_not_fake_a_buyout_collapse(db_path, cabinet):
+    """Главная ложная тревога: заказы последних дней ещё едут к покупателям.
+
+    У владельца это выглядело так: «выкуп из заказа упал с 74% до 23%», хотя
+    с товаром ничего не случилось. Выкуп по свежим суткам низкий всегда:
+    заказ сделан, а выкуп будет через неделю. Сравнение идёт по суткам,
+    которые уже доехали.
+    """
+    # Старые сутки: выкуп ровный, 8 из 10. Свежая неделя: заказы есть,
+    # выкупов почти нет, потому что товар ещё в пути.
+    old_days = [LAST - timedelta(days=shift) for shift in range(7, 28)]
+    for day in old_days:
+        put_day(cabinet, db_path, day, 111, opens=100, carts=50, orders=10, buyouts=8)
+    for day in NOW_DAYS:
+        put_day(cabinet, db_path, day, 111, opens=100, carts=50, orders=10, buyouts=2)
+
+    report = funnel.build(cabinet, "week", today=TODAY, path=db_path)
+    item = report.articles[0]
+
+    # Сырое окно показало бы обвал, а сравнение идёт по доехавшим суткам.
+    assert item.now.to_buyout == Decimal("20")
+    assert item.buyout_now == Decimal("80")
+    assert item.drop is None
+
+
+def test_a_real_buyout_drop_is_still_found(db_path, cabinet):
+    """Сдвиг окна не должен сделать бота слепым: настоящая просадка видна."""
+    old_days = [LAST - timedelta(days=shift) for shift in range(14, 28)]
+    for day in old_days:
+        put_day(cabinet, db_path, day, 111, opens=100, carts=50, orders=10, buyouts=9)
+    # Доехавшая неделя: выкуп рухнул по-настоящему.
+    for day in [LAST - timedelta(days=shift) for shift in range(7, 14)]:
+        put_day(cabinet, db_path, day, 111, opens=100, carts=50, orders=10, buyouts=3)
+    for day in NOW_DAYS:
+        put_day(cabinet, db_path, day, 111, opens=100, carts=50, orders=10, buyouts=1)
+
+    report = funnel.build(cabinet, "week", today=TODAY, path=db_path)
+    drop = report.articles[0].drop
+
+    assert drop is not None and drop.stage == funnel.TO_BUYOUT
+    assert drop.now == Decimal("30") and drop.was == Decimal("90")
+
+
+def test_without_history_for_the_shift_the_stage_stays_silent(db_path, cabinet):
+    """Истории на сдвиг не хватило: выкуп не сравнивается вовсе, а не «упал»."""
+    put_days(cabinet, db_path, NOW_DAYS, 111, opens=100, carts=50, orders=10, buyouts=2)
+    put_days(cabinet, db_path, PAST_DAYS, 111, opens=100, carts=50, orders=10, buyouts=9)
+
+    report = funnel.build(cabinet, "week", today=TODAY, path=db_path)
+    item = report.articles[0]
+
+    assert report.buyout_from is None
+    assert item.buyout_now is None
+    assert item.drop is None or item.drop.stage != funnel.TO_BUYOUT
+
+
+def test_the_summary_says_by_which_orders_the_buyout_is_counted(db_path, cabinet):
+    """Строка про окно выкупа обязана быть: иначе цифра читается неверно."""
+    from bot.handlers import funnel as handler
+
+    old_days = [LAST - timedelta(days=shift) for shift in range(7, 28)]
+    for day in old_days:
+        put_day(cabinet, db_path, day, 111, opens=100, carts=50, orders=10, buyouts=8)
+    for day in NOW_DAYS:
+        put_day(cabinet, db_path, day, 111, opens=100, carts=50, orders=10, buyouts=2)
+
+    text = str(handler.summary_text(funnel.build(cabinet, "week", today=TODAY, path=db_path)))
+
+    assert "Выкуп посчитан по заказам до" in text
+    # В сводке стоит выкуп доехавших суток, а не свежих.
+    assert "Из заказа в выкуп: 80" in text
+
+
+def test_the_summary_admits_when_the_buyout_is_not_compared(db_path, cabinet):
+    from bot.handlers import funnel as handler
+
+    put_days(cabinet, db_path, NOW_DAYS, 111, opens=100, carts=50, orders=10, buyouts=2)
+    put_days(cabinet, db_path, PAST_DAYS, 111, opens=100, carts=50, orders=10, buyouts=9)
+
+    text = str(handler.summary_text(funnel.build(cabinet, "week", today=TODAY, path=db_path)))
+
+    assert "Выкуп пока не сравниваю" in text

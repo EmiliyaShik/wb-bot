@@ -114,6 +114,16 @@ DYNAMICS_NOTE = (
     "что я ищу. СПП это не расход, а скидка площадки, её процент взят как "
     "есть."
 )
+# Две строки с одной датой это не сбой бота. Wildberries иногда выставляет за
+# одну неделю несколько отчётов, у каждого свой номер, и бот показывает их
+# отдельно: сверка с итогами Wildberries идёт по номеру отчёта, а после
+# склейки сверять было бы нечего.
+SAME_WEEK_NOTE = (
+    "\n\nУ некоторых недель в таблице по две строки с пометкой #2. Это не "
+    "ошибка: Wildberries иногда выставляет за одну неделю несколько отчётов, "
+    "и каждый показан отдельно, чтобы сверка с его итогами сходилась."
+)
+
 HOW_TO = (
     "Период можно выбрать: <code>/dynamics месяц</code>, "
     "<code>/dynamics квартал</code>, <code>/dynamics год</code>."
@@ -266,9 +276,21 @@ def table_text(table: watchdog.Dynamics) -> Safe:
 
     head = f"{'Неделя':<7}{'Выручка':>10}" + "".join(f"{title:>7}" for title, _ in COLUMNS)
     rows = [head]
+    # Wildberries иногда выставляет за одну и ту же неделю несколько отчётов,
+    # у каждого свой номер. Строки от этого двоятся, и выглядит это ошибкой
+    # бота. Склеивать их нельзя: сверка с итогами Wildberries идёт по номеру
+    # отчёта, и после склейки сверять было бы нечего. Поэтому второй и
+    # следующий отчёты той же недели помечаются по порядку.
+    seen: dict[str, int] = {}
+    doubled = False
     for week in table.weeks:
+        start = _short_day(week.date_from)
+        seen[start] = seen.get(start, 0) + 1
+        if seen[start] > 1:
+            doubled = True
+            start = f"{start}#{seen[start]}"
         revenue = f"{int(week.revenue):,}".replace(",", " ")
-        line = f"{_short_day(week.date_from):<7}{revenue:>10}"
+        line = f"{start:<7}{revenue:>10}"
         line += "".join(f"{_percent(week.value(name)):>7}" for _, name in COLUMNS)
         rows.append(line)
 
@@ -279,6 +301,7 @@ def table_text(table: watchdog.Dynamics) -> Safe:
         fill(DYNAMICS_HEADER, title=table.title)
         + fill("\n<pre>{rows}</pre>\n", rows="\n".join(rows))
         + DYNAMICS_NOTE
+        + (SAME_WEEK_NOTE if doubled else "")
         + "\n\n"
         + HOW_TO
     )

@@ -237,6 +237,20 @@ def threshold(stage: str) -> Decimal:
     return _decimal(key, default) if key else ZERO
 
 
+def buyout_lag() -> int:
+    """Сколько последних суток не берётся в сравнение выкупа.
+
+    Заказ становится выкупом не в день заказа: товар едет до пункта выдачи и
+    ждёт там человека. У свежих суток выкуп поэтому всегда низкий, и
+    сравнение показывало обвал у любого живого товара. Число в конфиге, это
+    срок доставки, а не наша придумка.
+    """
+    try:
+        return max(0, int(_section().get("buyout_lag_days", 7)))
+    except (TypeError, ValueError):
+        return 7
+
+
 def min_orders() -> int:
     """Сколько заказов за период нужно, чтобы конверсии товара вообще сравнивать.
 
@@ -384,7 +398,9 @@ class Drop:
         return ADVICE.get(self.stage, "")
 
 
-def worst_drop(now: Counts, past: Counts) -> Drop | None:
+def worst_drop(
+    now: Counts, past: Counts, *, buyout: tuple[Counts, Counts] | None = None
+) -> Drop | None:
     """Этап с самой большой просадкой сверх порога. Нет такого - None.
 
     Сравниваются только три конверсии: они меряются одной меркой, процентными
@@ -397,7 +413,14 @@ def worst_drop(now: Counts, past: Counts) -> Drop | None:
     """
     found: list[Drop] = []
     for stage in STAGES:
-        current, was = now.stage(stage), past.stage(stage)
+        if stage == TO_BUYOUT:
+            # Выкуп сравнивается только по доехавшим суткам. Их нет - этап
+            # молчит: обвал на свежих заказах это срок доставки, а не товар.
+            if buyout is None:
+                continue
+            current, was = buyout[0].to_buyout, buyout[1].to_buyout
+        else:
+            current, was = now.stage(stage), past.stage(stage)
         if current is None or was is None:
             continue
         item = Drop(stage, current, was)
@@ -436,6 +459,10 @@ class Article:
     past: Counts = Counts()
     expected_days: int = 0
     visibility: Visibility | None = None
+    # Те же два окна, сдвинутые на срок доставки: по ним и только по ним
+    # считается выкуп. Пусто, если истории на сдвиг не хватило.
+    buy_now: Counts = Counts()
+    buy_past: Counts = Counts()
 
     @property
     def enough_days(self) -> bool:
@@ -459,11 +486,32 @@ class Article:
         return self.enough_days and self.enough_orders
 
     @property
+    def buyout_ready(self) -> bool:
+        """Хватило ли истории, чтобы сравнить выкуп по доехавшим суткам."""
+        return (
+            self.buy_now.orders >= min_orders()
+            and self.buy_past.orders >= min_orders()
+        )
+
+    @property
+    def buyout_now(self) -> Decimal | None:
+        """Выкуп теперь, по доехавшим заказам. Не доехали - нечего и считать."""
+        return self.buy_now.to_buyout if self.buyout_ready else None
+
+    @property
+    def buyout_past(self) -> Decimal | None:
+        return self.buy_past.to_buyout if self.buyout_ready else None
+
+    @property
     def drop(self) -> Drop | None:
         """Просевший этап этого товара. Несравнимый товар просадки не имеет."""
         if not self.comparable:
             return None
-        return worst_drop(self.now, self.past)
+        return worst_drop(
+            self.now,
+            self.past,
+            buyout=(self.buy_now, self.buy_past) if self.buyout_ready else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -493,6 +541,11 @@ class FunnelReport:
     past_from: date
     past_to: date
     span: int = 0
+    # Окно, по которому считался выкуп: то же самое, сдвинутое на срок
+    # доставки. None значит, что истории на сдвиг не хватило и выкуп в этом
+    # отчёте не сравнивался вовсе.
+    buyout_from: date | None = None
+    buyout_to: date | None = None
     articles: tuple[Article, ...] = ()
     # Свод по суткам нынешнего периода, по тем же товарам, что и свод целиком.
     days: tuple[DayLine, ...] = ()
@@ -553,6 +606,28 @@ class FunnelReport:
         return self._counts("past")
 
     @property
+    def buy_now(self) -> Counts:
+        """Свод кабинета по доехавшим суткам: по нему считается выкуп."""
+        return self._counts("buy_now")
+
+    @property
+    def buy_past(self) -> Counts:
+        return self._counts("buy_past")
+
+    @property
+    def buyout_compared(self) -> bool:
+        """Сравнивался ли выкуп вообще. Истории на сдвиг могло не хватить."""
+        return self.buyout_from is not None and not self.buy_past.empty
+
+    @property
+    def buyout_now(self) -> Decimal | None:
+        return self.buy_now.to_buyout if self.buyout_compared else None
+
+    @property
+    def buyout_past(self) -> Decimal | None:
+        return self.buy_past.to_buyout if self.buyout_compared else None
+
+    @property
     def drop(self) -> Drop | None:
         """Просевший этап по кабинету целиком.
 
@@ -562,7 +637,11 @@ class FunnelReport:
         now, past = self.now, self.past
         if now.empty or past.empty:
             return None
-        return worst_drop(now, past)
+        return worst_drop(
+            now,
+            past,
+            buyout=(self.buy_now, self.buy_past) if self.buyout_compared else None,
+        )
 
     @property
     def troubled(self) -> tuple[Article, ...]:
@@ -866,14 +945,28 @@ def build(
     date_from, date_to, past_from, past_to, span, shortened = windows(
         period, today=today, since=since
     )
+    # Выкуп считается по тем же двум окнам, сдвинутым на срок доставки:
+    # свежий заказ ещё едет к покупателю, и выкупа по нему быть не может.
+    lag = timedelta(days=buyout_lag())
+    buy_from, buy_to = date_from - lag, date_to - lag
+    buy_past_from, buy_past_to = past_from - lag, past_to - lag
+    # Истории на сдвиг может не хватить: тогда сравнивать выкуп нечем, и
+    # этап промолчит, а не покажет обвал.
+    buyout_ready = span > 0 and (since is None or buy_past_from >= since)
+
     rows = _collected(
         repo.rows_between(
-            "nm_daily", "date", past_from.isoformat(), date_to.isoformat()
+            "nm_daily",
+            "date",
+            (buy_past_from if buyout_ready else past_from).isoformat(),
+            date_to.isoformat(),
         )
     )
 
     now_slots: dict[int, dict[str, int]] = {}
     past_slots: dict[int, dict[str, int]] = {}
+    buy_now_slots: dict[int, dict[str, int]] = {}
+    buy_past_slots: dict[int, dict[str, int]] = {}
     by_day: dict[tuple[str, int], dict[str, int]] = {}
     for row in rows:
         stamp = str(row["date"])[:10]
@@ -883,6 +976,13 @@ def build(
             _add(by_day.setdefault((stamp, nm_id), _empty_slot()), row)
         elif _between(stamp, past_from, past_to):
             _add(past_slots.setdefault(nm_id, _empty_slot()), row)
+        # Сдвинутые окна считаются отдельным проходом по тем же строкам:
+        # они пересекаются с обычными, и «или» тут было бы ошибкой.
+        if buyout_ready:
+            if _between(stamp, buy_from, buy_to):
+                _add(buy_now_slots.setdefault(nm_id, _empty_slot()), row)
+            elif _between(stamp, buy_past_from, buy_past_to):
+                _add(buy_past_slots.setdefault(nm_id, _empty_slot()), row)
 
     seen: dict[int, dict] = {}
     for row in repo.rows(
@@ -904,6 +1004,8 @@ def build(
             title=names.get(nm_id, ""),
             now=Counts(**now_slots.get(nm_id, _empty_slot())),
             past=Counts(**past_slots.get(nm_id, _empty_slot())),
+            buy_now=Counts(**buy_now_slots.get(nm_id, _empty_slot())),
+            buy_past=Counts(**buy_past_slots.get(nm_id, _empty_slot())),
             expected_days=span,
             visibility=(
                 Visibility(nm_id=nm_id, **seen[nm_id]) if nm_id in seen else None
@@ -936,6 +1038,8 @@ def build(
         past_from=past_from,
         past_to=past_to,
         span=span,
+        buyout_from=buy_from if buyout_ready else None,
+        buyout_to=buy_to if buyout_ready else None,
         articles=tuple(articles),
         days=days,
         since=since,
@@ -1157,8 +1261,8 @@ def excel_sheets(report: FunnelReport) -> list:
                 _cell(item.past.to_cart),
                 _cell(item.now.to_order),
                 _cell(item.past.to_order),
-                _cell(item.now.to_buyout),
-                _cell(item.past.to_buyout),
+                _cell(item.buyout_now),
+                _cell(item.buyout_past),
                 _cell(visibility.percent if visibility else None),
                 _cell(visibility.dynamics if visibility else None),
                 drop.title if drop else "",

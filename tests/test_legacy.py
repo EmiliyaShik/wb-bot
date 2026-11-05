@@ -1,5 +1,7 @@
 """Старая функция бота: артикул или ссылка возвращают карточку товара."""
 
+import pytest
+
 from legacy import card
 from legacy.handlers import format_product, parse_article
 
@@ -92,3 +94,91 @@ def test_every_field_from_wb_is_escaped():
     for raw in ("<i>", "<b>бренд", "<u>", "<s>", "<код>", "<script>"):
         assert raw not in text, f"в сообщение просочилось {raw}"
     assert "&lt;script&gt;" in text
+
+
+# --- витрина заблокирована, карточка приходит с хранилища WB ---
+
+
+def test_blocked_showcase_says_only_the_price_is_missing():
+    """«Нет данных» прочиталось бы как «товара нет»: это разные вещи."""
+    text = _card(price=None, showcase_blocked=True)
+
+    assert "Цена: сейчас недоступна" in text
+    assert "нет в наличии" not in text
+
+
+def test_without_the_showcase_an_empty_price_still_means_out_of_stock():
+    assert "нет в наличии" in _card(price=None)
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_showcase_falls_back_to_the_storage(monkeypatch):
+    """403 от витрины это не отказ клиенту: карточка целиком лежит на CDN.
+
+    Витрина отвечает 403 на запрос с не-российского адреса, а хранилище
+    отдаёт ту же карточку кому угодно. Цены там нет, и только она теряется.
+    """
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        if host.endswith("wb.ru") and "cards" in request.url.path:
+            return httpx.Response(403)
+        if host.startswith("basket-") and request.url.path.endswith("card.json"):
+            return httpx.Response(
+                200,
+                json={
+                    "imt_id": 777,
+                    "imt_name": "Расчёска",
+                    "subj_name": "Расчёски",
+                    "vendor_code": "Арт.11",
+                    "selling": {"brand_name": "Favorite Pets!"},
+                    "description": "Чешет",
+                    "options": [{"name": "Цвет", "value": "синий"}],
+                },
+            )
+        if "feedbacks" in request.url.path:
+            return httpx.Response(200, json={"valuation": "4.8", "feedbackCount": 531})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        kwargs.pop("proxy", None)
+        kwargs.pop("trust_env", None)
+        return real_client(*args, transport=transport, **kwargs)
+
+    monkeypatch.setattr(card.httpx, "AsyncClient", fake_client)
+
+    product = await card.fetch_product(213817876)
+
+    assert product.showcase_blocked is True
+    assert product.name == "Расчёска"
+    assert product.brand == "Favorite Pets!"
+    assert product.price is None
+    assert product.rating == 4.8 and product.feedbacks == 531
+    assert product.characteristics == [("Цвет", "синий")]
+
+
+@pytest.mark.asyncio
+async def test_no_card_anywhere_is_still_an_honest_refusal(monkeypatch):
+    """Ни витрины, ни хранилища: тогда отказ, но без слова «403» клиенту."""
+    import httpx
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(403))
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        kwargs.pop("proxy", None)
+        kwargs.pop("trust_env", None)
+        return real_client(*args, transport=transport, **kwargs)
+
+    monkeypatch.setattr(card.httpx, "AsyncClient", fake_client)
+
+    with pytest.raises(card.WBBlockedError) as error:
+        await card.fetch_product(213817876)
+
+    # В тексте для журнала причина названа, а имени переменной окружения нет.
+    assert "403" in str(error.value)
+    assert "WB_PROXY" not in str(error.value)
