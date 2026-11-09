@@ -113,6 +113,24 @@ OFFER_PENDING = (
     "Владелец бота уже знает об этом."
 )
 
+PRIVACY_PENDING = (
+    "Политика конфиденциальности сейчас готовится, ссылки пока нет. "
+    "Владелец бота уже знает об этом."
+)
+
+# Коротко о главном, своими словами и рядом с кнопкой. Полные документы лежат
+# по ссылкам, но читают их единицы, а знать эти четыре вещи должен каждый: что
+# токен только на чтение, что он лежит зашифрованным, что данные кабинета не
+# видит никто другой и что уйти можно одной командой. Это не сокращение оферты
+# и не замена ей: это те обещания, из-за которых человек нажимает кнопку.
+CONSENT_SHORT = (
+    "<b>Коротко:</b> бот читает данные вашего кабинета Wildberries токеном "
+    "только на чтение и ничего в кабинете не меняет. Токен хранится "
+    "зашифрованным. Данные вашего кабинета не видит никто, кроме вас. "
+    "Удалить токен и все данные можно в любой момент командой "
+    "<code>/disconnect</code>."
+)
+
 READ_ONLY_WARNING = (
     "⚠️ У этого токена не стоит галочка «Только на чтение».\n"
     "Я его принял и работать буду, но лучше выпустите другой, с галочкой. "
@@ -197,6 +215,8 @@ TOKEN_TROUBLE = (
 
 OFFER_LINE = "Оферта, с которой вы соглашаетесь: {link}"
 
+PRIVACY_LINE = "Политика конфиденциальности: {link}"
+
 CABINET = (
     "ID продавца: <code>{sid}</code>\n"
     "Тип токена: {acc}.\n"
@@ -233,9 +253,26 @@ def offer_line() -> Safe:
     return fill(OFFER_LINE, link=link)
 
 
+def privacy_line() -> Safe:
+    """Строка про политику. Переменная своя: документы могут разъехаться."""
+    link = clients.privacy_url()
+    if not link:
+        return Safe(PRIVACY_PENDING)
+    return fill(PRIVACY_LINE, link=link)
+
+
+def consent_block() -> Safe:
+    """С чем именно соглашается человек: два документа и главное словами.
+
+    Один блок, а не три места: согласие даётся одной кнопкой, и всё, что за
+    ней стоит, должно стоять рядом с ней.
+    """
+    return Safe(offer_line() + "\n" + privacy_line() + "\n\n" + CONSENT_SHORT)
+
+
 def instruction_text() -> Safe:
-    """Пошаговая инструкция плюс строка про оферту."""
-    return Safe(INSTRUCTION + "\n\n" + offer_line())
+    """Пошаговая инструкция плюс то, с чем человек соглашается."""
+    return Safe(INSTRUCTION + "\n\n" + consent_block())
 
 
 def token_prompt() -> Safe:
@@ -446,7 +483,7 @@ async def token_message(
         return
 
     if not clients.has_consent(client_id, path=path):
-        refusal = Safe(NEED_CONSENT + "\n\n" + offer_line())
+        refusal = Safe(NEED_CONSENT + "\n\n" + consent_block())
         await _reply(message, refusal, consent_keyboard())
         await _forget(message)
         return

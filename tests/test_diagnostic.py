@@ -499,7 +499,12 @@ async def test_free_report_does_not_hand_out_the_paid_one(db_path, cabinet):
     app = SimpleNamespace(bot=Bot())
     await handler.make_delivery(app, db_path)(cabinet, result)
 
-    assert len(app.bot.messages) == 1
+    # Два сообщения, и второе это не продолжение разбора, а вопрос про
+    # напоминания: согласие на них спрашивается ровно здесь, потому что
+    # бесплатный разбор и есть то место, где человек решает, платить ли.
+    assert len(app.bot.messages) == 2
+    assert "/stop" in app.bot.messages[1]
+    assert "<pre>" not in app.bot.messages[1]
 
 
 # --- чужой текст в бесплатном разборе ---

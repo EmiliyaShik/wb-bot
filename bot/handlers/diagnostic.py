@@ -34,6 +34,7 @@ from telegram.constants import ParseMode
 from telegram.ext import CommandHandler
 
 from agents import diagnostic
+from bot.handlers import reminders
 from bot.handlers.tariffs import client_id_of, rubles
 from bot import texts
 from bot.texts import Safe, fill
@@ -275,11 +276,30 @@ def make_delivery(app: Any, path: str | Path | None = None):
         if row is None:
             logger.warning("некому отправить диагностику: клиента %s нет", client_id)
             return
+        chat_id = int(row["telegram_id"])
         await app.bot.send_message(
-            chat_id=int(row["telegram_id"]),
+            chat_id=chat_id,
             text=texts.clip(report_text(result)),
             parse_mode=ParseMode.HTML,
         )
+        # Вопрос про напоминания уходит отдельным сообщением, а не припиской к
+        # разбору. Разбор режется по пределу Telegram, и приписка оказалась бы
+        # обрезанной ровно у того, у кого расходов больше всех, а кнопки под
+        # сообщением остались бы без вопроса. Спрашивается это здесь, потому
+        # что бесплатный разбор и есть то место, где человек решает, платить
+        # ли: кто решил, что нет, уходит молча, и писать ему потом можно
+        # только с его согласия.
+        if not reminders.worth_asking(client_id, path=path):
+            return
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=texts.clip(Safe(reminders.ASK)),
+                parse_mode=ParseMode.HTML,
+                reply_markup=reminders.ask_keyboard(),
+            )
+        except Exception:  # noqa: BLE001 - вопрос не важнее самого разбора
+            logger.exception("не удалось спросить про напоминания")
 
     return deliver
 
