@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from core import config
+from core import access, config, db
 from core.billing import payform
 
 NOW = datetime(2026, 11, 10, 0, 30)
@@ -114,3 +114,168 @@ def test_the_page_address_is_taken_as_it_is_given(paying, monkeypatch):
 def test_a_demo_payment_is_not_offered_by_accident(paying):
     """Демо-режим это проверка владельца, а не состояние боевой ссылки."""
     assert "demo_mode" not in make().url
+
+
+# --- уведомление об оплате ---------------------------------------------------
+
+SECRET = "kluch-platyozhnoy-stranicy"
+ORDER = "RP-{client}-finance-3-202611100030"
+
+
+@pytest.fixture
+def paid(monkeypatch):
+    monkeypatch.setenv(payform.SECRET_VAR, SECRET)
+
+
+@pytest.fixture
+def buyer(db_path):
+    return db.admin_repo(db_path).ensure_client(880001)
+
+
+def notice(client_id: int, total: str = "2673.00", status: str = "success") -> dict:
+    """Поля уведомления так, как их присылает Prodamus: плоско и строками."""
+    return {
+        "date": "2026-11-10T00:40:00+03:00",
+        "order_id": "300155",
+        "order_num": ORDER.format(client=client_id),
+        "domain": "tvoibot.payform.ru",
+        "sum": total,
+        "customer_phone": "+79990000000",
+        "payment_type": "Пластиковая карта Visa, MasterCard, МИР",
+        "attempt": "1",
+        "products[0][name]": "Рентген Продаж, модуль Финансы, 3 месяца",
+        "products[0][price]": total,
+        "products[0][quantity]": "1",
+        "products[0][sum]": total,
+        "payment_status": status,
+        "payment_status_description": "Успешная оплата",
+    }
+
+
+def signed(fields: dict) -> str:
+    return payform.signature(payform.php_dict(fields), SECRET)
+
+
+def test_the_basket_is_unpacked_the_way_php_sees_it():
+    """Подпись считается по разобранной корзине, а не по плоским полям."""
+    got = payform.php_dict(
+        {"a": "1", "products[0][name]": "Товар", "products[1][name]": "Второй"}
+    )
+
+    assert got["a"] == "1"
+    assert got["products"] == [{"name": "Товар"}, {"name": "Второй"}]
+
+
+def test_the_signature_notices_a_changed_amount():
+    """Ради этого всё и делается: сумму в уведомлении подправить нельзя."""
+    fields = payform.php_dict(notice(1))
+    sign = payform.signature(fields, SECRET)
+    fields["sum"] = "1.00"
+
+    assert payform.verify(fields, sign, SECRET) is False
+
+
+def test_a_foreign_key_does_not_open_the_door():
+    fields = payform.php_dict(notice(1))
+
+    assert payform.verify(fields, payform.signature(fields, "chuzhoy"), SECRET) is False
+
+
+def test_an_empty_signature_is_not_a_signature():
+    fields = payform.php_dict(notice(1))
+
+    assert payform.verify(fields, "", SECRET) is False
+    assert payform.verify(fields, payform.signature(fields, SECRET), "") is False
+
+
+def test_the_order_number_is_read_back_the_way_it_was_written(paying):
+    """Номер из ссылки и номер из уведомления это один и тот же номер."""
+    made = make().order_id
+    back = payform.read_order(made)
+
+    assert back == payform.Order(client_id=57, module="finance", months=3)
+
+
+def test_a_module_or_a_period_we_do_not_sell_is_not_our_order():
+    assert payform.read_order("RP-1-chuzhoy-3-202611100030") is None
+    assert payform.read_order("RP-1-finance-7-202611100030") is None
+    assert payform.read_order("order-1") is None
+    assert payform.read_order("") is None
+
+
+def test_payment_opens_the_module(paid, db_path, buyer):
+    fields = notice(buyer)
+
+    got = payform.apply(fields, signed(fields), path=db_path)
+
+    assert got.reason == payform.OK
+    assert got.granted is True
+    assert access.access_of(buyer, "finance", path=db_path).works is True
+
+
+def test_a_repeated_notification_does_not_extend_anything(paid, db_path, buyer):
+    """Prodamus повторяет уведомление, пока не получит 200. Это безопасно."""
+    fields = notice(buyer)
+    sign = signed(fields)
+    first = payform.apply(fields, sign, path=db_path)
+    second = payform.apply(fields, sign, path=db_path)
+
+    assert second.reason == payform.DUPLICATE
+    assert second.granted is False
+    assert access.access_of(buyer, "finance", path=db_path).until == first.until
+
+
+def test_a_wrong_signature_opens_nothing(paid, db_path, buyer):
+    fields = notice(buyer)
+
+    got = payform.apply(fields, "0" * 64, path=db_path)
+
+    assert got.reason == payform.BAD_SIGN
+    assert access.access_of(buyer, "finance", path=db_path).works is False
+
+
+def test_without_the_secret_key_nothing_is_opened(db_path, buyer, monkeypatch):
+    """Проверять нечем - значит не открываем. Молча доверять нельзя."""
+    monkeypatch.setenv(payform.SECRET_VAR, "")
+    fields = notice(buyer)
+
+    got = payform.apply(fields, "whatever", path=db_path)
+
+    assert got.reason == payform.NO_SECRET
+    assert access.access_of(buyer, "finance", path=db_path).works is False
+
+
+def test_a_cancelled_order_opens_nothing(paid, db_path, buyer):
+    fields = notice(buyer, status="order_canceled")
+
+    got = payform.apply(fields, signed(fields), path=db_path)
+
+    assert got.reason == payform.NOT_PAID
+    assert access.access_of(buyer, "finance", path=db_path).works is False
+
+
+def test_an_order_number_that_is_not_ours_opens_nothing(paid, db_path, buyer):
+    fields = notice(buyer)
+    fields["order_num"] = "chuzhoy-zakaz-1"
+
+    got = payform.apply(fields, signed(fields), path=db_path)
+
+    assert got.reason == payform.BAD_ORDER
+    assert access.access_of(buyer, "finance", path=db_path).works is False
+
+
+def test_paying_less_than_the_price_opens_nothing(paid, db_path, buyer):
+    """Сумму в ссылке клиент может поправить в адресной строке. Здесь это видно."""
+    fields = notice(buyer, total="1.00")
+
+    got = payform.apply(fields, signed(fields), path=db_path)
+
+    assert got.reason == payform.SHORT_PAY
+    assert got.due == config.price_decimal("finance", 3)
+    assert access.access_of(buyer, "finance", path=db_path).works is False
+
+
+def test_paying_more_than_the_price_is_fine(paid, db_path, buyer):
+    fields = notice(buyer, total="3000.00")
+
+    assert payform.apply(fields, signed(fields), path=db_path).reason == payform.OK
