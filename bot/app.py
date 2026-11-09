@@ -23,7 +23,7 @@ from telegram.constants import ParseMode
 from telegram.error import InvalidToken, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from bot import netwatch, texts
+from bot import netwatch, payments, texts, webserver
 from bot.handlers import menu, register_all
 from core import audit, config, crypto, db, queue, scheduler
 
@@ -144,11 +144,23 @@ async def start_background(app) -> None:
     )
     logger.info("Воркер очереди запущен")
 
+    # Приём уведомлений об оплате. Поднимается последним и только если
+    # хостинг передал порт: локально лишний слушающий порт не нужен, а без
+    # сервера бот работает как раньше, только доступ выдаётся командой.
+    app.bot_data["webserver"] = await webserver.start(app)
+
 
 async def stop_background(app) -> None:
     """Останавливает воркер без обрыва текущей задачи."""
     # Говорить владельцу про связь больше некуда: приложение уже погашено.
     netwatch.set_notifier(None)
+    # Сначала перестаём принимать новые уведомления об оплате, потом
+    # договариваем начатые: оплата уже прошла, и клиент должен об этом
+    # услышать, даже если бот в эту секунду останавливают.
+    await webserver.stop(app.bot_data.pop("webserver", None))
+    talking = payments.pending()
+    if talking:
+        await asyncio.gather(*talking, return_exceptions=True)
     stop = app.bot_data.pop("queue_stop", None)
     worker = app.bot_data.pop("queue_worker", None)
     if stop is not None:

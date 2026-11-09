@@ -24,6 +24,7 @@ Prodamus будет стучаться с ним до скончания век�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -153,12 +154,51 @@ def owner_text(result: payform.Result) -> Safe | None:
     return None
 
 
+# Разговоры, которые ещё идут. Множество, а не одна ссылка: уведомлений
+# может прийти несколько подряд, а задача без ссылки на неё может быть
+# убрана сборщиком мусора на середине.
+_talking: set[asyncio.Task] = set()
+
+
+def pending() -> tuple[asyncio.Task, ...]:
+    """Незаконченные разговоры об оплатах. Их ждут при остановке бота."""
+    return tuple(_talking)
+
+
+def _say_later(coro: Any) -> None:
+    task = asyncio.ensure_future(coro)
+    _talking.add(task)
+    task.add_done_callback(_talking.discard)
+
+
+async def _talk(app: Any, result: payform.Result) -> None:
+    """Рассказывает об оплате клиенту и владельцу. Сбой гасится в журнал."""
+    bot = getattr(app, "bot", None)
+    if bot is None:
+        return
+    try:
+        if result.granted and result.order is not None:
+            await tell_client(bot, result.order.client_id, client_text(result))
+        words = owner_text(result)
+        if words is not None:
+            await tell_owner(bot, words)
+    except Exception:  # noqa: BLE001 - молчание Telegram не отменяет оплату
+        logger.exception("не удалось рассказать об оплате по заказу %s", result.order_num)
+
+
 def make_receiver(app: Any, path: str | Path | None = None):
     """Чем принимать уведомление. Возвращает (код ответа, тело).
 
-    Сбой разговора с Telegram не отменяет оплаты: доступ уже открыт, и
-    ответить Prodamus надо всё равно двухсотым, иначе он будет повторять
-    уведомление, а выдача от этого не повторится, зато сообщения повторятся.
+    Подпись и выдача считаются сразу: это хеш и несколько строк в своей
+    базе, то есть доли секунды. Разговор с Telegram уходит в фон, и вот
+    почему. Перед ботом на хостинге стоит прокси со своим таймаутом, а
+    Telegram умеет молчать минутами (`bot/netwatch.py` про это целиком).
+    Дожидаться его значило бы не ответить Prodamus вовремя, а тот повторит
+    уведомление, и на повторе бот промолчит: выдача-то уже не новая, а
+    дубль. Клиент остался бы с оплаченным доступом и без единого слова.
+
+    Отвечать 200 до выдачи тоже нельзя: Prodamus больше не повторит, и
+    сорвавшаяся выдача никогда бы не повторилась.
     """
 
     async def receive(fields: Mapping[str, Any], sign: str) -> tuple[int, str]:
@@ -167,18 +207,7 @@ def make_receiver(app: Any, path: str | Path | None = None):
         except Exception:  # noqa: BLE001 - своя ошибка это не ответ «принято»
             logger.exception("не удалось разобрать уведомление об оплате")
             return 500, "error"
-
-        bot = getattr(app, "bot", None)
-        if bot is not None:
-            try:
-                if result.granted and result.order is not None:
-                    await tell_client(bot, result.order.client_id, client_text(result))
-                words = owner_text(result)
-                if words is not None:
-                    await tell_owner(bot, words)
-            except Exception:  # noqa: BLE001 - молчание Telegram не отменяет оплату
-                logger.exception("не удалось рассказать об оплате по заказу %s",
-                                 result.order_num)
+        _say_later(_talk(app, result))
         return ANSWERS.get(result.reason, (200, result.reason))
 
     return receive

@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from bot import payments
@@ -69,7 +71,10 @@ def signed(fields: dict) -> str:
 
 
 async def receive(app, fields, sign, path):
-    return await payments.make_receiver(app, path)(fields, sign)
+    """Принимает уведомление и дожидается разговора: он уходит в фон."""
+    code, body = await payments.make_receiver(app, path)(fields, sign)
+    await asyncio.gather(*payments.pending())
+    return code, body
 
 
 @pytest.mark.asyncio
@@ -175,3 +180,31 @@ async def test_a_foreign_order_number_opens_nothing(wired, buyer):
     assert code == 200
     assert app.bot.to(CLIENT_TG) == []
     assert "не наш" in app.bot.to(OWNER_ID)[0]
+
+
+@pytest.mark.asyncio
+async def test_the_answer_does_not_wait_for_telegram(wired, buyer):
+    """Перед ботом прокси со своим таймаутом, а Telegram умеет молчать минутами.
+
+    Ответ уходит сразу после выдачи доступа, разговор догоняет потом.
+    """
+    gate = asyncio.Event()
+
+    class SlowBot(FakeBot):
+        async def send_message(self, chat_id, text, **kwargs):
+            await gate.wait()
+            await FakeBot.send_message(self, chat_id, text, **kwargs)
+
+    app = FakeApp()
+    app.bot = SlowBot()
+    fields = notice(buyer)
+
+    code, _ = await payments.make_receiver(app, wired)(fields, signed(fields))
+
+    assert code == 200
+    assert access.access_of(buyer, "finance", path=wired).works is True
+    assert app.bot.messages == []
+
+    gate.set()
+    await asyncio.gather(*payments.pending())
+    assert app.bot.to(CLIENT_TG)
