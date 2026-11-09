@@ -52,6 +52,7 @@ from bot.handlers import tariffs
 from bot.texts import Safe, fill
 from core import audit, billing, config, db, scheduler
 from core.billing import counterparty
+from core.billing import payform
 from core.billing import pdf as invoice_pdf
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,19 @@ PAYSUPPORT_EMPTY = (
     "я передам сообщение владельцу сервиса."
 )
 
-CARD = (
+# Три ответа на «Картой или СБП», и выбор между ними делает не кнопка, а
+# состояние настроек: есть платёжная страница - ссылка, нет её, но есть
+# контакт владельца - контакт, нет ничего - честное «настраивается».
+CARD_LINK = (
+    "💳 <b>{title}</b>, {period}: {amount}\n\n"
+    "Кнопка ниже откроет страницу оплаты. Там карта, СБП и оплата по счёту "
+    "для организаций. Чек придёт на телефон или почту, которые вы укажете.\n\n"
+    "Доступ открою после поступления оплаты, обычно в течение часа, но не "
+    "позднее одного рабочего дня.\n"
+    "Номер заказа <code>{order}</code>: назовите его, если что-то пойдёт не так."
+)
+
+CARD_CONTACT = (
     "Картой или через СБП оплата идёт напрямую владельцу сервиса: {contact}\n"
     "Напишите ему, он подскажет, как перевести и включит модуль."
 )
@@ -143,6 +156,22 @@ CARD = (
 CARD_EMPTY = (
     "Оплата картой и через СБП пока настраивается. Напишите сюда, в этот чат, "
     "и владелец сервиса свяжется с вами."
+)
+
+# Срок выбирают до способа оплаты: в ссылку едет сумма, а суммы без срока не
+# существует. Этот ответ достаётся тому, у кого диалог оборвался на перезапуске.
+CARD_NO_PERIOD = (
+    "Сначала выберите срок: от него зависит сумма. "
+    "Витрина тарифов - команда <code>/tariffs</code>."
+)
+
+# Владельцу. Готовая команда выдачи внутри: когда деньги придут, останется
+# скопировать строку, а не собирать её из уведомления Prodamus руками.
+CARD_FOR_OWNER = (
+    "💳 Клиент {client_id} взял ссылку на оплату: {product}, {amount}.\n"
+    "Номер заказа <code>{order}</code>.\n\n"
+    "Когда деньги придут:\n"
+    "<code>/grant {client_id} {module} {months} карта {order}</code>"
 )
 
 OVERDUE_NOTE = (
@@ -198,10 +227,36 @@ def paysupport_text() -> Safe:
     return fill(PAYSUPPORT, contact=contact) if contact else Safe(PAYSUPPORT_EMPTY)
 
 
-def card_text() -> Safe:
-    """Оплата картой или СБП. Бот про кассу не знает ничего."""
-    contact = owner_contact()
-    return fill(CARD, contact=contact) if contact else Safe(CARD_EMPTY)
+def card_text(
+    pay: payform.Payment | None = None, *, title: str = "", period: str = ""
+) -> Safe:
+    """Как платить картой: ссылкой, если оплата настроена, иначе контактом.
+
+    Про кассу бот по-прежнему не знает ничего: чек пробивает платёжный
+    сервис, и сказано об этом в оферте, а не придумано здесь.
+    """
+    if pay is None:
+        contact = owner_contact()
+        return fill(CARD_CONTACT, contact=contact) if contact else Safe(CARD_EMPTY)
+    return fill(
+        CARD_LINK,
+        title=title,
+        period=period,
+        amount=tariffs.rubles(pay.amount),
+        order=pay.order_id,
+    )
+
+
+def card_keyboard(pay: payform.Payment) -> InlineKeyboardMarkup:
+    """Ссылка уходит кнопкой, а не текстом.
+
+    В адресе лежит и название товара, и сумма, поэтому строкой он выходит на
+    несколько сотен знаков: читать такое клиенту незачем, а промахнуться
+    мимо куска ссылки при копировании легко.
+    """
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Оплатить картой или через СБП", url=pay.url)]]
+    )
 
 
 def module_title(module: str) -> str:
@@ -224,9 +279,9 @@ def period_keyboard(module: str) -> InlineKeyboardMarkup:
                 )
             ]
         )
-    rows.append(
-        [InlineKeyboardButton("Картой или СБП", callback_data=f"{PREFIX}card")]
-    )
+    # Кнопки «Картой или СБП» здесь нет намеренно: в ссылку на оплату едет
+    # сумма, а суммы без выбранного срока не существует. Способ оплаты
+    # спрашивается следующим экраном, когда срок уже известен.
     rows.append([InlineKeyboardButton("Отмена", callback_data=f"{PREFIX}cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -367,7 +422,7 @@ async def period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     state = context.user_data.get(STATE, {}) if context.user_data is not None else {}
 
     if data == "card":
-        await query.message.reply_text(card_text(), parse_mode=ParseMode.HTML)
+        await _card(update, context, state)
         return
 
     if data == "cancel":
@@ -405,6 +460,65 @@ async def period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode=ParseMode.HTML,
             reply_markup=inn_keyboard(),
         )
+
+
+async def _card(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, state: dict
+) -> None:
+    """Кнопка «Картой или СБП»: ссылка на оплату клиенту, команда владельцу.
+
+    Доступ тут не включается и включиться не может. Сумма в ссылке это
+    параметр адреса, и подделать её может любой: открывать модуль по факту
+    перехода значило бы раздавать его бесплатно. Доступ включается по
+    пришедшим деньгам, и сверяет их владелец (`core/billing/payform.py`).
+    """
+    message = update.effective_message
+    if message is None:
+        return
+    module = str(state.get("module") or "")
+    try:
+        months = int(state.get("months"))
+    except (TypeError, ValueError):
+        await message.reply_text(CARD_NO_PERIOD, parse_mode=ParseMode.HTML)
+        return
+    # Та же проверка, что и перед счётом: состояние диалога наше, но сложено
+    # оно из нажатых кнопок, а их содержимое приходит от клиента.
+    if not tariffs.for_sale(module) or months not in config.periods():
+        await message.reply_text(CARD_NO_PERIOD, parse_mode=ParseMode.HTML)
+        return
+
+    client_id = tariffs.client_id_of(update)
+    if client_id is None:
+        return
+    title = module_title(module)
+    period = billing.months_words(months)
+    pay = payform.payment(client_id, module, months, title=title, period=period)
+    if pay is None:
+        # Платёжная страница не настроена. Это не повод молчать: клиент
+        # получает контакт владельца, как было до появления ссылок.
+        await message.reply_text(card_text(), parse_mode=ParseMode.HTML)
+        return
+
+    await message.reply_text(
+        card_text(pay, title=title, period=period),
+        parse_mode=ParseMode.HTML,
+        reply_markup=card_keyboard(pay),
+    )
+    bot = getattr(context, "bot", None)
+    if bot is None:
+        return
+    await tell_owner(
+        bot,
+        fill(
+            CARD_FOR_OWNER,
+            client_id=client_id,
+            product=pay.product,
+            amount=tariffs.rubles(pay.amount),
+            order=pay.order_id,
+            module=module,
+            months=months,
+        ),
+    )
 
 
 def _picked(data: str) -> tuple[str, int] | None:

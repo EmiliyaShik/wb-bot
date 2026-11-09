@@ -158,11 +158,104 @@ def test_paysupport_without_contact_invents_nothing(wired, monkeypatch):
     assert "готовится" in text or "скоро" in text
 
 
-def test_card_button_leads_to_the_same_contact(wired):
+def test_without_a_payment_page_the_card_button_gives_the_owner_contact(wired):
+    """Платёжная страница не настроена - клиент получает человека, а не тишину."""
     assert "@vladelec_testovyi" in handler.card_text()
-    # Бот про кассу ничего не знает: ни платёжных ссылок, ни провайдеров.
+    # Про кассу бот по-прежнему не знает ничего: чек пробивает платёжный
+    # сервис, и обещано это в оферте, а не здесь.
     for word in ("касса", "эквайринг", "ЮKassa", "Tinkoff"):
         assert word.lower() not in handler.card_text().lower()
+
+
+@pytest.fixture
+def paying(wired, monkeypatch):
+    """Платёжная страница настроена: кнопка картой выдаёт ссылку."""
+    monkeypatch.setenv("PRODAMUS_URL", "https://tvoibot.payform.ru/")
+    monkeypatch.setenv("BOT_LINK", "https://t.me/RentgenProdazh_bot")
+    return wired
+
+
+async def walk_to_card(context, module="finance", months=3):
+    """Выбирает модуль и срок, потом жмёт «Картой или СБП»."""
+    message = FakeMessage()
+    update = FakeUpdate(CLIENT_TG, message)
+    await handler.start_dialog(update, context, module)
+    pick = FakeUpdate(CLIENT_TG, message, FakeQuery(f"inv:p:{module}:{months}", message))
+    await handler.period_callback(pick, context)
+    card = FakeUpdate(CLIENT_TG, message, FakeQuery("inv:card", message))
+    await handler.period_callback(card, context)
+    return message
+
+
+@pytest.mark.asyncio
+async def test_the_card_button_gives_a_link_with_the_right_amount(paying, client_id):
+    context = FakeContext()
+    message = await walk_to_card(context)
+
+    text, kwargs = message.sent[-1]
+    # 990 за месяц, три месяца со скидкой 10 процентов. Разряды бот делит
+    # неразрывным пробелом, поэтому он тут и записан.
+    assert "2 673" in text
+    button = kwargs["reply_markup"].inline_keyboard[0][0]
+    assert button.url.startswith("https://tvoibot.payform.ru/")
+    assert "price%5D=2673" in button.url or "price]=2673" in button.url
+
+
+@pytest.mark.asyncio
+async def test_the_client_is_told_the_order_number_and_when_access_opens(paying, client_id):
+    context = FakeContext()
+    message = await walk_to_card(context)
+
+    text = message.last
+    assert f"RP-{client_id}-finance-3-" in text
+    # Обещание срока то же, что в оферте: час обычно, рабочий день предел.
+    assert "час" in text
+
+
+@pytest.mark.asyncio
+async def test_the_owner_gets_a_ready_grant_command(paying, client_id):
+    """Владельцу достаётся строка, которую остаётся скопировать, а не собрать."""
+    context = FakeContext()
+    await walk_to_card(context)
+
+    owner = context.bot.to(OWNER_ID)
+    assert owner
+    assert f"/grant {client_id} finance 3 карта RP-{client_id}-finance-3-" in owner[-1]
+
+
+@pytest.mark.asyncio
+async def test_the_card_button_without_a_period_asks_to_pick_one(paying, client_id):
+    """Диалог оборвался на перезапуске: суммы нет, и ссылки тоже."""
+    context = FakeContext()
+    message = FakeMessage()
+    card = FakeUpdate(CLIENT_TG, message, FakeQuery("inv:card", message))
+    await handler.period_callback(card, context)
+
+    assert "срок" in message.last.lower()
+    assert "payform" not in message.last
+
+
+@pytest.mark.asyncio
+async def test_a_forged_period_in_the_state_gives_no_link(paying, client_id):
+    """Состояние диалога наше, но сложено из кнопок, а их шлёт клиент."""
+    context = FakeContext()
+    context.user_data[handler.STATE] = {"module": "finance", "months": 7, "step": "inn"}
+    message = FakeMessage()
+    card = FakeUpdate(CLIENT_TG, message, FakeQuery("inv:card", message))
+    await handler.period_callback(card, context)
+
+    assert "срок" in message.last.lower()
+    assert context.bot.to(OWNER_ID) == []
+
+
+@pytest.mark.asyncio
+async def test_without_the_payment_page_the_dialog_falls_back_to_the_contact(wired, client_id, monkeypatch):
+    monkeypatch.setenv("PRODAMUS_URL", "")
+    context = FakeContext()
+    message = await walk_to_card(context)
+
+    assert "@vladelec_testovyi" in message.last
+    assert message.sent[-1][1].get("reply_markup") is None
 
 
 # --- подключение к витрине ---
@@ -188,7 +281,15 @@ def test_period_keyboard_shows_every_period_with_its_discounted_price(wired):
     assert "2 673" in joined
     datas = [button.callback_data for row in rows for button in row]
     assert "inv:p:finance:3" in datas
-    assert any(item.startswith("inv:card") for item in datas)
+    # Кнопки оплаты картой здесь нет: в ссылку на оплату едет сумма, а суммы
+    # без выбранного срока не существует. Способ спрашивается следующим шагом.
+    assert not any((item or "").startswith("inv:card") for item in datas)
+    inn_datas = [
+        button.callback_data
+        for row in handler.inn_keyboard().inline_keyboard
+        for button in row
+    ]
+    assert "inv:card" in inn_datas
 
 
 # --- диалог целиком ---
