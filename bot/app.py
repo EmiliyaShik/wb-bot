@@ -22,6 +22,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import InvalidToken, NetworkError
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest
 
 from bot import netwatch, payments, texts, webserver
 from bot.handlers import menu, register_all
@@ -48,6 +49,13 @@ TOKEN_REJECTED = (
 
 # Сколько сообщений бот разбирает одновременно.
 CONCURRENT_UPDATES = 32
+
+# Прокси до Telegram. Нужен не для анонимности: с российского адреса
+# api.telegram.org недоступен вовсе, и сервер в России без прокси не увидит
+# ни одного сообщения. К Wildberries это отношения не имеет, у него своя
+# переменная и свой повод (WB_PROXY, только для витрины карточек).
+TELEGRAM_PROXY_VAR = "TELEGRAM_PROXY"
+
 
 # Как часто воркер заглядывает в пустую очередь.
 WORKER_POLL_SEC = 5.0
@@ -376,6 +384,11 @@ async def on_error(update: object, context) -> None:
         logger.exception("не удалось ответить клиенту на сбой")
 
 
+def telegram_proxy() -> str:
+    """Адрес прокси до Telegram. Пустая строка означает «идти напрямую»."""
+    return config.env(TELEGRAM_PROXY_VAR)
+
+
 def register_base(app: Application) -> None:
     """Команды, которые есть всегда, даже когда ни один модуль не подключён."""
     app.add_handler(CommandHandler("start", start))
@@ -394,15 +407,21 @@ def build_app(token: str) -> Application:
     # get_updates_request: транспорт опроса под присмотром bot.netwatch. Обрыв
     # связи приходит сюда первым, и только здесь его видно целиком, включая
     # таймаут, который библиотека повторяет молча и без паузы.
-    app = (
+    proxy = telegram_proxy()
+    builder = (
         Application.builder()
         .token(token)
         .concurrent_updates(CONCURRENT_UPDATES)
-        .get_updates_request(netwatch.updates_request())
+        .get_updates_request(netwatch.updates_request(proxy))
         .post_init(start_background)
         .post_shutdown(stop_background)
-        .build()
     )
+    if proxy:
+        # Второй транспорт, которым бот отвечает и шлёт файлы. Прокси нужен
+        # обоим: опрос и отправка идут на один и тот же недоступный адрес.
+        builder = builder.request(HTTPXRequest(proxy=proxy))
+        audit.log("telegram", None, "Запросы к Telegram идут через прокси.")
+    app = builder.build()
     # Признак «опрос ещё идёт» библиотека снимает раньше, чем делает последний
     # заход за прочитанным, и по нему присмотр отличает обрыв от выключения.
     netwatch.set_polling(lambda: app.updater is not None and app.updater.running)

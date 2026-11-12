@@ -369,6 +369,11 @@ class WatchedRequest(HTTPXRequest):
         return answer
 
 
-def updates_request() -> WatchedRequest:
-    """Транспорт getUpdates под присмотром. Зовёт сборка приложения."""
-    return WatchedRequest(connection_pool_size=UPDATES_POOL)
+def updates_request(proxy: str | None = None) -> WatchedRequest:
+    """Транспорт getUpdates под присмотром. Зовёт сборка приложения.
+
+    Прокси тут нужен не для анонимности: с российского адреса Telegram
+    недоступен вовсе, и без него бот на сервере в России не увидит ни одного
+    сообщения. Пустое значение означает «идти напрямую», как было всегда.
+    """
+    return WatchedRequest(connection_pool_size=UPDATES_POOL, proxy=proxy or None)
