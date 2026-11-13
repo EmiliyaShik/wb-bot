@@ -16,7 +16,7 @@ from core import access, config, db
 from core.billing import payform
 
 NOW = datetime(2026, 11, 10, 0, 30)
-PAGE = "https://tvoibot.payform.ru/"
+PAGE = "https://primer.payform.ru/"
 BOT = "https://t.me/RentgenProdazh_bot"
 
 
@@ -138,7 +138,7 @@ def notice(client_id: int, total: str = "2673.00", status: str = "success") -> d
         "date": "2026-11-10T00:40:00+03:00",
         "order_id": "300155",
         "order_num": ORDER.format(client=client_id),
-        "domain": "tvoibot.payform.ru",
+        "domain": "primer.payform.ru",
         "sum": total,
         "customer_phone": "+79990000000",
         "payment_type": "Пластиковая карта Visa, MasterCard, МИР",

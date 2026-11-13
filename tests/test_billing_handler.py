@@ -170,7 +170,7 @@ def test_without_a_payment_page_the_card_button_gives_the_owner_contact(wired):
 @pytest.fixture
 def paying(wired, monkeypatch):
     """Платёжная страница настроена: кнопка картой выдаёт ссылку."""
-    monkeypatch.setenv("PRODAMUS_URL", "https://tvoibot.payform.ru/")
+    monkeypatch.setenv("PRODAMUS_URL", "https://primer.payform.ru/")
     monkeypatch.setenv("BOT_LINK", "https://t.me/RentgenProdazh_bot")
     return wired
 
@@ -197,7 +197,7 @@ async def test_the_card_button_gives_a_link_with_the_right_amount(paying, client
     # неразрывным пробелом, поэтому он тут и записан.
     assert "2 673" in text
     button = kwargs["reply_markup"].inline_keyboard[0][0]
-    assert button.url.startswith("https://tvoibot.payform.ru/")
+    assert button.url.startswith("https://primer.payform.ru/")
     assert "price%5D=2673" in button.url or "price]=2673" in button.url
 
 
