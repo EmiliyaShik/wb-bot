@@ -255,12 +255,14 @@ def test_a_cancelled_order_opens_nothing(paid, db_path, buyer):
 
 
 def test_an_order_number_that_is_not_ours_opens_nothing(paid, db_path, buyer):
+    """Чужой номер доступа не открывает. Тревогой это не считается: такой
+    номер приходит от соседнего бота с той же платёжной страницы."""
     fields = notice(buyer)
     fields["order_num"] = "chuzhoy-zakaz-1"
 
     got = payform.apply(fields, signed(fields), path=db_path)
 
-    assert got.reason == payform.BAD_ORDER
+    assert got.reason == payform.FOREIGN
     assert access.access_of(buyer, "finance", path=db_path).works is False
 
 
@@ -279,3 +281,40 @@ def test_paying_more_than_the_price_is_fine(paid, db_path, buyer):
     fields = notice(buyer, total="3000.00")
 
     assert payform.apply(fields, signed(fields), path=db_path).reason == payform.OK
+
+
+# --- одна платёжная страница на несколько ботов -------------------------------
+
+
+def test_a_foreign_bot_order_is_recognised_as_foreign():
+    """Платёжная страница бывает одна на несколько ботов."""
+    assert payform.is_ours("RP-1-finance-3-202611100030") is True
+    assert payform.is_ours("MARY-1-tarif-3-202611100030") is False
+    assert payform.is_ours("") is False
+
+
+def test_a_broken_order_of_ours_is_still_ours():
+    """Начало наше, а разобрать не вышло: это беда, а не чужая продажа."""
+    assert payform.is_ours("RP-sloman") is True
+    assert payform.read_order("RP-sloman") is None
+
+
+def test_a_foreign_payment_opens_nothing_and_is_not_an_alarm(paid, db_path, buyer):
+    fields = notice(buyer)
+    fields["order_num"] = "MARY-7-tarif-1-202611100030"
+
+    got = payform.apply(fields, signed(fields), path=db_path)
+
+    assert got.reason == payform.FOREIGN
+    assert got.granted is False
+    assert access.access_of(buyer, "finance", path=db_path).works is False
+
+
+def test_our_own_broken_order_is_still_an_alarm(paid, db_path, buyer):
+    """Деньги пришли, номер наш, а кому включать, непонятно. Это надо знать."""
+    fields = notice(buyer)
+    fields["order_num"] = "RP-sloman"
+
+    got = payform.apply(fields, signed(fields), path=db_path)
+
+    assert got.reason == payform.BAD_ORDER

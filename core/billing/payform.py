@@ -102,7 +102,7 @@ def order_id(
     двух нажатий одной.
     """
     moment = now or datetime.now()
-    return f"RP-{int(client_id)}-{module}-{int(months)}-{moment:%Y%m%d%H%M}"
+    return f"{ORDER_PREFIX}{int(client_id)}-{module}-{int(months)}-{moment:%Y%m%d%H%M}"
 
 
 @dataclass(frozen=True)
@@ -182,11 +182,31 @@ DUPLICATE = "duplicate"
 BAD_SIGN = "bad_sign"
 NOT_PAID = "not_paid"
 BAD_ORDER = "bad_order"
+FOREIGN = "foreign"
 SHORT_PAY = "short_pay"
 NO_SECRET = "no_secret"
 
+# Начало номера заказа: по нему оплата этого бота отличается от оплаты
+# соседнего. Платёжная страница у них может быть одна на всех, и тогда
+# уведомление об оплате приходит каждому боту: чужое надо узнать и промолчать,
+# а не поднимать тревогу. Префикс один на файл, и шаблон разбора собран из
+# него же: разойдись они, бот перестал бы узнавать собственные номера.
+ORDER_PREFIX = "RP-"
+
 # Номер заказа, который мы же и выдали: RP-клиент-модуль-месяцы-время.
-ORDER_RE = re.compile(r"^RP-(\d+)-([a-z_]+)-(\d+)-(\d{12})$")
+ORDER_RE = re.compile(
+    r"^" + re.escape(ORDER_PREFIX) + r"(\d+)-([a-z_]+)-(\d+)-(\d{12})$"
+)
+
+
+def is_ours(order_num: str) -> bool:
+    """Наш ли это номер заказа хотя бы по началу.
+
+    Проверка нарочно грубая: ею отличается чужая оплата (про неё молчим) от
+    своей, но испорченной (про неё кричим). Разбирает номер до конца
+    `read_order`, и это разные вопросы.
+    """
+    return (order_num or "").strip().startswith(ORDER_PREFIX)
 
 
 def secret() -> str:
@@ -362,10 +382,16 @@ def apply(
     if status != PAID:
         return Result(reason=NOT_PAID, order_num=order_num, order=order, paid=paid)
     if order is None:
+        if not is_ours(order_num):
+            # Оплата соседнего бота с той же платёжной страницы. Это
+            # обычное дело, а не беда: отвечаем «принято» и молчим, иначе
+            # владелец получал бы сообщение на каждую чужую продажу.
+            logger.info("уведомление не нашего бота, заказ %s", order_num or "пуст")
+            return Result(reason=FOREIGN, order_num=order_num, paid=paid)
         audit.log(
             "payment.order",
             None,
-            f"Оплата прошла, а номер заказа {order_num or 'пуст'} не наш.",
+            f"Оплата прошла, номер заказа {order_num} наш, а разобрать его не вышло.",
             level="error",
             path=path,
         )

@@ -170,16 +170,37 @@ async def test_a_silent_telegram_does_not_undo_a_payment(wired, buyer):
 
 
 @pytest.mark.asyncio
-async def test_a_foreign_order_number_opens_nothing(wired, buyer):
+async def test_a_foreign_order_is_quiet(wired, buyer):
+    """Платёжная страница одна на несколько ботов, и уведомление приходит всем.
+
+    Сообщение владельцу на каждую чужую продажу он перестал бы читать через
+    неделю, а вместе с ними перестал бы читать и настоящие.
+    """
     app = FakeApp()
     fields = notice(buyer)
-    fields["order_num"] = "chuzhoy-1"
+    fields["order_num"] = "MARY-7-tarif-1-202611100030"
+
+    code, _ = await receive(app, fields, signed(fields), wired)
+
+    assert code == 200
+    assert access.access_of(buyer, "finance", path=wired).works is False
+    assert app.bot.messages == []
+
+
+@pytest.mark.asyncio
+async def test_our_own_broken_order_still_wakes_the_owner(wired, buyer):
+    """Начало номера наше, а разобрать не вышло: деньги пришли неизвестно за что."""
+    app = FakeApp()
+    fields = notice(buyer)
+    fields["order_num"] = "RP-sloman"
 
     code, _ = await receive(app, fields, signed(fields), wired)
 
     assert code == 200
     assert app.bot.to(CLIENT_TG) == []
-    assert "не наш" in app.bot.to(OWNER_ID)[0]
+    owner = app.bot.to(OWNER_ID)[0]
+    assert "RP-sloman" in owner
+    assert "разобрать не вышло" in owner
 
 
 @pytest.mark.asyncio

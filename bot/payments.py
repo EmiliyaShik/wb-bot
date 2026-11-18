@@ -58,10 +58,12 @@ SHORT_OWNER = (
     "Включить всё равно: <code>/grant {client_id} {module} {months} карта {order}</code>"
 )
 
+# Номер начинается как наш, а дальше не разбирается. Текст именно про это:
+# чужие номера сюда больше не попадают, у них своя дорога и своё молчание.
 BAD_ORDER_OWNER = (
-    "⚠️ Оплата прошла, а номер заказа <code>{order}</code> не наш.\n"
-    "Доступ не открыт: по такому номеру непонятно, кому и что включать. "
-    "Платёж виден в кабинете Prodamus, оттуда и разбирайтесь."
+    "⚠️ Оплата прошла, а номер заказа <code>{order}</code> разобрать не вышло.\n"
+    "Начало номера наше, то есть платёж наш, но кому и что включать, по нему "
+    "непонятно. Доступ не открыт, платёж виден в кабинете Prodamus."
 )
 
 BAD_SIGN_OWNER = (
@@ -83,6 +85,7 @@ ANSWERS = {
     payform.DUPLICATE: (200, "duplicate"),
     payform.NOT_PAID: (200, "not paid"),
     payform.BAD_ORDER: (200, "unknown order"),
+    payform.FOREIGN: (200, "not our order"),
     payform.SHORT_PAY: (200, "short payment"),
     payform.BAD_SIGN: (403, "bad sign"),
     payform.NO_SECRET: (503, "no secret"),
@@ -118,12 +121,16 @@ def client_text(result: payform.Result) -> Safe:
 def owner_text(result: payform.Result) -> Safe | None:
     """Что видит владелец. None означает «говорить не о чем».
 
-    Молчим о двух вещах: об отменённом заказе (клиент просто передумал, и
-    письмо об этом Prodamus владельцу и так пришлёт) и о дубле уведомления
-    (деньги те же, доступ тот же, сообщение было бы вторым о том же самом).
+    Молчим о трёх вещах: об отменённом заказе (клиент просто передумал, и
+    письмо об этом Prodamus владельцу и так пришлёт), о дубле уведомления
+    (деньги те же, доступ тот же, сообщение было бы вторым о том же самом)
+    и о чужом заказе. Последнее про то, что платёжная страница бывает одна
+    на несколько ботов, и тогда уведомление приходит каждому из них:
+    сообщение на каждую чужую продажу владелец перестал бы читать через
+    неделю, а вместе с ними перестал бы читать и настоящие.
     """
     reason, order = result.reason, result.order
-    if reason in (payform.NOT_PAID, payform.DUPLICATE):
+    if reason in (payform.NOT_PAID, payform.DUPLICATE, payform.FOREIGN):
         return None
     if reason == payform.BAD_SIGN:
         return Safe(BAD_SIGN_OWNER)
