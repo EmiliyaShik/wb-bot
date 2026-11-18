@@ -180,6 +180,30 @@ def five_weeks(db_path, client):
     return client
 
 
+@pytest.fixture
+def five_weeks_now(db_path, client):
+    """Те же пять недель, но прижатые к сегодняшнему дню.
+
+    Нужна там, где проверяется `alerts_task`: он берёт сегодня у часов, и
+    своего шва для даты у него нет (и заводить третий шов ради этого не
+    станем). С фиксированными датами такой тест однажды краснеет сам по
+    себе, просто от того, что прошло время, и красный он не про код.
+    """
+    from datetime import datetime
+
+    today = datetime.now(scheduler.tz()).date()
+    first = today - timedelta(days=7 * 5)
+    for number in range(1, 6):
+        put_week(
+            client,
+            db_path,
+            number,
+            (first + timedelta(days=7 * (number - 1))).isoformat(),
+            commission="18000" if number == 5 else "15000",
+        )
+    return client
+
+
 def test_five_weeks_are_enough_to_name_the_grown_commission(db_path, five_weeks):
     watch = watchdog.check(five_weeks, today=TODAY, path=db_path)
 
@@ -256,16 +280,16 @@ def no_wb(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_nothing_reaches_wildberries(db_path, five_weeks, no_wb):
+async def test_nothing_reaches_wildberries(db_path, five_weeks_now, no_wb):
     """R103 дословно: работает на данных агента 1, новых запросов не делает."""
-    watchdog.check(five_weeks, today=TODAY, path=db_path)
-    watchdog.dynamics(five_weeks, "quarter", today=TODAY, path=db_path)
+    watchdog.check(five_weeks_now, path=db_path)
+    watchdog.dynamics(five_weeks_now, "quarter", path=db_path)
 
     sent: list = []
     watchdog.set_delivery(lambda client_id, watch: sent.append(watch))
-    access.grant_access(five_weeks, watchdog.MODULE, 30, "test", path=db_path)
+    access.grant_access(five_weeks_now, watchdog.MODULE, 30, "test", path=db_path)
     await watchdog.alerts_task(
-        SimpleNamespace(client_id=five_weeks, payload={"report_id": 5}), path=db_path
+        SimpleNamespace(client_id=five_weeks_now, payload={"report_id": 5}), path=db_path
     )
 
     assert no_wb == []
@@ -406,15 +430,15 @@ class FakeApp:
 
 
 @pytest.mark.asyncio
-async def test_register_puts_the_command_and_the_weekly_delivery_in_place(db_path, five_weeks):
+async def test_register_puts_the_command_and_the_weekly_delivery_in_place(db_path, five_weeks_now):
     scheduler.reset()
     queue.reset()
     app = FakeApp()
 
     handler.register(app, path=db_path)
-    access.grant_access(five_weeks, watchdog.MODULE, 30, "test-register", path=db_path)
+    access.grant_access(five_weeks_now, watchdog.MODULE, 30, "test-register", path=db_path)
     await watchdog.alerts_task(
-        SimpleNamespace(client_id=five_weeks, payload={"report_id": 5}), path=db_path
+        SimpleNamespace(client_id=five_weeks_now, payload={"report_id": 5}), path=db_path
     )
 
     assert len(app.handlers) == 1

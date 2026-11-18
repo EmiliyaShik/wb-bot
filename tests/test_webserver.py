@@ -156,6 +156,7 @@ async def test_a_curious_browser_gets_nothing(wired):
 
 def test_the_port_decides_whether_there_is_a_server(monkeypatch):
     """Нет порта - нет сервера: локально лишний слушающий порт не нужен."""
+    monkeypatch.setenv("WEB_PORT", "")
     monkeypatch.setenv("PORT", "")
     assert webserver.web_port() == 0
     monkeypatch.setenv("PORT", "ne-chislo")
@@ -166,8 +167,28 @@ def test_the_port_decides_whether_there_is_a_server(monkeypatch):
     assert webserver.web_port() == 3000
 
 
+def test_our_own_variable_wins_over_the_hosting_one(monkeypatch):
+    """Платформа передаёт PORT сама, но приём денег на этом не строится.
+
+    Не приехала чужая переменная - сервер молча не поднимется, а узнаем мы
+    об этом от клиента, который заплатил и не получил доступ.
+    """
+    monkeypatch.setenv("WEB_PORT", "3000")
+    monkeypatch.setenv("PORT", "")
+    assert webserver.web_port() == 3000
+
+    monkeypatch.setenv("PORT", "8080")
+    assert webserver.web_port() == 3000
+
+    # Своя переменная с мусором не отменяет хостинговую: сервер важнее
+    # аккуратности, и опечатка владельца не должна гасить приём оплаты.
+    monkeypatch.setenv("WEB_PORT", "ne-chislo")
+    assert webserver.web_port() == 8080
+
+
 @pytest.mark.asyncio
 async def test_without_a_port_nothing_is_started(monkeypatch):
+    monkeypatch.setenv("WEB_PORT", "")
     monkeypatch.setenv("PORT", "")
 
     assert await webserver.start(FakeApp()) is None
