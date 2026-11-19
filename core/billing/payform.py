@@ -224,7 +224,14 @@ def _strings(value: Any) -> Any:
         return {str(key): _strings(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_strings(item) for item in value]
-    return "" if value is None else str(value)
+    if value is None:
+        return ""
+    # PHP пишет истину единицей, Python словом True. В уведомлении булевых
+    # полей нет (форма приходит строками), но в ссылку на оплату такое
+    # значение попасть может, и тогда подпись разойдётся на ровном месте.
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
 
 
 def signature(data: Mapping[str, Any], key: str) -> str:
@@ -238,9 +245,16 @@ def signature(data: Mapping[str, Any], key: str) -> str:
     адресе внутри данных.
     """
     clean = {name: item for name, item in data.items() if name != "signature"}
-    payload = json.dumps(_strings(clean), sort_keys=True, separators=(",", ":"))
+    # ensure_ascii=False обязателен. Python по умолчанию превращает русские
+    # буквы в \uXXXX, PHP на той стороне пишет их как есть, и подпись
+    # расходится на любом уведомлении с кириллицей, то есть почти на каждом:
+    # там и способ оплаты словами, и название товара. Поймано живым тестовым
+    # запросом Prodamus, который вернулся с «bad sign».
+    payload = json.dumps(
+        _strings(clean), sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
     payload = payload.replace("/", "\\/")
-    return hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def verify(data: Mapping[str, Any], sign: str, key: str) -> bool:

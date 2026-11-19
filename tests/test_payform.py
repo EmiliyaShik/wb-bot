@@ -7,6 +7,8 @@ Prodamus. Проверяется то, из-за чего оплата лома�
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
@@ -318,3 +320,51 @@ def test_our_own_broken_order_is_still_an_alarm(paid, db_path, buyer):
     got = payform.apply(fields, signed(fields), path=db_path)
 
     assert got.reason == payform.BAD_ORDER
+
+
+# --- как именно собирается строка под подпись ---------------------------------
+
+
+def test_cyrillic_is_not_escaped_before_signing():
+    """Поймано живым тестовым запросом Prodamus, вернувшимся с «bad sign».
+
+    Python по умолчанию превращает русские буквы в \\uXXXX, PHP на той
+    стороне пишет их как есть. В уведомлении кириллица почти всегда: способ
+    оплаты словами, название товара, примечание. Поэтому строка под подпись
+    закреплена здесь целиком, а не проверяется «сама с собой».
+    """
+    payload = '{"a":"тест"}'
+    want = hmac.new(b"kluch", payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    assert payform.signature({"a": "тест"}, "kluch") == want
+
+
+def test_the_slash_is_escaped_the_way_php_writes_it():
+    """json_encode в PHP пишет \\/ вместо /, и в адресах это видно всегда."""
+    payload = '{"u":"https:\\/\\/t.me\\/bot"}'
+    want = hmac.new(b"kluch", payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    assert payform.signature({"u": "https://t.me/bot"}, "kluch") == want
+
+
+def test_keys_are_sorted_and_there_are_no_spaces():
+    payload = '{"a":"1","b":"2"}'
+    want = hmac.new(b"kluch", payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    assert payform.signature({"b": 2, "a": 1}, "kluch") == want
+
+
+def test_the_basket_is_signed_as_a_nested_array():
+    """Корзина подписывается разобранной: PHP видит массив, а не плоские поля."""
+    payload = '{"products":[{"name":"Товар"}]}'
+    want = hmac.new(b"kluch", payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    assert payform.signature(payform.php_dict({"products[0][name]": "Товар"}), "kluch") == want
+
+
+def test_a_boolean_is_written_the_php_way():
+    """PHP пишет истину единицей, Python словом True."""
+    payload = '{"no":"0","yes":"1"}'
+    want = hmac.new(b"kluch", payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    assert payform.signature({"yes": True, "no": False}, "kluch") == want
