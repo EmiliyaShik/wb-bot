@@ -59,6 +59,7 @@ from bot import texts
 from bot.texts import Safe, fill
 from bot.handlers.tariffs import local_date, rubles
 from core import access, audit, billing, config, db, metering, queue, ratelimit, scheduler
+from core.billing import payform
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,33 @@ TRACE_USAGE = (
     "\n\nПоказать предыдущую: <code>/trace 2</code>, перед ней "
     "<code>/trace 3</code> и так далее."
 )
+
+TESTPAY_TITLE = "Тестовая оплата"
+
+TESTPAY_READY = (
+    "🧪 <b>Проверка приёма оплаты, без денег.</b>\n\n"
+    "Откройте ссылку и заплатите тестовой картой Prodamus:\n"
+    "номер <code>2202 2050 0001 2424</code>, срок <code>05/35</code>, "
+    "код <code>669</code>.\n\n"
+    "Списания не будет, чек не пробьётся, доступ никому не откроется. "
+    "Настоящим покупателям это не мешает: демо-режим включён только в этой "
+    "ссылке.\n\n"
+    "Если цепочка цела, через несколько секунд сюда придёт «тестовая оплата "
+    "дошла». Если не придёт, смотрите журнал: уведомление либо не дошло "
+    "вовсе, либо не сошлась подпись.\n\n"
+    "Заказ <code>{order}</code>, сумма в ссылке {amount}."
+)
+
+# Адреса платёжной страницы нет. Текст про переменную, а не про «что-то
+# пошло не так»: это сообщение видит только владелец, и чинить ему.
+TESTPAY_OFF = (
+    "Оплата картой не настроена: не задан адрес платёжной страницы "
+    "(переменная <code>PRODAMUS_URL</code>). Проверять нечего."
+)
+
+# Ни одного видимого модуля в конфиге. Такого быть не должно, но пустой
+# список лучше поймать здесь, чем получить исключение в ссылке.
+TESTPAY_NO_MODULE = "В конфиге нет ни одного видимого модуля, не из чего собрать ссылку."
 
 RETRY_BUTTON = "Перезапустить #{task_id}"
 RETRY_DONE = "Задача #{task_id} возвращена в очередь, счётчик попыток обнулён."
@@ -776,6 +804,53 @@ async def trace_command(update, context, *, path: str | Path | None = None) -> N
     await _reply(update, trace_text(list(rows), number))
 
 
+async def testpay_command(update, context, *, path: str | Path | None = None) -> None:
+    """`/testpay`: проверить приём оплаты, не тратя денег.
+
+    Проверить настоящей покупкой можно и нужно хотя бы раз, но каждая такая
+    проверка это комиссия платёжной страницы и возня с возвратом. Демо-режим
+    Prodamus проводит оплату тестовой картой, денег не списывает и чека не
+    пробивает, а уведомление шлёт настоящее и подписанное. Проверяется всё,
+    кроме самих денег: ссылка, подпись, приём по HTTP и разбор номера заказа.
+
+    Номер клиента в тестовом заказе нулевой намеренно. Доступ по такому
+    номеру не открывается в принципе, читать из него некого, а настоящий
+    номер стал бы лишним следом в чужих журналах.
+
+    Модуль берётся самый дешёвый из видимых, срок самый короткий: сумма в
+    демо-режиме ни на что не влияет, а ссылка при этом выглядит как
+    настоящая, то есть проверяется тот же путь, которым ходит клиент.
+    """
+    if _owner(update) is None:
+        return
+    shown = [one for one in config.modules().values() if one.visible]
+    if not shown:
+        await _reply(update, Safe(TESTPAY_NO_MODULE))
+        return
+    info = min(shown, key=lambda one: one.price_month)
+    months = min(config.periods() or (1,))
+    pay = payform.payment(
+        0,
+        info.name,
+        months,
+        title=info.title or info.name,
+        period=billing.months_words(months),
+        test=True,
+    )
+    if pay is None:
+        await _reply(update, Safe(TESTPAY_OFF))
+        return
+    audit.log("admin.testpay", None, f"Собрана тестовая оплата, заказ {pay.order_id}.", path=path)
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(TESTPAY_TITLE, url=pay.url)]])
+    await _reply(
+        update,
+        TESTPAY_READY,
+        reply_markup=keyboard,
+        order=pay.order_id,
+        amount=rubles(pay.amount),
+    )
+
+
 def _task_by_id(task_id: int, path) -> Any:
     for row in db.admin_repo(path).tasks(limit=1000):
         if int(row["id"]) == task_id:
@@ -833,6 +908,7 @@ def register(app, *, path: str | Path | None = None) -> None:
     app.add_handler(CommandHandler("revoke", functools.partial(revoke_command, path=path)))
     app.add_handler(CommandHandler("tasks", functools.partial(tasks_command, path=path)))
     app.add_handler(CommandHandler("trace", functools.partial(trace_command, path=path)))
+    app.add_handler(CommandHandler("testpay", functools.partial(testpay_command, path=path)))
     app.add_handler(
         CallbackQueryHandler(functools.partial(retry_callback, path=path), pattern=f"^{PREFIX}")
     )

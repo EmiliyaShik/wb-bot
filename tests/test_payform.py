@@ -368,3 +368,46 @@ def test_a_boolean_is_written_the_php_way():
     want = hmac.new(b"kluch", payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
     assert payform.signature({"yes": True, "no": False}, "kluch") == want
+
+
+# --- тестовая оплата ----------------------------------------------------------
+
+
+def test_the_test_link_says_demo_and_carries_its_own_order_number(paying):
+    """Демо-режим включается в ссылке, а не настройкой страницы.
+
+    Настройка выключила бы приём денег у всех сразу, включая настоящих
+    покупателей. Поле в адресе действует только на эту одну оплату.
+    """
+    pay = payform.payment(
+        0, "funnel", 1, title="Воронка", period="1 месяц", now=NOW, test=True
+    )
+
+    assert params(pay.url)["demo_mode"] == "1"
+    assert pay.order_id.startswith(payform.TEST_PREFIX)
+    assert payform.is_test(pay.order_id) is True
+
+
+def test_a_usual_link_stays_without_demo(paying):
+    """Признак демо-режима не должен протечь в обычную покупку."""
+    assert "demo_mode" not in params(make().url)
+    assert payform.is_test(make().order_id) is False
+
+
+def test_a_test_order_is_ours_for_the_neighbours(paying):
+    """Начало номера общее нарочно: соседний бот обязан узнать чужое и промолчать."""
+    pay = payform.payment(
+        0, "funnel", 1, title="Воронка", period="1 месяц", now=NOW, test=True
+    )
+
+    assert payform.is_ours(pay.order_id) is True
+
+
+def test_a_test_order_cannot_be_read_as_a_purchase():
+    """Доступ по тестовому номеру не открывается даже подделкой.
+
+    Шаблон разбора ждёт после начала номера цифры клиента, и слово «test»
+    ему не подходит никогда. Значит ни клиента, ни модуля, ни срока из
+    такого номера не достать, сколько их туда ни впиши.
+    """
+    assert payform.read_order(f"{payform.TEST_PREFIX}57-finance-3-202611100030") is None

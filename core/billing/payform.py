@@ -92,7 +92,12 @@ def ready() -> bool:
 
 
 def order_id(
-    client_id: int, module: str, months: int, *, now: datetime | None = None
+    client_id: int,
+    module: str,
+    months: int,
+    *,
+    now: datetime | None = None,
+    test: bool = False,
 ) -> str:
     """Номер заказа, он же будущий `payment_ref`.
 
@@ -100,9 +105,12 @@ def order_id(
     Prodamus и этим же номером выдаёт доступ, не сверяясь ни с чем ещё.
     Минута в конце делает номер разным у разных покупок и одинаковым у
     двух нажатий одной.
+
+    У тестовой оплаты начало номера своё, и доступ по ней не открывается.
     """
     moment = now or datetime.now()
-    return f"{ORDER_PREFIX}{int(client_id)}-{module}-{int(months)}-{moment:%Y%m%d%H%M}"
+    prefix = TEST_PREFIX if test else ORDER_PREFIX
+    return f"{prefix}{int(client_id)}-{module}-{int(months)}-{moment:%Y%m%d%H%M}"
 
 
 @dataclass(frozen=True)
@@ -123,17 +131,23 @@ def payment(
     title: str,
     period: str,
     now: datetime | None = None,
+    test: bool = False,
 ) -> Payment | None:
     """Ссылка на оплату модуля за выбранный срок. None, если оплата не настроена.
 
     Название модуля и период приходят параметрами, а не берутся из конфига:
     те же слова стоят в сообщении клиенту, и расходиться им нельзя.
+
+    `test` собирает ссылку демо-режима: Prodamus проводит такую оплату
+    тестовой картой, денег не списывает и чека не пробивает, а уведомление
+    присылает настоящее и подписанное. Это и нужно: проверяется вся цепочка
+    до последнего звена, кроме самих денег.
     """
     base = payform_url()
     if not base:
         return None
     amount = config.price_decimal(module, months)
-    number = order_id(client_id, module, months, now=now)
+    number = order_id(client_id, module, months, now=now, test=test)
     product = PRODUCT.format(title=title, period=period)
     params = {
         "do": "pay",
@@ -152,6 +166,8 @@ def payment(
             title=title, bot=bot_link() or "Telegram"
         ),
     }
+    if test:
+        params["demo_mode"] = "1"
     # Хвост чистится до того, как выбран разделитель, а не после: адрес
     # «…/?» кончается вопросом, но параметров в нём нет, и приклеивать к
     # нему «&» значит собрать ссылку, которую Prodamus не разберёт.
@@ -185,6 +201,7 @@ BAD_ORDER = "bad_order"
 FOREIGN = "foreign"
 SHORT_PAY = "short_pay"
 NO_SECRET = "no_secret"
+TEST_OK = "test_ok"
 
 # Начало номера заказа: по нему оплата этого бота отличается от оплаты
 # соседнего. Платёжная страница у них может быть одна на всех, и тогда
@@ -197,6 +214,20 @@ ORDER_PREFIX = "RP-"
 ORDER_RE = re.compile(
     r"^" + re.escape(ORDER_PREFIX) + r"(\d+)-([a-z_]+)-(\d+)-(\d{12})$"
 )
+
+# Номер тестовой оплаты: владелец проверяет цепочку тестовой картой Prodamus,
+# деньги не списываются и доступ не открывается. Начало номера то же, что у
+# настоящих, и это нарочно: соседний бот на общей платёжной странице увидит
+# чужую оплату и промолчит, как и положено. А наш узнаёт тестовую раньше
+# разбора, и открыть ею доступ нельзя даже подделкой: после «RP-» шаблон ждёт
+# цифры, слово «test» ему не подходит никогда, то есть номер с клиентом,
+# модулем и сроком из такой оплаты не прочитается в принципе.
+TEST_PREFIX = ORDER_PREFIX + "test-"
+
+
+def is_test(order_num: str) -> bool:
+    """Тестовая ли это оплата. Спрашивается до разбора номера."""
+    return (order_num or "").strip().startswith(TEST_PREFIX)
 
 
 def is_ours(order_num: str) -> bool:
@@ -395,6 +426,17 @@ def apply(
     paid = _amount(nested.get("sum"))
     if status != PAID:
         return Result(reason=NOT_PAID, order_num=order_num, order=order, paid=paid)
+    if is_test(order_num):
+        # Проверка владельца тестовой картой. Спрашивается раньше разбора
+        # номера нарочно: иначе такой номер не прочитался бы и бот поднял бы
+        # тревогу «деньги пришли неизвестно за что», хотя денег не было.
+        audit.log(
+            "payment.test",
+            None,
+            f"Тестовая оплата дошла, подпись верна, заказ {order_num}. Доступ не открыт.",
+            path=path,
+        )
+        return Result(reason=TEST_OK, order_num=order_num, paid=paid)
     if order is None:
         if not is_ours(order_num):
             # Оплата соседнего бота с той же платёжной страницы. Это

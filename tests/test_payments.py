@@ -229,3 +229,41 @@ async def test_the_answer_does_not_wait_for_telegram(wired, buyer):
     gate.set()
     await asyncio.gather(*payments.pending())
     assert app.bot.to(CLIENT_TG)
+
+
+@pytest.mark.asyncio
+async def test_a_test_payment_tells_the_owner_and_opens_nothing(wired, buyer):
+    """Демо-оплата владельца: подпись проверена, доступ не выдан никому.
+
+    Номер такого заказа начинается как наш, поэтому соседний бот на общей
+    платёжной странице промолчит. А наш узнаёт его раньше разбора, иначе
+    поднял бы тревогу «деньги пришли неизвестно за что», хотя денег не было.
+    """
+    app = FakeApp()
+    fields = notice(buyer)
+    fields["order_num"] = f"{payform.TEST_PREFIX}0-finance-3-202611100030"
+
+    code, _ = await receive(app, fields, signed(fields), wired)
+
+    assert code == 200
+    assert access.access_of(buyer, "finance", path=wired).works is False
+    assert app.bot.to(CLIENT_TG) == []
+    assert "Тестовая оплата дошла" in app.bot.to(OWNER_ID)[0]
+
+
+@pytest.mark.asyncio
+async def test_a_test_order_never_opens_access_even_with_a_real_client(wired, buyer):
+    """Подделка тестового номера под настоящего клиента ничего не даёт.
+
+    Проверяется не текст, а дверь: номер с «test» не читается шаблоном
+    разбора вовсе, значит ни клиента, ни модуля из него не достать.
+    """
+    app = FakeApp()
+    fields = notice(buyer)
+    fields["order_num"] = f"{payform.TEST_PREFIX}{buyer}-finance-3-202611100030"
+
+    code, _ = await receive(app, fields, signed(fields), wired)
+
+    assert code == 200
+    assert payform.read_order(fields["order_num"]) is None
+    assert access.access_of(buyer, "finance", path=wired).works is False

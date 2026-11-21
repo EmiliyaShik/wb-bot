@@ -73,6 +73,16 @@ BAD_SIGN_OWNER = (
     "Prodamus, и доступ включается командой <code>/grant</code>."
 )
 
+# Тестовая оплата владельца. Говорится вслух, что доступ не выдан: иначе
+# следующий вопрос будет «а кому он включился».
+TEST_OWNER = (
+    "🧪 Тестовая оплата дошла до бота, подпись верна.\n"
+    "Заказ <code>{order}</code>, сумма {amount}. Денег не списано, доступ "
+    "никому не открыт.\n"
+    "Проверено всё, кроме самих денег: ссылка, подпись Prodamus, приём "
+    "уведомления и разбор номера заказа."
+)
+
 NO_SECRET_OWNER = (
     "⛔️ Пришло уведомление об оплате, а секретный ключ платёжной страницы "
     "боту не задан (переменная <code>PRODAMUS_SECRET</code>). Проверить "
@@ -87,6 +97,7 @@ ANSWERS = {
     payform.BAD_ORDER: (200, "unknown order"),
     payform.FOREIGN: (200, "not our order"),
     payform.SHORT_PAY: (200, "short payment"),
+    payform.TEST_OK: (200, "test ok"),
     payform.BAD_SIGN: (403, "bad sign"),
     payform.NO_SECRET: (503, "no secret"),
 }
@@ -136,6 +147,8 @@ def owner_text(result: payform.Result) -> Safe | None:
         return Safe(BAD_SIGN_OWNER)
     if reason == payform.NO_SECRET:
         return Safe(NO_SECRET_OWNER)
+    if reason == payform.TEST_OK:
+        return fill(TEST_OWNER, order=result.order_num, amount=_money(result.paid))
     if reason == payform.BAD_ORDER:
         return fill(BAD_ORDER_OWNER, order=result.order_num)
     if reason == payform.SHORT_PAY and order is not None:
