@@ -52,6 +52,42 @@ def test_article_and_telegram_id_survive():
     assert "990" in cleaned
 
 
+def test_password_inside_an_address_is_cut_even_without_the_scheme():
+    """Прокси до Telegram записан с логином и паролем прямо в адресе.
+
+    Подстановка по значению переменной прячет только адрес целиком, а чужая
+    библиотека кладёт в текст ошибки кусок: «логин:пароль@хост» без схемы.
+    Проверено опытом: httpx пароль маскирует сам, но держать защиту на
+    вежливости чужой библиотеки нельзя.
+    """
+    cleaned = audit.redact("proxy login-vydumannyy:SEKRET@198.51.100.7:1080 failed")
+
+    assert "SEKRET" not in cleaned
+    assert "login-vydumannyy" not in cleaned
+    # Хост остаётся: по нему видно, какой прокси не отвечает.
+    assert "198.51.100.7:1080" in cleaned
+
+
+def test_password_is_cut_for_any_address_not_only_the_known_one():
+    """Правило по форме записи, а не по известному значению из окружения."""
+    cleaned = audit.redact("http://admin:qwerty123@10.0.0.1:3128 refused")
+
+    assert "qwerty123" not in cleaned
+    assert "10.0.0.1:3128" in cleaned
+
+
+def test_usual_addresses_and_mail_are_not_touched():
+    """Чистка не должна съедать то, ради чего журнал читают."""
+    cleaned = audit.redact(
+        "GET https://basket-10.wbbasket.ru/vol1/part1/179323396/info/ru/card.json, "
+        "письмо ушло на owner@example.com"
+    )
+
+    assert "basket-10.wbbasket.ru" in cleaned
+    assert "179323396" in cleaned
+    assert "owner@example.com" in cleaned
+
+
 def test_seller_details_from_env_are_cut(monkeypatch):
     monkeypatch.setenv("SELLER_ACCOUNT", "тестовый-реквизит-из-окружения")
     cleaned = audit.redact("платёж на тестовый-реквизит-из-окружения принят")
