@@ -876,6 +876,43 @@ async def test_funnel_can_ask_for_the_past_period(cabinet):
 
 
 @pytest.mark.asyncio
+async def test_funnel_asks_by_date_even_when_given_real_dates(cabinet):
+    """Воронка принимает только ГГГГ-ММ-ДД, и это ловится настоящими датами.
+
+    Прежний тест передавал даты строками, а строку форматировщик возвращает
+    как есть, поэтому неверный формат он пропускал. Агент же передаёт date,
+    и тогда к дате приклеивалось время: Wildberries отвечал четырёхсоткой
+    «parsing time ... extra text: T00:00:00», свод воронки не приходил, и
+    сбор молча брал артикулы из накопленного. Поймано на живом кабинете.
+    """
+    seen: list[httpx.Request] = []
+    client = build(cabinet, [ok({"data": {"products": []}})], seen)
+
+    await client.sales_funnel_products(
+        date(2026, 9, 8),
+        date(2026, 9, 14),
+        past=(date(2026, 9, 1), date(2026, 9, 7)),
+    )
+
+    body = json.loads(seen[0].content)
+    assert body["selectedPeriod"] == {"start": "2026-09-08", "end": "2026-09-14"}
+    assert body["pastPeriod"] == {"start": "2026-09-01", "end": "2026-09-07"}
+    assert "T" not in json.dumps(body["selectedPeriod"])
+
+
+@pytest.mark.asyncio
+async def test_the_sales_report_still_asks_with_time(cabinet):
+    """Обратная сторона: отчёт о реализации время в датах как раз требует."""
+    seen: list[httpx.Request] = []
+    client = build(cabinet, [ok({"data": []})], seen)
+
+    await client.sales_report_detailed(date(2026, 9, 1), date(2026, 9, 7))
+
+    body = json.loads(seen[0].content)
+    assert body["dateFrom"] == "2026-09-01T00:00:00"
+
+
+@pytest.mark.asyncio
 async def test_probe_reports_the_code_the_host_answered(tmp_path):
     """В отчёт попадает настоящий код, а не подставленная константа."""
     path = tmp_path / "diag.db"

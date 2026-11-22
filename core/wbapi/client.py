@@ -837,13 +837,17 @@ class WBClient:
         offset = 0
         for _ in range(max_pages):
             body: dict[str, Any] = {
-                "selectedPeriod": {"start": moment(start), "end": moment(end)},
+                # Дата без времени: этот метод аналитики принимает только
+                # ГГГГ-ММ-ДД и на RFC3339 отвечает четырёхсоткой «extra text:
+                # T00:00:00». Так же считает соседний метод воронки, а время
+                # в датах ждёт только отчёт о реализации (`moment`).
+                "selectedPeriod": {"start": day(start), "end": day(end)},
                 "limit": int(limit),
                 "offset": int(offset),
                 "skipDeletedNm": False,
             }
             if past:
-                body["pastPeriod"] = {"start": moment(past[0]), "end": moment(past[1])}
+                body["pastPeriod"] = {"start": day(past[0]), "end": day(past[1])}
             if nm_ids:
                 body["nmIds"] = [int(value) for value in nm_ids]
             page = _listify(
