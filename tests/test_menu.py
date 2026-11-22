@@ -45,7 +45,10 @@ HANDLERS = ROOT / "bot" / "handlers"
 
 # Команды владельца по спецификации. Список записан руками нарочно: сторож
 # должен падать, когда админскую команду тихо пустят в общее меню.
-OWNER_ONLY = {"stats", "acts", "grant", "revoke", "tasks", "trace", "diag", "testpay"}
+OWNER_ONLY = {
+    "stats", "acts", "grant", "revoke", "tasks", "trace", "diag", "testpay",
+    "news", "newswho",
+}
 
 
 # --- приспособления ---

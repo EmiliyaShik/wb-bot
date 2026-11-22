@@ -187,10 +187,30 @@ def sent_count(client_id: int, *, path: str | Path | None = None) -> int:
         return 0
 
 
+def note_mailing(
+    client_id: int, *, today: date | None = None, path: str | Path | None = None
+) -> None:
+    """Отмечает день любой отправки: по нему считается обещанная пауза.
+
+    Часы тут одни на всё, что бот шлёт сам, и это не упрощение. Политика
+    обещает «не чаще одного раза в 30 дней», а не «по разу от каждой
+    рассылки»: заведи новостям свой счёт, и человек получит напоминание и
+    новость в одну неделю, причём оба раза «по правилам».
+    """
+    state = _state(client_id, path)
+    state["sent_at"] = _today(today).isoformat()
+    _save(client_id, state, path)
+
+
 def note_sent(
     client_id: int, *, today: date | None = None, path: str | Path | None = None
 ) -> None:
-    """Отмечает отправленное напоминание: число и день."""
+    """Отмечает отправленное напоминание: число и день.
+
+    Счётчик растёт только здесь. Предел в три письма это предел кампании
+    напоминаний тому, кто ничего не оформил, а не предел переписки вообще:
+    новость, отправленная платящему клиенту, его исчерпать не может.
+    """
     state = _state(client_id, path)
     state["sent"] = sent_count(client_id, path=path) + 1
     state["sent_at"] = _today(today).isoformat()
@@ -277,6 +297,46 @@ def due(*, today: date | None = None, path: str | Path | None = None) -> list[Le
             continue
         ready.append(lead)
     return ready
+
+
+@dataclass(frozen=True)
+class Recipient:
+    """Кому можно отправить новость: только номер клиента и чат."""
+
+    client_id: int
+    telegram_id: int
+
+
+def news_due(
+    *, today: date | None = None, path: str | Path | None = None
+) -> list[Recipient]:
+    """Кому можно отправить новость: согласие есть и пауза прошла.
+
+    Отличий от `due` два, и оба намеренные. Платящий клиент сюда входит:
+    новость про новый модуль нужна в первую очередь тому, кто уже платит, а
+    `due` ищет только неоформивших, у них своя кампания. И предел в три
+    письма тут не при чём: он про напоминания, а не про переписку вообще.
+
+    Общее у двух рассылок одно, и оно главное: пауза. Считается она по тому
+    же `sent_at`, то есть новость не уйдёт следом за напоминанием.
+    """
+    day = _today(today)
+    gap = gap_days()
+    found: list[Recipient] = []
+    for row in db.admin_repo(path).all_clients():
+        client_id = int(row["id"])
+        try:
+            if choice(client_id, path=path) != YES:
+                continue
+            last = _as_date(_state(client_id, path).get("sent_at"))
+            if last is not None and day - last < timedelta(days=gap):
+                continue
+            found.append(
+                Recipient(client_id=client_id, telegram_id=int(row["telegram_id"]))
+            )
+        except Exception:  # noqa: BLE001 - один клиент не ломает рассылку
+            logger.exception("не удалось разобрать клиента %s", client_id)
+    return found
 
 
 def stale(*, today: date | None = None, path: str | Path | None = None) -> list[Lead]:
