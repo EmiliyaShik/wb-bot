@@ -38,7 +38,7 @@ from telegram.ext import (
 )
 
 from bot.texts import Safe, fill
-from core import consent, db
+from core import consent, db, leads
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +89,20 @@ PD_WAIT = (
 )
 PD_DONE = "✅ Согласие на обработку данных дано {when}."
 
+# Самая длинная строка экрана, и это не случайность. Рекламное согласие
+# считается данным только тогда, когда человек понимал, на что соглашается:
+# что именно придёт, сколько раз, как часто и как отказаться. Поэтому числа
+# названы прямо здесь, а не спрятаны в документе, который не читают. Берутся
+# они из конфига, из той же секции, которой держится сама рассылка: напишешь
+# их руками, и однажды обещание разойдётся с поведением.
 NEWS_WAIT = (
-    "✉️ <b>Новости и специальные предложения.</b> По желанию. Отказ ничему "
-    "не мешает: бот работает одинаково."
+    "✉️ <b>Новости и специальные предложения.</b> По желанию: отказ ничему "
+    "не мешает, бот работает одинаково.\n"
+    "Пишу только о сервисе и не чаще одного раза в {days}. Если доступ вы так "
+    "и не оформите, напоминаний будет не больше {letters}, дальше они "
+    "прекращаются сами. Отказаться можно когда угодно командой "
+    "<code>/stop</code>. Правила рассылки записаны в политике "
+    "конфиденциальности. {link}"
 )
 NEWS_YES_DONE = "✅ Новости и предложения: присылать. Передумаете - <code>/stop</code>."
 NEWS_NO_DONE = "➖ Новости и предложения: не присылать."
@@ -114,6 +125,41 @@ NEWS_LATER = (
 def _link(kind: str) -> Safe:
     address = consent.document_of(kind)
     return fill(LINK, link=address) if address else Safe(LINK_PENDING)
+
+
+def _days_word(days: int) -> str:
+    """«30 дней», «3 дня», «1 день». Читатель это селлер, а не программист."""
+    days = abs(int(days))
+    if 11 <= days % 100 <= 14:
+        return f"{days} дней"
+    last = days % 10
+    if last == 1:
+        return f"{days} день"
+    if last in (2, 3, 4):
+        return f"{days} дня"
+    return f"{days} дней"
+
+
+def _letters_word(count: int) -> str:
+    """«не больше 3 писем», «не больше 1 письма»: форма после слова «больше».
+
+    Склонение здесь одно и под одну фразу: отдельный падеж на все случаи
+    жизни завёл бы в хендлере маленький словарь русского языка.
+    """
+    count = abs(int(count))
+    if count % 10 == 1 and count % 100 != 11:
+        return f"{count} письма"
+    return f"{count} писем"
+
+
+def _news_line() -> Safe:
+    """Что обещано рассылкой. Числа из конфига, оттуда же их берёт сама рассылка."""
+    return fill(
+        NEWS_WAIT,
+        letters=_letters_word(leads.max_reminders()),
+        days=_days_word(leads.gap_days()),
+        link=_link(consent.PERSONAL_DATA),
+    )
 
 
 def _when(record: Any) -> str:
@@ -141,7 +187,7 @@ def screen(client_id: int, *, path: str | Path | None = None) -> tuple[Safe, Any
     elif asked_news:
         news_line = Safe(NEWS_NO_DONE)
     else:
-        news_line = Safe(NEWS_WAIT)
+        news_line = _news_line()
 
     template = READY if consent.ready(client_id, path=path) else ASK
     text = fill(

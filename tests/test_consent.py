@@ -265,6 +265,36 @@ async def test_the_news_refusal_is_recorded_as_an_answer(newcomer, db_path):
     assert consent.has(newcomer, consent.NEWS, path=db_path) is False
 
 
+def test_the_news_line_says_what_will_come_and_how_often(newcomer, db_path):
+    """Рекламное согласие считается данным, только если человек понимал, на что идёт.
+
+    Поэтому в строке названы и что придёт, и сколько, и как часто, и чем
+    отказаться. Документ тут не нужен: правила те же, что в политике, а
+    документ, который не читают, информированности не добавляет.
+    """
+    text, _ = handler.screen(newcomer, path=db_path)
+
+    assert "не больше 3 писем" in text
+    assert "30 дней" in text
+    assert "/stop" in text
+    assert PRIVACY in text
+
+
+def test_the_news_limits_are_taken_from_the_config(newcomer, db_path, monkeypatch):
+    """Числа обещания и числа рассылки обязаны быть одними и теми же.
+
+    Написать их в тексте руками значит однажды поменять конфиг и начать
+    обещать не то, что бот делает.
+    """
+    monkeypatch.setattr(handler.leads, "max_reminders", lambda: 1)
+    monkeypatch.setattr(handler.leads, "gap_days", lambda: 2)
+
+    text, _ = handler.screen(newcomer, path=db_path)
+
+    assert "не больше 1 письма" in text
+    assert "2 дня" in text
+
+
 def test_the_screen_offers_only_what_is_still_undecided(newcomer, db_path):
     consent.accept(newcomer, consent.OFFER, path=db_path)
 
