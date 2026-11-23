@@ -74,7 +74,19 @@ BASKET_VOL_RANGES = [
     (2045, 13), (2189, 14), (2405, 15), (2621, 16), (2837, 17), (3053, 18),
     (3269, 19), (3485, 20), (3701, 21), (3917, 22),
 ]
-BASKET_MAX_HOST = 40  # верхняя граница перебора корзин
+# Верхняя граница перебора корзин. Их число у Wildberries растёт: на живом
+# артикуле 1951384853 (vol 19513) карточка нашлась на корзине 53, а потолок
+# в 40 до неё не доходил, и бот отвечал «витрина не отвечает» на каждый новый
+# товар. Запас взят с избытком нарочно: несуществующий хост отказывает в
+# соединении сразу, то есть лишние номера почти ничего не стоят, а
+# закончившийся потолок стоит неработающей команды.
+BASKET_MAX_HOST = 80
+
+# Сколько корзин спрашиваем разом. Перебор по одной это полсотни запросов
+# подряд, то есть минута молчания на каждый новый товар: человек за это время
+# решает, что бот сломался. Пачкой те же полсотни укладываются в несколько
+# заходов. Больше десяти разом не берём: это чужой CDN, а не наш сервер.
+BASKET_BATCH = 10
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -258,14 +270,19 @@ async def _fetch_feedbacks(
 
 
 def _basket_host_candidates(vol: int) -> list[int]:
-    """Порядок перебора basket-хостов: сначала подсказка по таблице, затем остальные."""
-    guess = BASKET_MAX_HOST
+    """Порядок перебора basket-хостов.
+
+    Попал vol в таблицу - её подсказка идёт первой, остальные по возрастанию.
+    Не попал (а это значит «товар новее таблицы») - перебор идёт сверху вниз:
+    номер корзины растёт вместе с vol, и у нового товара она заведомо ближе к
+    потолку, чем к единице. Таблицу можно было бы дописать, но она у
+    Wildberries дрейфует, и дописанная устареет так же, как устарела эта.
+    """
+    all_hosts = range(1, BASKET_MAX_HOST + 1)
     for max_vol, host in BASKET_VOL_RANGES:
         if vol <= max_vol:
-            guess = host
-            break
-    ordered = [guess] + [n for n in range(1, BASKET_MAX_HOST + 1) if n != guess]
-    return ordered
+            return [host] + [n for n in all_hosts if n != host]
+    return list(reversed(all_hosts))
 
 
 def _parse_characteristics(card: dict) -> list[tuple[str, str]]:
@@ -310,7 +327,7 @@ async def _fetch_cdn_card(client: httpx.AsyncClient, nm_id: int) -> dict | None:
     if known is not None:
         candidates = [known] + [n for n in candidates if n != known]
 
-    for host_num in candidates:
+    async def ask(host_num: int) -> tuple[int, dict | None]:
         url = (
             f"https://basket-{host_num:02d}.wbbasket.ru"
             f"/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
@@ -318,12 +335,21 @@ async def _fetch_cdn_card(client: httpx.AsyncClient, nm_id: int) -> dict | None:
         try:
             response = await client.get(url, headers=BASE_HEADERS)
             if response.status_code != 200:
-                continue
-            card = response.json()
+                return host_num, None
+            return host_num, response.json()
         except (httpx.HTTPError, ValueError):
-            continue
-        _CDN_HOST_BY_VOL[vol] = host_num
-        return card
+            return host_num, None
+
+    # Пачками, а не по одной: иначе новый товар стоит полусотни запросов
+    # подряд. Внутри пачки порядок сохраняется, чтобы подсказка таблицы и
+    # запомненный хост оставались первыми по смыслу, а не по тому, кто
+    # ответил быстрее.
+    for start in range(0, len(candidates), BASKET_BATCH):
+        batch = candidates[start : start + BASKET_BATCH]
+        for host_num, card in await asyncio.gather(*(ask(one) for one in batch)):
+            if card is not None:
+                _CDN_HOST_BY_VOL[vol] = host_num
+                return card
 
     return None
 

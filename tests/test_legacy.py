@@ -182,3 +182,72 @@ async def test_no_card_anywhere_is_still_an_honest_refusal(monkeypatch):
     # В тексте для журнала причина названа, а имени переменной окружения нет.
     assert "403" in str(error.value)
     assert "WB_PROXY" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_a_card_is_found_on_a_basket_above_the_old_ceiling(monkeypatch):
+    """Корзин у Wildberries больше сорока, и новый товар лежит выше.
+
+    Поймано на живом артикуле: карточка нашлась на корзине 53, а потолок
+    перебора стоял на сорока, и бот отвечал «витрина не отвечает» на каждый
+    новый товар. Проверяется именно потолок, а не механика: хост один, и он
+    заведомо за прежней границей.
+    """
+    import httpx
+
+    LIVES_ON = 53
+    asked: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        if host.endswith("wb.ru") and "cards" in request.url.path:
+            return httpx.Response(403)
+        if host.startswith("basket-") and request.url.path.endswith("card.json"):
+            number = int(host.split("-")[1].split(".")[0])
+            asked.append(number)
+            if number != LIVES_ON:
+                return httpx.Response(404)
+            return httpx.Response(
+                200,
+                json={
+                    "imt_id": 1,
+                    "imt_name": "Свечи новогодние",
+                    "subj_name": "Свечи",
+                    "vendor_code": "Арт.1",
+                    "selling": {"brand_name": "Бренд"},
+                    "description": "Горят",
+                    "options": [],
+                },
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        kwargs.pop("proxy", None)
+        kwargs.pop("trust_env", None)
+        return real_client(*args, transport=transport, **kwargs)
+
+    monkeypatch.setattr(card.httpx, "AsyncClient", fake_client)
+    card._CDN_HOST_BY_VOL.clear()
+
+    product = await card.fetch_product(1951384853)
+
+    assert product.name == "Свечи новогодние"
+    assert product.showcase_blocked is True
+    assert LIVES_ON in asked, "корзина выше прежнего потолка не спрошена"
+
+
+@pytest.mark.asyncio
+async def test_a_new_article_is_searched_from_the_top(monkeypatch):
+    """Номер корзины растёт вместе с vol: у нового товара она у потолка.
+
+    Перебор снизу стоил бы полусотни запросов там, где хватает трёх.
+    """
+    vol = 1951384853 // 100000
+
+    order = card._basket_host_candidates(vol)
+
+    assert order[0] == card.BASKET_MAX_HOST
+    assert order[-1] == 1
